@@ -1,0 +1,137 @@
+### Equipment Flow — sample requests (VS Code "REST Client" extension). Run top to bottom.
+@base = http://localhost:5055/api
+@user = hamza
+@password = change-me
+
+### health
+GET {{base}}/health
+
+### login -> copy data.token into @token below
+# @name login
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "username": "{{user}}", "password": "{{password}}" }
+
+###
+@token = {{login.response.body.data.token}}
+
+### who am I
+GET {{base}}/auth/me
+Authorization: Bearer {{token}}
+
+### create a site
+POST {{base}}/sites
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "site_code": "S08", "site_name": "Tower B", "has_night_shift": false, "day_shift_start": "07:00" }
+
+### create a vendor
+POST {{base}}/equipment/vendors
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "vendor_name": "Al-Bunyan Heavy Equipment", "contact_person": "Samer", "phone_number": "+963..." }
+
+### contract (vendor 1)
+POST {{base}}/equipment/vendors/1/contracts
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "contract_number": "AB-2026-07", "start_date": "2026-07-01", "currency": "USD" }
+
+### machine (type 1 = Excavator)
+POST {{base}}/equipment/machines
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "vendor_id": 1, "type_id": 1, "make": "CAT", "model": "320D", "plate_number": "482193" }
+
+### rate card: hourly 40, min 6 h, OT after 10 h at 50
+POST {{base}}/equipment/machines/1/rate-cards
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "vendor_contract_id": 1, "effective_from": "2026-07-01", "billing_mode": "Hourly", "hourly_rate": 40,
+  "min_billable_hours_per_day": 6, "overtime_enabled": true, "overtime_threshold_hours": 10, "overtime_rate": 50 }
+
+### "test this price"
+POST {{base}}/equipment/rate-cards/preview
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "rate_card": { "billing_mode": "Hourly", "hourly_rate": 40, "min_billable_hours_per_day": 6, "overtime_enabled": true, "overtime_threshold_hours": 10, "overtime_rate": 50 },
+  "sample_rows": [ { "day_status": "Working", "gross_hours": 13, "break_hours": 1 }, { "day_status": "Standby" } ] }
+
+### operator
+POST {{base}}/equipment/operators
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "vendor_id": 1, "full_name": "Ahmad Khaled", "license_expiry": "2030-01-01" }
+
+### deploy machine 1 to site 1 (Day)
+POST {{base}}/equipment/deployments
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "equipment_id": 1, "site_id": 1, "shift_type": "Day", "assigned_date": "2026-10-01", "default_operator_id": 1 }
+
+### day board
+GET {{base}}/equipment/attendance/site/1?date=2026-10-03&shift=Day
+Authorization: Bearer {{token}}
+
+### check-in
+POST {{base}}/equipment/attendance/check-in
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "equipment_id": 1, "site_id": 1, "shift_type": "Day", "check_in_time": "2026-10-03 07:00", "meter_start": 5100 }
+
+### break 12:00-13:00 on row 1
+POST {{base}}/equipment/attendance/1/downtime/start
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "downtime_type": "Break", "start_time": "2026-10-03 12:00", "end_time": "2026-10-03 13:00" }
+
+### check-out
+POST {{base}}/equipment/attendance/1/check-out
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "check_out_time": "2026-10-03 17:30", "meter_end": 5109.6, "work_description": "Excavation axis A1-A4" }
+
+### submit the day
+POST {{base}}/equipment/attendance/submit
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "site_id": 1, "shift_type": "Day", "record_date": "2026-10-03" }
+
+### approve
+POST {{base}}/equipment/admin/attendance/approve
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "ids": [1] }
+
+### print the monthly paper sheet (open the response as PDF)
+GET {{base}}/equipment/timesheets/1/print.pdf
+Authorization: Bearer {{token}}
+
+### live board
+GET {{base}}/equipment/live
+Authorization: Bearer {{token}}
+
+### payroll blockers for October
+GET {{base}}/equipment/payroll/blockers?start_date=2026-10-01&end_date=2026-10-31
+Authorization: Bearer {{token}}
+
+### payroll preview
+POST {{base}}/equipment/payroll/preview
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "start_date": "2026-10-01", "end_date": "2026-10-31" }
