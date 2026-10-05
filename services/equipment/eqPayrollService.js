@@ -79,6 +79,53 @@ function monthsContext(start, end, deployRanges, card, ownsDay = null, offDay = 
   }));
 }
 
+/** A row has standby time (full Standby day, or standby periods inside a Working day). */
+function hasStandby(r) { return r.day_status === 'Standby' || Number(r.standby_minutes || 0) > 0; }
+
+/** The fields of an attendance row that the billing engine reads. */
+function engineRow(r) {
+  return { record_date: r.record_date, day_status: r.day_status, gross_minutes: r.gross_minutes, break_minutes: r.break_minutes,
+    breakdown_minutes: r.breakdown_minutes, standby_minutes: r.standby_minutes,
+    standby_credit_minutes: r.standby_credit_minutes === undefined ? null : r.standby_credit_minutes };
+}
+
+/** Billed minutes of one row (what goes into the payroll snapshot). thr = overtime threshold in minutes. */
+function rowFigures(r, rate, thr) {
+  const m = engine.dayMinutes(r, rate);
+  const credit = rate.billing_mode === 'Monthly' && r.standby_credit_minutes !== null && r.standby_credit_minutes !== undefined
+    ? engine.standbyCredit(r, Math.round(Number(rate.standard_hours_per_day) * 60)) : null;
+  return { work: m.work, ot: Math.max(0, m.work - thr), standby: m.standby, breakdown: m.breakdown, brk: m.brk, topup: engine.minimumTopUp(m, rate), credit };
+}
+
+/**
+ * Stale check of a batch: rows whose BILLED figures are no longer what the batch used. Only changes that move money
+ * count (times, downtime, day status, standby hours given, approval). Paper checks, scans, meters, remarks do not.
+ */
+async function changedRows(conn, batchId) {
+  const [rows] = await conn.query(
+    `SELECT s.eq_attendance_id, s.day_status AS s_day_status, s.check_in_time AS s_in, s.check_out_time AS s_out,
+       s.work_minutes AS s_work, s.overtime_minutes AS s_ot, s.standby_minutes AS s_standby, s.breakdown_minutes AS s_breakdown,
+       s.break_minutes AS s_break, s.topup_minutes AS s_topup, s.standby_credit_minutes AS s_credit, i.rate_snapshot, i.billing_mode,
+       a.status, a.day_status, a.check_in_time, a.check_out_time, a.gross_minutes, a.break_minutes, a.breakdown_minutes, a.standby_minutes,
+       a.standby_credit_minutes
+     FROM eq_payroll_attendance_snapshot s JOIN eq_payroll_items i ON i.eq_item_id = s.eq_item_id
+     LEFT JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id
+     WHERE s.eq_batch_id = ?`, [batchId]);
+  const out = [];
+  for (const r of rows) {
+    if (!r.status || r.status !== 'Approved') { out.push({ eq_attendance_id: r.eq_attendance_id, reason: 'not approved any more' }); continue; }
+    const rate = engineRate(parseJson(r.rate_snapshot) || {});
+    const thr = r.billing_mode === 'Monthly' ? Infinity : engine.otThresholdMin(rate);
+    const f = rowFigures(r, rate, thr);
+    const same = r.s_day_status === r.day_status && String(r.s_in) === String(r.check_in_time) && String(r.s_out) === String(r.check_out_time)
+      && Number(r.s_work) === f.work && Number(r.s_ot) === f.ot && Number(r.s_standby) === f.standby && Number(r.s_breakdown) === f.breakdown
+      && Number(r.s_break) === f.brk && Number(r.s_topup) === f.topup
+      && (r.billing_mode !== 'Monthly' || (r.s_credit === null ? null : Number(r.s_credit)) === f.credit);
+    if (!same) out.push({ eq_attendance_id: r.eq_attendance_id, reason: 'billed figures changed' });
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ fuel price difference
 /** Effective-dated fuel terms of the machines (base price + litres per working hour). */
 async function loadFuelTerms(conn, equipmentIds, start, end) {
@@ -183,10 +230,16 @@ async function blockers(conn, scope) {
     [...exParams, ...params]);
   add('IN_OTHER_BATCH', 'Rows already paid in another active batch (they are skipped).', inOther);
   // rate cards: for eligible rows and for Monthly deployments
-  const [approved] = await conn.query(`SELECT ea.eq_attendance_id, ea.equipment_id, e.equipment_code, ea.record_date ${base} AND ea.status = 'Approved'`, params);
+  const [approved] = await conn.query(`SELECT ea.eq_attendance_id, ea.equipment_id, e.equipment_code, st.site_code, ea.record_date, ea.day_status, ea.standby_minutes, ea.standby_credit_minutes ${base} AND ea.status = 'Approved'`, params);
   const ids = [...new Set(approved.map((r) => r.equipment_id))];
   const cards = await loadRateCards(conn, ids, scope.start_date, scope.end_date);
   add('NO_RATE_CARD', 'Rows on dates without a rate card.', approved.filter((r) => !cardFor(cards, r.equipment_id, r.record_date)));
+  // monthly machines: the standby hours paid are decided per row by the Admin/Accountant (no %)
+  add('STANDBY_HOURS_NOT_SET', 'Monthly machines with standby: set the standby hours to pay (Attendance review).',
+    approved.filter((r) => {
+      const c = cardFor(cards, r.equipment_id, r.record_date);
+      return c && c.billing_mode === 'Monthly' && hasStandby(r) && (r.standby_credit_minutes === null || r.standby_credit_minutes === undefined);
+    }).map(({ standby_credit_minutes: _x, ...r }) => r));
   const fs = scopeSql(scope, 'f');
   const [fuel] = await conn.query(
     `SELECT f.fuel_issue_id, e.equipment_code, f.issue_date, f.liters FROM eq_fuel_issues f JOIN eq_equipment e ON e.equipment_id = f.equipment_id
@@ -209,7 +262,7 @@ async function blockers(conn, scope) {
   return out;
 }
 
-const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING'];
+const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING'];
 /** Shown with the blockers but never prevent generating. */
 const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING'];
 
@@ -324,12 +377,9 @@ async function calculate(conn, scope) {
     }
     if (rate.billing_mode !== 'Monthly' && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;
     if (rate.billing_mode === 'Monthly' && !ctx.months.length && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;
-    const engineRows = g.rows.map((r) => ({ record_date: r.record_date, day_status: r.day_status, gross_minutes: r.gross_minutes, break_minutes: r.break_minutes, breakdown_minutes: r.breakdown_minutes, standby_minutes: r.standby_minutes }));
+    const engineRows = g.rows.map(engineRow);
     const thr = rate.billing_mode === 'Monthly' ? Infinity : engine.otThresholdMin(rate); // monthly overtime is counted on the month, not per day
-    const perRow = g.rows.map((r) => {
-      const m = engine.dayMinutes(r, rate);
-      return { row: r, work: m.work, ot: Math.max(0, m.work - thr), standby: m.standby, breakdown: m.breakdown, brk: m.brk, topup: engine.minimumTopUp(m, rate) };
-    });
+    const perRow = g.rows.map((r) => ({ row: r, ...rowFigures(r, rate, thr) }));
     const fd = fuelDifference(perRow, g.equipment_id, g.card.currency, fuelTerms, fuelPrices, allowNegative);
     if (fd.missing.length) warnings.push({ code: 'FUEL_PRICE_MISSING', equipment_id: g.equipment_id, site_id: g.site_id, days: fd.missing.map((x) => x.record_date), message: 'No national fuel price on some days: no fuel difference for them.' });
     const res = engine.billItem(engineRows, rate, ctx, {
@@ -361,4 +411,4 @@ async function calculate(conn, scope) {
   return { items, warnings };
 }
 
-module.exports = { calculate, blockers, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };
+module.exports = { calculate, blockers, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };

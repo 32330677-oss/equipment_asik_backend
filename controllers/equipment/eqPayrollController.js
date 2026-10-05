@@ -132,10 +132,10 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
       const r = pr.row;
       await conn.execute(
         `INSERT INTO eq_payroll_attendance_snapshot (eq_batch_id, eq_item_id, eq_attendance_id, record_date, day_status, check_in_time, check_out_time,
-           operator_name, work_minutes, overtime_minutes, standby_minutes, breakdown_minutes, break_minutes, topup_minutes, meter_start, meter_end, sheet_row_no, paper_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           operator_name, work_minutes, overtime_minutes, standby_minutes, standby_credit_minutes, breakdown_minutes, break_minutes, topup_minutes, meter_start, meter_end, sheet_row_no, paper_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [batchId, ir.insertId, r.eq_attendance_id, r.record_date, r.day_status, r.check_in_time, r.check_out_time, r.operator_name || null,
-          pr.work, pr.ot, pr.standby, pr.breakdown, pr.brk, pr.topup, r.meter_start, r.meter_end, r.sheet_row_no, r.paper_status]);
+          pr.work, pr.ot, pr.standby, pr.credit ?? null, pr.breakdown, pr.brk, pr.topup, r.meter_start, r.meter_end, r.sheet_row_no, r.paper_status]);
     }
   }
   return batchId;
@@ -187,11 +187,9 @@ async function loadBatch(conn, id, lock = false) {
   return rows[0];
 }
 
+/** Stale = a row's BILLED figures changed after generation (paper checks, scans, meters or remarks do not count). */
 async function isStale(conn, batch) {
-  const [[r]] = await conn.execute(
-    `SELECT COUNT(*) AS n FROM eq_payroll_attendance_snapshot s JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id
-     WHERE s.eq_batch_id = ? AND a.updated_at > ?`, [batch.eq_batch_id, batch.generated_at]);
-  return Number(r.n) > 0;
+  return (await P.changedRows(conn, batch.eq_batch_id)).length > 0;
 }
 
 async function batchDetail(conn, id) {

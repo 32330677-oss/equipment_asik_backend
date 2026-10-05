@@ -90,6 +90,7 @@ router.post('/admin/attendance/approve', A, review.approve);
 router.post('/admin/attendance/reject', A, review.reject);
 router.get('/admin/attendance/:id', AC, review.get);
 router.post('/admin/attendance/:id/ack-anomaly', A, review.ackAnomaly);
+router.patch('/admin/attendance/:id/standby-credit', AC, review.standbyCredit);
 router.patch('/admin/attendance/:id', A, review.adminEdit);
 router.post('/admin/attendance/:id/correction', A, review.correction);
 router.get('/admin/corrections', AC, review.listCorrections);

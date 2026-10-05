@@ -8,6 +8,14 @@ const audit = require('../services/audit');
 const { businessNow, businessToday } = require('../utils/businessDate');
 const { addMinutes } = require('../utils/dateTime');
 const { supervisorSitesOn } = require('../services/siteAccess');
+const { passwordVersion } = require('../middleware/requireAuth');
+
+/** Session token, tied to the current password version (see requireAuth). */
+function issueToken(user) {
+  const token = jwt.sign({ user_id: user.user_id, pwv: passwordVersion(user) }, env.jwtSecret, { expiresIn: env.jwtExpiresIn });
+  const { exp } = jwt.decode(token);
+  return { token, expires_at: new Date(exp * 1000).toISOString() };
+}
 
 const MAX_FAILED = 5;
 const LOCK_MINUTES = 15;
@@ -58,9 +66,7 @@ exports.login = async (req, res) => {
   }
   await pool.execute('UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_login_at = ? WHERE user_id = ?', [nowStr, user.user_id]);
   await recordAttempt(user.user_id, username, true, req);
-  const token = jwt.sign({ user_id: user.user_id }, env.jwtSecret, { expiresIn: env.jwtExpiresIn });
-  const { exp } = jwt.decode(token);
-  res.json({ status: 'success', data: { token, expires_at: new Date(exp * 1000).toISOString(), user: publicUser(user) } });
+  res.json({ status: 'success', data: { ...issueToken(user), user: publicUser(user) } });
 };
 
 exports.me = async (req, res) => {
@@ -80,16 +86,30 @@ exports.changePassword = async (req, res) => {
   if (String(current_password) === String(new_password)) {
     throw AppError.badRequest('WEAK_PASSWORD', 'The new password must be different from the current one.');
   }
-  await withTransaction(async (conn) => {
-    const [rows] = await conn.execute('SELECT user_id, password_hash FROM users WHERE user_id = ? FOR UPDATE', [req.user.user_id]);
+  const session = await withTransaction(async (conn) => {
+    const [rows] = await conn.execute('SELECT user_id, password_hash, password_changed_at FROM users WHERE user_id = ? FOR UPDATE', [req.user.user_id]);
     if (!(await passwords.verify(current_password, rows[0].password_hash))) {
       throw AppError.badRequest('INVALID_CREDENTIALS', 'The current password is wrong.');
     }
+    const changedAt = newPasswordVersion(rows[0].password_changed_at);
     await conn.execute(
       'UPDATE users SET password_hash = ?, must_change_password = 0, password_changed_at = ? WHERE user_id = ?',
-      [await passwords.hash(new_password), businessNow(), req.user.user_id]
+      [await passwords.hash(new_password), changedAt, req.user.user_id]
     );
     await audit.log(conn, { table: 'users', id: req.user.user_id, action: 'change_password', ...audit.ctx(req) });
+    return issueToken({ user_id: req.user.user_id, password_changed_at: changedAt });
   });
-  res.json({ status: 'success', data: { changed: true }, message: 'Password changed.' });
+  // every other session ends; this device keeps working with the new token
+  res.json({ status: 'success', data: { changed: true, ...session }, message: 'Password changed.' });
 };
+
+/** A new password version that is always different from the previous one (two changes in the same second). */
+function newPasswordVersion(previous) {
+  const now = businessNow();
+  return previous && String(previous) >= now ? bumpSecond(String(previous)) : now;
+}
+function bumpSecond(dt) {
+  const ms = Date.parse(dt.replace(' ', 'T') + 'Z') + 1000;
+  return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+}
+exports.newPasswordVersion = newPasswordVersion;

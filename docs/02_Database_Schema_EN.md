@@ -1,27 +1,36 @@
 # Database Schema — & Migration
 
-**Standalone database equipment_flow — 25 tables, idempotent**
+**Standalone database equipment_flow — 30 tables (25 base + 4 from migration 001 + schema_migrations), idempotent**
 
 Full schema SQL, seed, table reference, settings and query recipes. Run twice on an empty database without error.
 
-_Equipment Flow · Doc 02 · v2.0 standalone · 2026-10-03_
+_Equipment Flow · Doc 02 · v2.3 standalone · 2026-10-05 — consolidated: schema.sql + migrations 001–004_
 
 ---
 
 # 1. Overview
 
-Equipment Flow has **its own MySQL database** (`equipment_flow`) with **25 tables**:
+Equipment Flow has **its own MySQL database** (`equipment_flow`) with **30 tables**:
 
-- 7 platform tables: `users`, `login_history`, `sites`, `site_supervisors`, `settings`, `audit_logs`, `eq_attendance_corrections`.
-- 18 equipment tables, prefixed `eq_`.
+- 7 platform tables: `users`, `login_history`, `sites`, `site_supervisors`, `settings`, `audit_logs`, `schema_migrations`.
+- 23 equipment tables, prefixed `eq_` (19 in `schema.sql` + 4 from migration 001: `eq_fuel_prices`, `eq_fuel_terms`, `eq_invoice_counters`, `eq_invoices`).
+
+**Changes since v2.0 (applied by migrations, `schema.sql` itself is unchanged):**
+
+| Migration | Change |
+|---|---|
+| `001_fuel_difference_invoices_scans.sql` | New tables `eq_fuel_prices`, `eq_fuel_terms`, `eq_invoice_counters`, `eq_invoices`. `eq_payroll_lines.line_type` + `'FuelPriceDifference'`; `source_table` + `'eq_fuel_terms'`. Settings: `eq_finalize_requires_scan=true`, `payroll_finalize_admin_only=true`, `eq_payroll_requires_paper_match` → `false`. Clears old `operator_license_expired` anomalies (licence no longer an anomaly). |
+| `004_standby_hours_given.sql` | Monthly machines: the standby % is replaced by hours given per row. `eq_attendance` + `standby_credit_minutes` (NULL = not decided), `standby_credit_by_user_id`, `standby_credit_at`, `standby_credit_note`; `eq_payroll_attendance_snapshot` + `standby_credit_minutes`. New payroll blocker `STANDBY_HOURS_NOT_SET`. |
+| `003_monthly_hours_and_roles.sql` | `eq_payroll_lines.line_type` + `'HoursShortfall'` (monthly machines billed on hours due). Setting `eq_weekly_off_day = 5` (Friday). `eq_rate_cards.monthly_working_days` is no longer used by billing (working days = days of the month minus the weekly day off). |
+| `002_fuel_diff_deduct_when_lower.sql` | `eq_fuel_diff_allow_negative=true`: when the official price falls below the machine base price, the difference is deducted from the vendor. |
 
 | Item | Value |
 |---|---|
-| Files | `database/schema.sql`, `database/seed.sql`, `database/rollback_drop_all.sql` (dev only) |
+| Files | `database/schema.sql`, `database/seed.sql`, `database/migrations/NNN_*.sql`, `database/applyMigrations.js`, `database/reset_data.sql`, `database/rollback_drop_all.sql` (dev only) |
 | Engine / charset | InnoDB, utf8mb4 (`utf8mb4_unicode_ci` on CREATE DATABASE; MySQL 8 may use `utf8mb4_0900_ai_ci`) |
 | Idempotent | Yes. `CREATE TABLE IF NOT EXISTS`, `INSERT IGNORE`. Both files were run twice on an empty database without error; the rollback was then run and the schema re-applied (verified while writing this document). |
 | First admin | `node scripts/createAdmin.js --username admin --name "System Admin"` prints a temporary password (bcrypt hash stored). |
-| Future changes | Numbered files in `database/migrations/NNN_description.sql`, plus a `schema_migrations` table created by `scripts/migrate.js` (phase P0). |
+| Changes | Numbered files in `database/migrations/NNN_description.sql`, applied once each in name order by `database/applyMigrations.js` (`npm run migrate`, initDb, tests) and recorded in `schema_migrations`. Never edit an applied file. |
 
 Create the database:
 
@@ -60,6 +69,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES ON equipm
 | 17 | `eq_payroll_lines` | Statement lines | signed amounts, source links |
 | 18 | `eq_payroll_attendance_snapshot` | Frozen rows per item | unique (batch, row) |
 | 19 | `eq_attendance_corrections` | Corrections inside finalized periods | open → resolved by an adjustment |
+| 20 | `eq_fuel_prices` | Official fuel price per currency, effective-dated | unique (currency, effective_from); valid until next row |
+| 21 | `eq_fuel_terms` | Fuel-difference terms per machine (base price, L/h) | effective-dated; a change closes the old row |
+| 22 | `eq_invoice_counters` | Invoice number sequence per kind + year | never reused |
+| 23 | `eq_invoices` | Official invoices issued at batch finalize | unique invoice_no and (kind, year, seq) |
+| M | `schema_migrations` | Applied migration files | created by `applyMigrations.js` |
 
 ### Rules enforced in the service layer
 
@@ -73,7 +87,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES ON equipm
 
 | Key | Default | Meaning |
 |---|---|---|
-| `eq_payroll_requires_paper_match` | `true` | Payroll includes only Matched rows |
+| `eq_payroll_requires_paper_match` | `false` | `true` = payroll includes only Matched rows (set to `false` by 001) |
 | `eq_paper_tolerance_minutes` | `10` | Max paper vs electronic difference for Matched |
 | `eq_meter_tolerance_pct` | `15` | Meter delta vs working hours → `meter_mismatch` |
 | `eq_long_session_review_hours` | `16` | Long session → `long_session` / forgotten check-out |
@@ -84,8 +98,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES ON equipm
 | `week_gate_enabled` | `true` | Weekly submit gate |
 | `company_name` | `ASIK ENGINEERING CONSTRUCTION` | Printed on documents |
 | `app_time_zone` | `Asia/Beirut` | Business time zone (env `APP_TIME_ZONE` overrides) |
-
-Optional, add when needed: `payroll_finalize_admin_only` (`true`). The settings service caches values in memory and invalidates the cache on `PUT /api/settings/:key`.
+| `eq_finalize_requires_scan` | `true` | Signed sheet scan required to FINALIZE (not to generate) — 001 |
+| `eq_fuel_diff_allow_negative` | `true` | Fuel price below base → difference deducted from vendor — 002 |
+| `payroll_finalize_admin_only` | `true` | Finalize / mark paid by Admin only — 001 |
+| `eq_weekly_off_day` | `5` | Weekly day off for monthly machines (0=Sunday … 5=Friday) — 003 | The settings service caches values in memory and invalidates the cache on `PUT /api/settings/:key`.
 
 # 4. Query recipes
 
@@ -189,11 +205,14 @@ ORDER BY b.eq_batch_id DESC LIMIT 1;
 
 # 5. Full SQL
 
-## 5.1 `database/schema.sql`
+## 5.1 Consolidated schema (`schema.sql` + migrations 001–004)
+
+For a fresh install run `schema.sql`, `seed.sql`, then `npm run migrate`. The block below is the resulting final state in one file.
 
 ```sql
 -- =====================================================================
--- Equipment Flow — database/schema.sql   (STANDALONE system, own database)
+-- Equipment Flow — CONSOLIDATED CURRENT SCHEMA = schema.sql + migrations 001 + 002 + 003 + 004
+-- 30 tables (25 base + eq_fuel_prices, eq_fuel_terms, eq_invoice_counters, eq_invoices + schema_migrations)
 -- MySQL 8.0+ (also runs on MariaDB 10.6+ for local tests).
 -- Idempotent: CREATE TABLE IF NOT EXISTS everywhere. Run on an EMPTY database:
 --   CREATE DATABASE equipment_flow CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -526,6 +545,10 @@ CREATE TABLE IF NOT EXISTS eq_attendance (
   break_minutes    INT NOT NULL DEFAULT 0,
   breakdown_minutes INT NOT NULL DEFAULT 0,
   standby_minutes  INT NOT NULL DEFAULT 0,
+  standby_credit_minutes INT NULL COMMENT 'Monthly machines: standby minutes paid, set by Admin/Accountant; NULL = not set',
+  standby_credit_by_user_id INT NULL,
+  standby_credit_at DATETIME NULL,
+  standby_credit_note VARCHAR(500) NULL,
   working_minutes  INT NULL COMMENT 'Informational: gross - breaks - breakdown - standby (break policy applied at billing)',
   work_description VARCHAR(500) NULL,
   remarks          TEXT NULL,
@@ -563,6 +586,8 @@ CREATE TABLE IF NOT EXISTS eq_attendance (
   CONSTRAINT fk_eqa_ack_by    FOREIGN KEY (anomaly_ack_by_user_id) REFERENCES users (user_id),
   CONSTRAINT fk_eqa_timesheet FOREIGN KEY (timesheet_id) REFERENCES eq_timesheets (timesheet_id),
   CONSTRAINT chk_eqa_times    CHECK (check_out_time IS NULL OR check_in_time IS NULL OR check_out_time > check_in_time),
+  CONSTRAINT fk_eqa_credit_by FOREIGN KEY (standby_credit_by_user_id) REFERENCES users (user_id),
+  CONSTRAINT chk_eqa_credit   CHECK (standby_credit_minutes IS NULL OR standby_credit_minutes BETWEEN 0 AND 1440),
   CONSTRAINT chk_eqa_meter    CHECK (meter_end IS NULL OR meter_start IS NULL OR meter_end >= meter_start)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -751,12 +776,12 @@ CREATE TABLE IF NOT EXISTS eq_payroll_items (
 CREATE TABLE IF NOT EXISTS eq_payroll_lines (
   eq_line_id       BIGINT NOT NULL AUTO_INCREMENT,
   eq_item_id       INT NOT NULL,
-  line_type        ENUM('Work','Overtime','Standby','Breakdown','MinimumTopUp','MonthlyBase','AbsenceDeduction','BreakdownDeduction','Operator','Fuel','Adjustment') NOT NULL,
+  line_type        ENUM('Work','Overtime','Standby','Breakdown','MinimumTopUp','MonthlyBase','AbsenceDeduction','BreakdownDeduction','Operator','Fuel','Adjustment','FuelPriceDifference','HoursShortfall') NOT NULL,
   quantity         DECIMAL(12,4) NOT NULL,
   unit             ENUM('h','day','month','L','item') NOT NULL,
   unit_price       DECIMAL(12,3) NOT NULL,
   amount           DECIMAL(14,2) NOT NULL COMMENT 'Signed',
-  source_table     ENUM('eq_fuel_issues','eq_adjustments') NULL,
+  source_table     ENUM('eq_fuel_issues','eq_adjustments','eq_fuel_terms') NULL,
   source_id        INT NULL,
   note             VARCHAR(500) NULL,
   PRIMARY KEY (eq_line_id),
@@ -779,6 +804,7 @@ CREATE TABLE IF NOT EXISTS eq_payroll_attendance_snapshot (
   work_minutes     INT NOT NULL DEFAULT 0,
   overtime_minutes INT NOT NULL DEFAULT 0,
   standby_minutes  INT NOT NULL DEFAULT 0,
+  standby_credit_minutes INT NULL,
   breakdown_minutes INT NOT NULL DEFAULT 0,
   break_minutes    INT NOT NULL DEFAULT 0,
   topup_minutes    INT NOT NULL DEFAULT 0,
@@ -820,6 +846,80 @@ CREATE TABLE IF NOT EXISTS eq_attendance_corrections (
   CONSTRAINT fk_eqac_by FOREIGN KEY (corrected_by_user_id) REFERENCES users (user_id),
   CONSTRAINT fk_eqac_resolved_by FOREIGN KEY (resolved_by_user_id) REFERENCES users (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- =====================================================================
+-- E. Added by migration 001 (fuel price difference + official invoices)
+-- =====================================================================
+
+-- 20. National fuel price list (effective-dated per currency)
+CREATE TABLE IF NOT EXISTS eq_fuel_prices (
+  fuel_price_id    INT NOT NULL AUTO_INCREMENT,
+  currency         CHAR(3) NOT NULL,
+  effective_from   DATE NOT NULL,
+  price_per_liter  DECIMAL(12,3) NOT NULL,
+  note             VARCHAR(500) NULL,
+  created_by_user_id INT NULL,
+  created_at       TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (fuel_price_id),
+  UNIQUE KEY uq_eqfp_cur_from (currency, effective_from),
+  CONSTRAINT fk_eqfp_user FOREIGN KEY (created_by_user_id) REFERENCES users (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 21. Fuel price-difference terms per machine (effective-dated)
+CREATE TABLE IF NOT EXISTS eq_fuel_terms (
+  fuel_terms_id    INT NOT NULL AUTO_INCREMENT,
+  equipment_id     INT NOT NULL,
+  effective_from   DATE NOT NULL,
+  effective_to     DATE NULL,
+  base_price_per_liter DECIMAL(12,3) NOT NULL COMMENT 'Fuel price agreed when the machine joined the project',
+  liters_per_hour  DECIMAL(8,3) NOT NULL COMMENT 'Approximate consumption per working hour',
+  note             VARCHAR(500) NULL,
+  created_by_user_id INT NULL,
+  created_at       TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (fuel_terms_id),
+  KEY idx_eqft_equipment (equipment_id, effective_from),
+  CONSTRAINT fk_eqft_equipment FOREIGN KEY (equipment_id) REFERENCES eq_equipment (equipment_id),
+  CONSTRAINT fk_eqft_user FOREIGN KEY (created_by_user_id) REFERENCES users (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 22. Official invoice number sequences (per kind + year)
+CREATE TABLE IF NOT EXISTS eq_invoice_counters (
+  kind             ENUM('Vendor','Machine','FuelDiff') NOT NULL,
+  year             SMALLINT NOT NULL,
+  last_seq         INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (kind, year)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 23. Official invoices issued at batch finalize
+CREATE TABLE IF NOT EXISTS eq_invoices (
+  invoice_id       INT NOT NULL AUTO_INCREMENT,
+  invoice_no       VARCHAR(30) NOT NULL,
+  kind             ENUM('Vendor','Machine','FuelDiff') NOT NULL,
+  year             SMALLINT NOT NULL,
+  seq              INT NOT NULL,
+  eq_batch_id      INT NOT NULL,
+  vendor_id        INT NOT NULL,
+  equipment_id     INT NULL,
+  eq_item_id       INT NULL,
+  currency         CHAR(3) NOT NULL,
+  amount           DECIMAL(14,2) NOT NULL,
+  issued_at        DATETIME NOT NULL,
+  PRIMARY KEY (invoice_id),
+  UNIQUE KEY uq_eqinv_no (invoice_no),
+  UNIQUE KEY uq_eqinv_kind_seq (kind, year, seq),
+  KEY idx_eqinv_batch (eq_batch_id),
+  CONSTRAINT fk_eqinv_batch FOREIGN KEY (eq_batch_id) REFERENCES eq_payroll_batches (eq_batch_id),
+  CONSTRAINT fk_eqinv_vendor FOREIGN KEY (vendor_id) REFERENCES eq_vendors (vendor_id),
+  CONSTRAINT fk_eqinv_equipment FOREIGN KEY (equipment_id) REFERENCES eq_equipment (equipment_id),
+  CONSTRAINT fk_eqinv_item FOREIGN KEY (eq_item_id) REFERENCES eq_payroll_items (eq_item_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 24. Migration bookkeeping (created by database/applyMigrations.js)
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  filename         VARCHAR(255) NOT NULL PRIMARY KEY,
+  applied_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
 ```
 
 ## 5.2 `database/seed.sql`
@@ -827,7 +927,7 @@ CREATE TABLE IF NOT EXISTS eq_attendance_corrections (
 ```sql
 -- database/seed.sql (idempotent). The first Admin user is created by scripts/createAdmin.js (bcrypt), not here.
 INSERT IGNORE INTO settings (setting_key, setting_value) VALUES
-  ('eq_payroll_requires_paper_match', 'true'),   -- payroll only takes rows whose paper_status = Matched
+  ('eq_payroll_requires_paper_match', 'false'),  -- true = payroll only takes rows whose paper_status = Matched
   ('eq_paper_tolerance_minutes',      '10'),     -- paper vs electronic time difference still "Matched"
   ('eq_meter_tolerance_pct',          '15'),     -- meter delta vs working hours: above -> anomaly
   ('eq_long_session_review_hours',    '16'),     -- open/long session -> anomaly (warning only)
@@ -855,9 +955,12 @@ SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS eq_attendance_corrections, eq_payroll_attendance_snapshot, eq_payroll_lines, eq_payroll_items,
   eq_payroll_batches, eq_paper_checks, eq_timesheet_scans, eq_adjustments, eq_fuel_issues, eq_downtime_periods,
   eq_attendance, eq_timesheets, eq_site_assignments, eq_rate_cards, eq_operators, eq_equipment, eq_types,
-  eq_vendor_contracts, eq_vendors, audit_logs, settings, site_supervisors, sites, login_history, users;
+  eq_vendor_contracts, eq_vendors, audit_logs, settings, site_supervisors, sites, login_history, users,
+  eq_invoices, eq_invoice_counters, eq_fuel_terms, eq_fuel_prices, schema_migrations;
 SET FOREIGN_KEY_CHECKS = 1;
 ```
+
+> Note: the repo copy of `rollback_drop_all.sql` still lists only the 25 base tables; the version above also drops the 4 migration tables and `schema_migrations`.
 
 # 6. Test database
 

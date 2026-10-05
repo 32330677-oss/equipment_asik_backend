@@ -183,6 +183,12 @@ exports.endSupervisor = async (req, res) => {
     if (!before) throw AppError.notFound('Supervisor period');
     if (to_date < addDays(before.from_date, -1)) throw AppError.validation({ to_date: 'cannot be before from_date - 1' });
     if (before.to_date && before.to_date < to_date) throw AppError.validation({ to_date: 'can only shorten a period' });
+    if (to_date < before.from_date) {
+      // from_date - 1 = the period never happened: delete it (the CHECK to_date >= from_date forbids storing it)
+      await conn.execute('DELETE FROM site_supervisors WHERE site_supervisor_id = ?', [id]);
+      await audit.log(conn, { table: 'site_supervisors', id, action: 'cancel', oldValues: before, ...audit.ctx(req) });
+      return { ...before, to_date, cancelled: true };
+    }
     await conn.execute('UPDATE site_supervisors SET to_date = ? WHERE site_supervisor_id = ?', [to_date, id]);
     await audit.log(conn, { table: 'site_supervisors', id, action: 'end', oldValues: { to_date: before.to_date }, newValues: { to_date }, ...audit.ctx(req) });
     return { ...before, to_date };
@@ -206,9 +212,16 @@ exports.replaceSupervisor = async (req, res) => {
     if (cur[0]) {
       if (cur[0].user_id === data.user_id) throw AppError.conflict('SAME_SUPERVISOR', 'This user is already the supervisor on that date.');
       const newEnd = addDays(data.first_day, -1);
-      await conn.execute('UPDATE site_supervisors SET to_date = ? WHERE site_supervisor_id = ?', [newEnd, cur[0].site_supervisor_id]);
-      await audit.log(conn, { table: 'site_supervisors', id: cur[0].site_supervisor_id, action: 'end', oldValues: { to_date: cur[0].to_date }, newValues: { to_date: newEnd }, reason: 'replaced', ...audit.ctx(req) });
-      ended = { ...cur[0], to_date: newEnd };
+      if (newEnd < cur[0].from_date) {
+        // replaced from its very first day: the old period never happened
+        await conn.execute('DELETE FROM site_supervisors WHERE site_supervisor_id = ?', [cur[0].site_supervisor_id]);
+        await audit.log(conn, { table: 'site_supervisors', id: cur[0].site_supervisor_id, action: 'cancel', oldValues: cur[0], reason: 'replaced from the first day', ...audit.ctx(req) });
+        ended = { ...cur[0], to_date: newEnd, cancelled: true };
+      } else {
+        await conn.execute('UPDATE site_supervisors SET to_date = ? WHERE site_supervisor_id = ?', [newEnd, cur[0].site_supervisor_id]);
+        await audit.log(conn, { table: 'site_supervisors', id: cur[0].site_supervisor_id, action: 'end', oldValues: { to_date: cur[0].to_date }, newValues: { to_date: newEnd }, reason: 'replaced', ...audit.ctx(req) });
+        ended = { ...cur[0], to_date: newEnd };
+      }
     }
     const created = await insertPeriod(conn, req, { siteId, userId: data.user_id, shiftType: data.shift_type, fromDate: data.first_day, toDate: cur[0] ? cur[0].to_date : null });
     return { ended, created };

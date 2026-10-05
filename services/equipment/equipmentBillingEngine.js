@@ -5,6 +5,8 @@
 
 const toCents = (v) => Math.round(Number(v || 0) * 100);
 const roundCents = (x) => Math.round(x); // half-away-from-zero is fine for positive values
+/** Money amount -> cents, rounded once; toFixed removes binary noise (1000 x 1.235 = 1234.9999...). */
+const exactCents = (amount) => Math.round(Number((Number(amount) * 100).toFixed(6)));
 const DAY_STATUSES = ['Working', 'Standby', 'Breakdown', 'Absent', 'Holiday'];
 
 /** Minutes for one attendance row (already clipped/validated when stored). */
@@ -113,19 +115,29 @@ function billDaily(rows, rate) {
 }
 
 // ---------------------------------------------------------------- Monthly
+/** Standby minutes given (paid) on one row of a monthly machine: set by the Admin/Accountant, never above one day. */
+function standbyCredit(row, maxCredit) {
+  const c = Number(row.standby_credit_minutes);
+  if (row.standby_credit_minutes === null || row.standby_credit_minutes === undefined || !Number.isFinite(c) || c <= 0) return 0;
+  if (row.day_status === 'Standby') return Math.min(Math.round(c), maxCredit);
+  if (row.day_status !== 'Working') return 0; // no standby on this row any more
+  return Math.min(Math.round(c), maxCredit, Math.round(Number(row.standby_minutes || 0)));
+}
+
 // A monthly machine owes a number of hours per month:
 //   working days of the month = calendar days minus the weekly day off (Friday by default)
 //   daily price  = monthly price / working days of that month
 //   hourly price = daily price / hours per day agreed for the machine (standard_hours_per_day)
 //   required hours = deployed working days (minus official holidays recorded) x hours per day
-//   billable hours = work + standby x standby% + breakdown x breakdown%   (breaks deducted per break_policy)
+//   billable hours = work + standby hours GIVEN by the Admin/Accountant per row (standby_credit_minutes, max hours per day)
+//                    + breakdown x breakdown%   (breaks deducted per break_policy). No standby % for monthly machines.
 // Billable >= required -> full base + overtime (extra hours x hourly price, or the overtime_rate typed on the card).
 // Billable <  required -> base - missing hours x hourly price.
 // ctx.months: [{ month:'2026-10', workingDays:26, assignedWorkingDays:26, holidayDays:0, daysInMonth, assignedDays }]
 function billMonthly(rows, rate, ctx) {
   const monthly = toCents(rate.monthly_rate);
   const hpd = Number(rate.standard_hours_per_day);
-  const sbPct = Number(rate.standby_billable_pct) / 100;
+  const maxCredit = Math.round(hpd * 60);
   const bdPct = Number(rate.breakdown_billable_pct) / 100;
   const t = { work: 0, ot: 0, standby: 0, breakdown: 0, workedDays: 0, baseCents: 0, shortMinutes: 0, requiredMinutes: 0, billableMinutes: 0 };
   const lines = [];
@@ -133,17 +145,18 @@ function billMonthly(rows, rate, ctx) {
   const months = ctx.months || [];
   for (const mo of months) {
     const mRows = rows.filter((r) => !r.record_date || months.length === 1 || String(r.record_date).slice(0, 7) === mo.month);
-    let work = 0; let standby = 0; let breakdown = 0;
+    let work = 0; let standby = 0; let breakdown = 0; let credit = 0;
     for (const r of mRows) {
       const m = dayMinutes(r, rate);
       work += m.work; standby += m.standby; breakdown += m.breakdown;
+      credit += standbyCredit(r, maxCredit);
       if (m.status === 'Working' && m.work > 0) t.workedDays += 1;
     }
     const wd = Math.max(1, Number(mo.workingDays));
     const hourlyC = monthly / wd / hpd; // cents per hour, not rounded
     const baseC = roundCents(monthly * mo.assignedWorkingDays / wd);
     const requiredMin = Math.max(0, Math.round((mo.assignedWorkingDays - (mo.holidayDays || 0)) * hpd * 60));
-    const billableMin = Math.round(work + standby * sbPct + breakdown * bdPct);
+    const billableMin = Math.round(work + credit + breakdown * bdPct);
     const label = `${mo.month}: ${mo.assignedWorkingDays} of ${wd} working days`;
     lines.push({ line_type: 'MonthlyBase', quantity: round4(mo.assignedWorkingDays / wd), unit: 'month', unit_price_cents: monthly, amount_cents: baseC, note: label });
     let otMin = 0; let shortMin = 0;
@@ -162,7 +175,7 @@ function billMonthly(rows, rate, ctx) {
     details.push({ month: mo.month, working_days: wd, deployed_working_days: mo.assignedWorkingDays, holiday_days: mo.holidayDays || 0,
       hours_per_day: hpd, hourly_price: Math.round(hourlyC * 10) / 1000, daily_price: Math.round(monthly / wd) / 100,
       required_hours: requiredMin / 60, billable_hours: billableMin / 60, overtime_hours: otMin / 60, missing_hours: shortMin / 60,
-      work_hours: work / 60, standby_hours: standby / 60, breakdown_hours: breakdown / 60 });
+      work_hours: work / 60, standby_hours: standby / 60, standby_paid_hours: credit / 60, breakdown_hours: breakdown / 60 });
   }
   return { totals: t, lines: lines.filter((l) => l.quantity !== 0 || l.line_type === 'MonthlyBase'), monthly_details: details };
 }
@@ -189,8 +202,10 @@ function billItem(rows, rate, ctx = {}, extras = {}) {
   }
   if (rate.fuel_policy !== 'CompanySuppliesFree') {
     for (const f of extras.fuel || []) {
-      res.lines.push({ line_type: 'Fuel', quantity: Number(f.liters), unit: 'L', unit_price_cents: toCents(f.price_per_liter),
-                       amount_cents: -roundCents(Number(f.liters) * toCents(f.price_per_liter)) });
+      const price = Number(f.price_per_liter || 0);
+      // the price has 3 decimals: multiply first, round the AMOUNT once (never the unit price)
+      res.lines.push({ line_type: 'Fuel', quantity: Number(f.liters), unit: 'L', unit_price_cents: roundCents(price * 100), unit_price_exact: price,
+                       amount_cents: -exactCents(Number(f.liters) * price) });
     }
   }
   // fuel price difference (company pays the increase of the national fuel price): computed by the caller per day
@@ -204,4 +219,4 @@ function billItem(rows, rate, ctx = {}, extras = {}) {
   return { ...res, gross_cents: gross, deductions_cents: deductions, net_cents: gross - deductions };
 }
 
-module.exports = { dayMinutes, billItem, billHourly, billDaily, billMonthly, minimumTopUp, otThresholdMin };
+module.exports = { standbyCredit, exactCents, dayMinutes, billItem, billHourly, billDaily, billMonthly, minimumTopUp, otThresholdMin };

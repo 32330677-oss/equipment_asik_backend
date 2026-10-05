@@ -72,6 +72,7 @@ async function rowView(conn, id) {
     operator_id: row.operator_id, operator_name: operatorName, check_in_time: row.check_in_time, check_out_time: row.check_out_time,
     meter_start: row.meter_start, meter_end: row.meter_end, gross_minutes: row.gross_minutes, break_minutes: row.break_minutes,
     breakdown_minutes: row.breakdown_minutes, standby_minutes: row.standby_minutes, working_minutes: row.working_minutes,
+    standby_credit_minutes: row.standby_credit_minutes ?? null, standby_credit_at: row.standby_credit_at ?? null, standby_credit_note: row.standby_credit_note ?? null,
     work_description: row.work_description, remarks: row.remarks, admin_rejection_notes: row.admin_rejection_notes,
     anomaly_code: row.anomaly_code, anomaly_detail: row.anomaly_detail, anomaly_acknowledged: Boolean(row.anomaly_ack_at),
     paper_status: row.paper_status, sheet: sheet ? { ...sheet, sheet_row_no: row.sheet_row_no } : null,

@@ -4,6 +4,7 @@ const { v, validate, pageParams, parseId } = require('../utils/validate');
 const passwords = require('../services/passwords');
 const audit = require('../services/audit');
 const { businessToday } = require('../utils/businessDate');
+const { newPasswordVersion } = require('./authController');
 
 const ROLES = ['Admin', 'Supervisor', 'Accountant'];
 const PUBLIC_COLS = `user_id, username, email, full_name, phone_number, role, status, must_change_password,
@@ -134,9 +135,12 @@ exports.resetPassword = async (req, res) => {
   const temp = passwords.temporary();
   const hash = await passwords.hash(temp);
   await withTransaction(async (conn) => {
-    await loadUser(conn, id, true);
+    const [[cur]] = await conn.execute('SELECT password_changed_at FROM users WHERE user_id = ? FOR UPDATE', [id]);
+    if (!cur) throw AppError.notFound('User');
+    // a reset ends every session of the user (requireAuth compares the password version)
     await conn.execute(
-      'UPDATE users SET password_hash = ?, must_change_password = 1, failed_login_attempts = 0, locked_until = NULL WHERE user_id = ?', [hash, id]);
+      'UPDATE users SET password_hash = ?, must_change_password = 1, failed_login_attempts = 0, locked_until = NULL, password_changed_at = ? WHERE user_id = ?',
+      [hash, newPasswordVersion(cur.password_changed_at), id]);
     await audit.log(conn, { table: 'users', id, action: 'reset_password', ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: { user_id: id, temporary_password: temp }, message: 'Temporary password created; it is shown only once.' });

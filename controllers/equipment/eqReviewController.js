@@ -8,6 +8,7 @@ const S = require('../../services/equipment/eqAttendanceService');
 const lock = require('../../services/equipment/eqLock');
 const sheets = require('../../services/equipment/eqTimesheetService');
 const att = require('./eqAttendanceController');
+const C = require('../../services/equipment/eqCommon');
 
 exports.list = async (req, res) => {
   const { page, pageSize, offset } = pageParams(req.query);
@@ -45,7 +46,13 @@ exports.get = async (req, res) => {
   const [history] = await pool.execute(
     `SELECT a.action_type, a.created_at, a.reason, u.full_name AS user_name FROM audit_logs a LEFT JOIN users u ON u.user_id = a.user_id
      WHERE a.table_name = 'eq_attendance' AND a.record_id = ? ORDER BY a.log_id`, [id]);
-  res.json({ status: 'success', data: { ...view, paper_checks: checks, corrections, history } });
+  const card = await C.rateCardOn(pool, view.equipment_id, view.record_date);
+  const standby = {
+    billing_mode: card ? card.billing_mode : null,
+    applies: Boolean(card && card.billing_mode === 'Monthly' && (view.day_status === 'Standby' || Number(view.standby_minutes) > 0)),
+    max_hours: card ? maxStandbyHours(view, card) : null,
+  };
+  res.json({ status: 'success', data: { ...view, standby_credit: standby, paper_checks: checks, corrections, history } });
 };
 
 exports.approve = async (req, res) => {
@@ -177,4 +184,39 @@ exports.resolveCorrection = async (req, res) => {
     await audit.log(conn, { table: 'eq_attendance_corrections', id, action: 'resolve', newValues: d, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: { correction_id: id, adjustment_status: 'Resolved' } });
+};
+
+// ------------------------------------------------------------------ standby hours given (monthly machines)
+/** Most hours that can be given: one day of the card; inside a Working day, not more than the standby recorded. */
+function maxStandbyHours(row, card) {
+  const day = Number(card.standard_hours_per_day);
+  if (row.day_status === 'Standby') return day;
+  return Math.min(day, Math.round((Number(row.standby_minutes || 0) / 60) * 100) / 100);
+}
+
+/** Admin/Accountant decide how many standby hours a MONTHLY machine is paid for on this row (no %). hours = null clears it. */
+exports.standbyCredit = async (req, res) => {
+  const id = parseId(req.params.id);
+  const body = req.body || {};
+  const d = validate(body, { hours: v.number({ min: 0, max: 24, decimals: 2 }), note: v.string({ max: 500 }) });
+  const clear = body.hours === null;
+  if (!clear && d.hours === undefined) throw AppError.validation({ hours: 'is required (or null to clear)' });
+  await withTransaction(async (conn) => {
+    const row = await S.loadRow(conn, id, true);
+    await lock.assertEqEditable(conn, row);
+    const card = await C.rateCardOn(conn, row.equipment_id, row.record_date);
+    if (!card) throw AppError.conflict('NO_RATE_CARD', `The machine has no rate card on ${row.record_date}.`);
+    if (card.billing_mode !== 'Monthly') throw AppError.conflict('NOT_MONTHLY', 'Standby hours are given only for monthly machines; hourly and daily cards use the standby % of the card.');
+    if (!(row.day_status === 'Standby' || Number(row.standby_minutes) > 0)) throw AppError.conflict('NO_STANDBY', 'This row has no standby time.');
+    const max = maxStandbyHours(row, card);
+    if (!clear && d.hours > max) throw AppError.validation({ hours: `cannot be more than ${max} h for this row` });
+    const minutes = clear ? null : Math.round(d.hours * 60);
+    await conn.execute(
+      `UPDATE eq_attendance SET standby_credit_minutes = ?, standby_credit_by_user_id = ?, standby_credit_at = ?, standby_credit_note = ?
+       WHERE eq_attendance_id = ?`,
+      [minutes, clear ? null : req.user.user_id, clear ? null : businessNow(), clear ? null : (d.note || null), id]);
+    await audit.log(conn, { table: 'eq_attendance', id, action: 'standby_credit',
+      oldValues: { standby_credit_minutes: row.standby_credit_minutes }, newValues: { standby_credit_minutes: minutes, note: d.note || null }, ...audit.ctx(req) });
+  });
+  res.json({ status: 'success', data: await att.rowView(pool, id) });
 };

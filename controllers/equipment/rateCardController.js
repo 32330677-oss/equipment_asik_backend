@@ -158,10 +158,13 @@ exports.preview = async (req, res) => {
   const engineRows = rows.map((r, i) => {
     const s = validate(r, {
       day_status: v.enumOf(['Working', 'Standby', 'Breakdown', 'Absent', 'Holiday'], { required: true }),
-      gross_hours: HOURS(), break_hours: HOURS(), breakdown_hours: HOURS(), standby_hours: HOURS(),
+      gross_hours: HOURS(), break_hours: HOURS(), breakdown_hours: HOURS(), standby_hours: HOURS(), standby_paid_hours: HOURS(),
     });
     if (s.day_status === 'Working' && !(s.gross_hours > 0)) throw AppError.validation({ [`sample_rows[${i}].gross_hours`]: 'is required for Working' });
-    return { day_status: s.day_status, gross_minutes: toMin(s.gross_hours), break_minutes: toMin(s.break_hours), breakdown_minutes: toMin(s.breakdown_hours), standby_minutes: toMin(s.standby_hours) };
+    // monthly: standby hours given by the accountant; default in the test = all the standby of the sample row
+    const fullStandby = s.day_status === 'Standby' ? (toMin(s.gross_hours) || Math.round(Number(card.standard_hours_per_day) * 60)) : toMin(s.standby_hours);
+    return { day_status: s.day_status, gross_minutes: toMin(s.gross_hours), break_minutes: toMin(s.break_hours), breakdown_minutes: toMin(s.breakdown_hours), standby_minutes: toMin(s.standby_hours),
+      standby_credit_minutes: s.standby_paid_hours !== undefined && s.standby_paid_hours !== null ? toMin(s.standby_paid_hours) : fullStandby };
   });
   // Monthly: a real calendar month (working days = days minus the weekly day off)
   const month = /^\d{4}-\d{2}$/.test(String(body.month || '')) ? String(body.month) : businessToday().slice(0, 7);
@@ -172,7 +175,7 @@ exports.preview = async (req, res) => {
   res.json({
     status: 'success',
     data: {
-      lines: result.lines.map((l) => ({ ...l, unit_price: l.unit_price_cents / 100, amount: l.amount_cents / 100 })),
+      lines: result.lines.map((l) => ({ ...l, unit_price: l.unit_price_exact ?? l.unit_price_cents / 100, amount: l.amount_cents / 100 })),
       gross: result.gross_cents / 100, deductions: result.deductions_cents / 100, net: result.net_cents / 100,
       totals: result.totals, monthly: result.monthly_details || null,
     },

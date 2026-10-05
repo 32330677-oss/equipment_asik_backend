@@ -66,6 +66,12 @@ test('scenario: review, fuel, adjustments, preview numbers, finalize, invoices',
   await ok(h.api().post(`/api/equipment/admin/attendance/${ids.e27}/ack-anomaly`).set(A()).send({ note: 'meter replaced' }));
   const all = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE status = 'Submitted'");
   await ok(h.api().post('/api/equipment/admin/attendance/approve').set(A()).send({ ids: all.map((r) => r.eq_attendance_id) }));
+  // monthly crane standby day: no %; the accountant gives the hours (max = hours per day of the card)
+  const tooMany = await h.api().patch(`/api/equipment/admin/attendance/${ids.c26}/standby-credit`).set(ACC()).send({ hours: 9 });
+  assert.strictEqual(tooMany.body.code, 'VALIDATION_ERROR');
+  const blk = await ok(h.api().get('/api/equipment/payroll/blockers?start_date=2026-09-01&end_date=2026-09-30').set(ACC()));
+  assert.ok(blk.find((b) => b.code === 'STANDBY_HOURS_NOT_SET'), 'standby hours must be decided before paying');
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${ids.c26}/standby-credit`).set(ACC()).send({ hours: 4 }));
   const fuel = await ok(h.api().get('/api/equipment/fuel-issues?unpriced=true').set(ACC()));
   await ok(h.api().patch(`/api/equipment/fuel-issues/${fuel[0].fuel_issue_id}`).set(ACC()).send({ price_per_liter: 1.1 }));
   await ok(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.exc.equipment_id, adjustment_date: '2026-09-10', adjustment_type: 'Mobilization', amount: 150, reason: 'Transport' }));
@@ -75,7 +81,7 @@ test('scenario: review, fuel, adjustments, preview numbers, finalize, invoices',
   const net = (m) => p.items.find((i) => i.equipment_id === m.equipment_id).net;
   assert.strictEqual(net(F.exc), '1487.00');
   assert.strictEqual(net(F.loader), '250.00'); // 1 day x 300 - penalty 50 (no operator line)
-  assert.strictEqual(net(F.crane), '593.75'); // 208 h due, 19 h done (8 + 7 + standby 8 x 50%) -> 189 h x 31.25 missing
+  assert.strictEqual(net(F.crane), '593.75'); // 208 h due, 19 h done (8 + 7 + standby 4 h given) -> 189 h x 31.25 missing
   assert.strictEqual(p.totals[0].net, '2330.75');
   const batch = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send(SC));
   const no = await h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A());

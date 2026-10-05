@@ -148,7 +148,7 @@ function rateSummary(r) {
     const parts = [`Monthly ${fmt.num(r.monthly_rate)}`, `${n(r.standard_hours_per_day)} h per working day`,
       'hourly price = monthly / working days of the month / hours per day',
       `overtime ${r.overtime_rate !== null && r.overtime_rate !== undefined ? `at ${fmt.num(r.overtime_rate)}/h` : 'at the hourly price'}`,
-      `standby ${n(r.standby_billable_pct)}%`, `breakdown ${n(r.breakdown_billable_pct)}%`, `breaks ${r.break_policy === 'Paid' ? 'paid' : 'deducted'}`];
+      'standby: hours given per day by the accountant', `breakdown ${n(r.breakdown_billable_pct)}%`, `breaks ${r.break_policy === 'Paid' ? 'paid' : 'deducted'}`];
     return parts.join(' | ');
   }
   const price = r.billing_mode === 'Hourly' ? `${fmt.num(r.hourly_rate)}/h` : `${fmt.num(r.daily_rate)}/day`;

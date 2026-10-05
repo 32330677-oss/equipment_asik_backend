@@ -21,6 +21,10 @@ function errorHandler(err, req, res, next) {
   if (err && (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE')) {
     return res.status(400).json({ status: 'error', code: 'VALIDATION_ERROR', message: 'Too many files or unexpected file field.' });
   }
+  // a database CHECK constraint refused the values (MySQL 3819, MariaDB 4025): the request is invalid, not a crash
+  if (err && (err.code === 'ER_CHECK_CONSTRAINT_VIOLATED' || err.errno === 3819 || err.errno === 4025)) {
+    return res.status(409).json({ status: 'error', code: 'INVALID_VALUES', message: 'These values are not allowed (a date or number is out of range).' });
+  }
   if (err && err.code === 'ER_DUP_ENTRY') {
     return res.status(409).json({ status: 'error', code: 'DUPLICATE', message: 'A record with the same unique value already exists.' });
   }

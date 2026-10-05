@@ -58,6 +58,9 @@ before(async () => {
   for (const a of anomalies) await ok(h.api().post(`/api/equipment/admin/attendance/${a.eq_attendance_id}/ack-anomaly`).set(A()).send({ note: 'known' }));
   const all = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE status = 'Submitted'");
   await ok(h.api().post('/api/equipment/admin/attendance/approve').set(A()).send({ ids: all.map((r) => r.eq_attendance_id) }));
+  // monthly crane: the accountant gives 4 h for its standby day (no % for monthly machines)
+  const [sb] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-08'", [F.crane.equipment_id]);
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${sb.eq_attendance_id}/standby-credit`).set(ACC()).send({ hours: 4, note: 'site not ready' }));
   // fuel + adjustment for the excavator (example A)
   await ok(h.api().post('/api/equipment/fuel-issues').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, issue_date: '2026-10-03', liters: 100, price_per_liter: 1.1, receipt_number: 'F-10233' }));
   await ok(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, adjustment_date: '2026-10-01', adjustment_type: 'Mobilization', amount: 150, reason: 'Transport of excavator to S08' }));
@@ -151,9 +154,13 @@ test('finalize locks; supersede creates v2; void rules; accountant finalize sett
 
 test('stale batch cannot be finalized', async () => {
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ ...SCOPE, equipment_id: F.exc.equipment_id }));
-  await new Promise((r) => setTimeout(r, 1100));
-  const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-03'", [F.exc.equipment_id]);
+  const [row] = await h.query("SELECT eq_attendance_id, check_out_time FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-03'", [F.exc.equipment_id]);
+  // remarks / paper do not move money: the batch stays finalizable
   await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'changed after generation' }));
+  assert.strictEqual((await ok(h.api().get(`/api/equipment/payroll/batches/${b.eq_batch_id}`).set(ACC()))).stale, false);
+  // a different check-out changes the billed hours: stale
+  const { addMinutes } = require('../utils/dateTime');
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: addMinutes(row.check_out_time, -30) }));
   const d = await ok(h.api().get(`/api/equipment/payroll/batches/${b.eq_batch_id}`).set(ACC()));
   assert.strictEqual(d.stale, true);
   const f = await h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/finalize`).set(A());

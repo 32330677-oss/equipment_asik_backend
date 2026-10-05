@@ -57,7 +57,10 @@ test('admin creates user; temp password works; must change before anything else'
   assert.strictEqual(weak.body.code, 'WEAK_PASSWORD');
   const ok = await h.api().post('/api/auth/change-password').set(h.auth(tk)).send({ current_password: temp, new_password: 'NewPassword2026' });
   assert.strictEqual(ok.status, 200);
-  const now = await h.api().get('/api/sites').set(h.auth(tk));
+  // the old session ends; the token returned by change-password keeps this device signed in
+  const old = await h.api().get('/api/sites').set(h.auth(tk));
+  assert.strictEqual(old.body.code, 'TOKEN_REVOKED');
+  const now = await h.api().get('/api/sites').set(h.auth(ok.body.data.token));
   assert.strictEqual(now.status, 200);
 });
 
@@ -90,9 +93,11 @@ test('supervisor with open site periods cannot be deactivated', async () => {
 test('reset password unlocks and forces change', async () => {
   const r = await h.api().post('/api/users/4/reset-password').set(A());
   assert.ok(r.body.data.temporary_password);
-  const u = await h.query('SELECT must_change_password FROM users WHERE user_id = 4');
+  const u = await h.query('SELECT must_change_password, password_changed_at FROM users WHERE user_id = 4');
   assert.strictEqual(Number(u[0].must_change_password), 1);
-  await h.query('UPDATE users SET must_change_password = 0 WHERE user_id = 4');
+  assert.ok(u[0].password_changed_at, 'a reset ends the sessions of the user');
+  assert.strictEqual((await h.api().get('/api/auth/me').set(h.auth(h.T.sup9()))).body.code, 'TOKEN_REVOKED');
+  await h.query('UPDATE users SET must_change_password = 0, password_changed_at = NULL WHERE user_id = 4');
 });
 
 test('sites: create, duplicate code, supervisor sees only own sites', async () => {
@@ -116,6 +121,17 @@ test('supervisor periods: overlap refused, replace ends D-1 and opens D, night n
   assert.strictEqual(rep.body.data.created.from_date, '2026-10-15');
   const notSup = await h.api().post('/api/sites/10/supervisors').set(A()).send({ user_id: 2, from_date: '2026-06-01' });
   assert.strictEqual(notSup.body.code, 'NOT_A_SUPERVISOR');
+});
+
+test('supervisor periods: replacing from the first day or ending at from_date - 1 cancels the period (no 500)', async () => {
+  const again = await h.api().post('/api/sites/8/supervisors/replace').set(A()).send({ user_id: 3, shift_type: 'Day', first_day: '2026-10-15' });
+  assert.strictEqual(again.status, 201, JSON.stringify(again.body));
+  assert.strictEqual(again.body.data.ended.cancelled, true);
+  const id = again.body.data.created.site_supervisor_id;
+  const cancel = await h.api().patch(`/api/site-supervisors/${id}/end`).set(A()).send({ to_date: '2026-10-14' });
+  assert.strictEqual(cancel.status, 200, JSON.stringify(cancel.body));
+  assert.strictEqual(cancel.body.data.cancelled, true);
+  assert.strictEqual((await h.query('SELECT COUNT(*) AS n FROM site_supervisors WHERE site_supervisor_id = ?', [id]))[0].n, 0);
 });
 
 test('settings validation + audit written', async () => {

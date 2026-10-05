@@ -51,6 +51,11 @@ async function recompute(conn, id) {
   await conn.execute(
     `UPDATE eq_attendance SET gross_minutes = ?, break_minutes = ?, breakdown_minutes = ?, standby_minutes = ?, working_minutes = ?
      WHERE eq_attendance_id = ?`, [gross, brk, breakdown, standby, working, id]);
+  // standby hours given (monthly machines) lose their meaning when the row has no standby any more
+  if (row.standby_credit_minutes !== null && row.standby_credit_minutes !== undefined && row.day_status !== 'Standby' && !(standby > 0)) {
+    await conn.execute(
+      'UPDATE eq_attendance SET standby_credit_minutes = NULL, standby_credit_by_user_id = NULL, standby_credit_at = NULL, standby_credit_note = NULL WHERE eq_attendance_id = ?', [id]);
+  }
   await evaluateAnomalies(conn, id);
   return loadRow(conn, id);
 }
