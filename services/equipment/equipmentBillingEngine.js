@@ -56,7 +56,7 @@ function billHourly(rows, rate) {
   const t = { work: 0, regular: 0, ot: 0, standby: 0, breakdown: 0, topup: 0, standbyBill: 0, breakdownBill: 0, workedDays: 0 };
   for (const r of rows) {
     const m = dayMinutes(r, rate);
-    const regular = Math.min(m.work, thr);
+    const regular = Math.min(m.work, allowOf(r, thr));
     t.work += m.work; t.regular += regular; t.ot += m.work - regular;
     t.standby += m.standby; t.breakdown += m.breakdown;
     t.standbyBill += m.standby * Number(rate.standby_billable_pct) / 100;
@@ -86,24 +86,122 @@ function workFraction(workMin, stdMin, rate) {
   }
 }
 
+/**
+ * Regular (not overtime) minutes this row may still use. A row alone: the threshold. Continuous shifts
+ * (gap <= eq_shift_continuity_minutes) share threshold x shifts; the caller then sets row.regular_allow.
+ */
+function allowOf(r, thr) {
+  const a = r.regular_allow;
+  return a === null || a === undefined || !Number.isFinite(Number(a)) ? thr : Math.max(0, Number(a));
+}
+
+const wallMinutes = (v) => Date.parse(`${String(v).slice(0, 19).replace(' ', 'T')}Z`) / 60000;
+
+/**
+ * Continuous shifts of ONE machine: Working rows where the next check-in comes at most `gapMin` minutes after the
+ * previous check-out form a block. The block may work thr x (number of shifts) regular minutes before overtime;
+ * they are used in time order, so overtime falls on the last hours. Returns { [eq_attendance_id]: { allow, shifts } }.
+ * thrOf(row) gives the threshold of the row's card (Infinity = no overtime).
+ */
+function blockAllowances(rows, thrOf, workOf, gapMin) {
+  const list = rows.filter((r) => r.day_status === 'Working' && r.check_in_time && r.check_out_time)
+    .sort((a, b) => wallMinutes(a.check_in_time) - wallMinutes(b.check_in_time) || Number(a.eq_attendance_id) - Number(b.eq_attendance_id));
+  const out = {};
+  let block = [];
+  const flush = () => {
+    let remaining = block.reduce((acc, r) => acc + thrOf(r), 0);
+    for (const r of block) {
+      out[r.eq_attendance_id] = { allow: remaining, shifts: block.length };
+      if (Number.isFinite(remaining)) remaining = Math.max(0, remaining - Math.min(workOf(r), remaining));
+    }
+    block = [];
+  };
+  for (const r of list) {
+    const prev = block[block.length - 1];
+    if (prev && wallMinutes(r.check_in_time) - wallMinutes(prev.check_out_time) > gapMin) flush();
+    block.push(r);
+  }
+  if (block.length) flush();
+  return out;
+}
+
+/** Raw day fractions of one Daily row: work (with top-up), standby x %, breakdown x %. */
+function dailyFractions(r, rate) {
+  const stdMin = Math.round(Number(rate.standard_hours_per_day) * 60);
+  const m = dayMinutes(r, rate);
+  const topup = minimumTopUp(m, rate);
+  return {
+    m, topup,
+    wf: workFraction(m.work + topup, stdMin, rate),
+    sf: Math.min(1, m.standby / stdMin) * Number(rate.standby_billable_pct) / 100,
+    bf: Math.min(1, m.breakdown / stdMin) * Number(rate.breakdown_billable_pct) / 100,
+  };
+}
+
+/**
+ * Shares one calendar day between the shifts of a Daily machine. `used` = part of the day already taken by the
+ * earlier shifts. Work first, then breakdown, then standby, never above one day; work above one day is the
+ * SECOND SHIFT (billed at second_shift_pct %).
+ *   billed day = min(1, sum of work) + second_shift_pct x max(0, sum of work - 1)
+ */
+function allocateDay(f, used) {
+  let avail = Math.max(0, 1 - used);
+  const wp = Math.min(f.wf, avail); avail -= wp;
+  const extra = f.wf - wp;
+  const bf = Math.min(f.bf, avail); avail -= bf;
+  const sf = Math.min(f.sf, avail);
+  return { wp, extra, bf, sf, used: used + wp + bf + sf };
+}
+
+/** Order of the shifts inside one day: Day shift first, then by check-in. */
+function shiftOrder(a, b) {
+  const sa = a.shift_type === 'Night' ? 1 : 0; const sb = b.shift_type === 'Night' ? 1 : 0;
+  return sa - sb || String(a.check_in_time || '').localeCompare(String(b.check_in_time || '')) || Number(a.eq_attendance_id || 0) - Number(b.eq_attendance_id || 0);
+}
+
+/**
+ * Part of the day used before each row, for rows of ONE machine (any site): { [eq_attendance_id]: used }.
+ * The caller passes every row of the machine on those days so a second shift at another site is seen.
+ */
+function usedBeforeMap(rows, rate) {
+  const byDay = new Map();
+  for (const r of rows) {
+    const k = r.record_date ? String(r.record_date).slice(0, 10) : {}; // a row without a date is a day of its own
+    if (!byDay.has(k)) byDay.set(k, []);
+    byDay.get(k).push(r);
+  }
+  const out = new Map();
+  for (const list of byDay.values()) {
+    let used = 0;
+    for (const r of [...list].sort(shiftOrder)) {
+      out.set(r, used);
+      used = allocateDay(dailyFractions(r, rate), used).used;
+    }
+  }
+  return out;
+}
+function dayUsedBefore(rows, rate) {
+  const out = {};
+  for (const [r, used] of usedBeforeMap(rows, rate)) out[r.eq_attendance_id] = used;
+  return out;
+}
+
 function billDaily(rows, rate) {
   const daily = toCents(rate.daily_rate);
-  const stdMin = Math.round(Number(rate.standard_hours_per_day) * 60);
   const thr = otThresholdMin(rate);
   const hourlyEquiv = daily / Number(rate.standard_hours_per_day);
-  const t = { work: 0, ot: 0, standby: 0, breakdown: 0, topup: 0, workDays: 0, standbyDays: 0, breakdownDays: 0, workedDays: 0 };
+  const pct = Number(rate.second_shift_pct || 0) / 100;
+  const t = { work: 0, ot: 0, standby: 0, breakdown: 0, topup: 0, workDays: 0, standbyDays: 0, breakdownDays: 0, workedDays: 0, secondShiftDays: 0 };
+  // rows without a given day_used_before share the day with the other rows of this item on the same date
+  const local = usedBeforeMap(rows.filter((r) => r.day_used_before === null || r.day_used_before === undefined), rate);
   for (const r of rows) {
-    const m = dayMinutes(r, rate);
-    const topup = minimumTopUp(m, rate);
-    let wf = workFraction(m.work + topup, stdMin, rate);
-    let sf = Math.min(1, m.standby / stdMin) * Number(rate.standby_billable_pct) / 100;
-    let bf = Math.min(1, m.breakdown / stdMin) * Number(rate.breakdown_billable_pct) / 100;
-    // A day is never billed above 1 day (overtime aside): trim standby, then breakdown.
-    if (wf + sf + bf > 1) { sf = Math.max(0, 1 - wf - bf); if (wf + bf > 1) bf = Math.max(0, 1 - wf); }
-    t.work += m.work; t.ot += Math.max(0, m.work - thr); t.topup += topup;
-    t.standby += m.standby; t.breakdown += m.breakdown;
-    t.workDays += wf; t.standbyDays += sf; t.breakdownDays += bf;
-    if (m.status === 'Working' && m.work > 0) t.workedDays += 1;
+    const f = dailyFractions(r, rate);
+    const used = r.day_used_before !== null && r.day_used_before !== undefined ? Number(r.day_used_before) : (local.get(r) || 0);
+    const d = allocateDay(f, used);
+    t.work += f.m.work; t.ot += Math.max(0, f.m.work - allowOf(r, thr)); t.topup += f.topup;
+    t.standby += f.m.standby; t.breakdown += f.m.breakdown;
+    t.workDays += d.wp; t.standbyDays += d.sf; t.breakdownDays += d.bf; t.secondShiftDays += d.extra;
+    if (f.m.status === 'Working' && f.m.work > 0) t.workedDays += 1;
   }
   const lines = [
     line('Work', t.workDays, 'day', daily),
@@ -111,6 +209,11 @@ function billDaily(rows, rate) {
     line('Standby', t.standbyDays, 'day', daily),
     line('Breakdown', t.breakdownDays, 'day', daily),
   ];
+  if (t.secondShiftDays > 0 && pct > 0) {
+    lines.push({ line_type: 'SecondShift', quantity: round4(t.secondShiftDays), unit: 'day', unit_price_cents: roundCents(daily * pct),
+      unit_price_exact: Math.round(daily * pct * 10) / 1000, amount_cents: roundCents(t.secondShiftDays * daily * pct),
+      note: `second shift at ${Math.round(pct * 10000) / 100}% of the daily price` });
+  }
   return { totals: t, lines: lines.filter((l) => l.quantity !== 0) };
 }
 
@@ -219,4 +322,7 @@ function billItem(rows, rate, ctx = {}, extras = {}) {
   return { ...res, gross_cents: gross, deductions_cents: deductions, net_cents: gross - deductions };
 }
 
-module.exports = { standbyCredit, exactCents, dayMinutes, billItem, billHourly, billDaily, billMonthly, minimumTopUp, otThresholdMin };
+module.exports = {
+  standbyCredit, exactCents, dayMinutes, billItem, billHourly, billDaily, billMonthly, minimumTopUp, otThresholdMin,
+  allowOf, dailyFractions, allocateDay, dayUsedBefore, shiftOrder, blockAllowances,
+};

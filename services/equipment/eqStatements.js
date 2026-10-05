@@ -9,7 +9,7 @@ const LINE_LABEL = {
   Work: 'Work', Overtime: 'Overtime', Standby: 'Standby (billable part)', Breakdown: 'Breakdown (billable part)',
   MinimumTopUp: 'Minimum guarantee top-up', MonthlyBase: 'Monthly base', AbsenceDeduction: 'Absence deduction',
   BreakdownDeduction: 'Breakdown deduction', Operator: 'Operator (not included in rate)', Fuel: 'Fuel issued by us', Adjustment: 'Adjustment',
-  FuelPriceDifference: 'Fuel price difference (compensation)', HoursShortfall: 'Hours below the monthly hours due',
+  FuelPriceDifference: 'Fuel price difference (compensation)', HoursShortfall: 'Hours below the monthly hours due', SecondShift: 'Second shift the same day',
 };
 
 const n = (v) => Number(v || 0);
@@ -156,6 +156,7 @@ function rateSummary(r) {
   if (r.min_billable_hours_per_day !== null && r.min_billable_hours_per_day !== undefined) parts.push(`min ${n(r.min_billable_hours_per_day)} h/day`);
   if (n(r.overtime_enabled)) parts.push(`OT > ${n(r.overtime_threshold_hours ?? r.standard_hours_per_day)} h at ${r.overtime_rate !== null && r.overtime_rate !== undefined ? fmt.num(r.overtime_rate) : `x${n(r.overtime_multiplier)}`}`);
   parts.push(`standby ${n(r.standby_billable_pct)}%`, `breakdown ${n(r.breakdown_billable_pct)}%`, `breaks ${r.break_policy === 'Paid' ? 'paid' : 'deducted'}`);
+  if (r.billing_mode === 'Daily') parts.push(`2nd shift ${n(r.second_shift_pct)}%`);
   parts.push(`fuel: ${r.fuel_policy}`);
   return parts.join(' | ');
 }
@@ -183,6 +184,35 @@ function drawMonthlyCalc(doc, y, it, cur) {
   }) + 6;
 }
 
+/** Monthly machine at several sites: its cost split between the sites by the hours each got. */
+function drawSiteAllocation(doc, y, it, cur) {
+  const sa = (it.rate && it.rate.site_allocation) || it.site_allocation;
+  if (!sa || !sa.length) return y;
+  y = sectionTitle(doc, y, 'Cost by site', 'توزيع الكلفة على المواقع');
+  return P.table(doc, {
+    y, rowHeight: 15, headHeight: 26, fontSize: 7, onNewPage: () => doc.page.margins.top + 4,
+    columns: [
+      { key: 'site', en: 'Site', ar: 'الموقع', width: 120 }, { key: 'h', en: 'Hours', ar: 'الساعات', width: 80, align: 'right' },
+      { key: 'pct', en: 'Share', ar: 'النسبة', width: 80, align: 'right' }, { key: 'amt', en: `Cost (${cur})`, ar: 'الكلفة', width: 120, align: 'right' },
+    ],
+    rows: sa.map((a) => ({ site: a.site_code || `#${a.site_id}`, h: fmt.num(a.hours), pct: `${fmt.num(a.share_pct)}%`, amt: fmt.num((a.amount_cents ?? Math.round(n(a.amount) * 100)) / 100) })),
+  }) + 6;
+}
+
+/** Adds site codes to the cost-by-site split of each item. */
+async function withSiteCodes(conn, items) {
+  const ids = [...new Set(items.flatMap((i) => ((i.rate && i.rate.site_allocation) || i.site_allocation || []).map((a) => a.site_id)))];
+  if (!ids.length) return items;
+  const [rows] = await conn.query('SELECT site_id, site_code FROM sites WHERE site_id IN (?)', [ids]);
+  const code = Object.fromEntries(rows.map((r) => [r.site_id, r.site_code]));
+  for (const i of items) {
+    const sa = (i.rate && i.rate.site_allocation) || i.site_allocation;
+    if (sa) i.site_allocation = sa.map((a) => ({ ...a, site_code: code[a.site_id] }));
+    if (i.rate && i.rate.site_allocation) i.rate = { ...i.rate, site_allocation: i.site_allocation };
+  }
+  return items;
+}
+
 // --------------------------------------------------------------- data shaping
 /** Normalized statement model from a batch detail. */
 async function modelFromBatch(conn, detail) {
@@ -197,7 +227,7 @@ async function modelFromBatch(conn, detail) {
     ...i, rate: i.rate_snapshot, fuel_diff: i.rate_snapshot && i.rate_snapshot.fuel_diff, rows: rows.filter((r) => r.eq_item_id === i.eq_item_id),
     lines: i.lines.map((l) => ({ ...l, quantity: n(l.quantity), unit_price: n(l.unit_price), amount: n(l.amount) })),
   }));
-  return { batch: { ...detail, ...scope }, items };
+  return { batch: { ...detail, ...scope }, items: await withSiteCodes(conn, items) };
 }
 
 /** Same model from a provisional calculation (no batch). */
@@ -213,7 +243,7 @@ async function modelFromCalc(conn, { kind, scope, items }) {
     equipment_id: i.equipment_id, equipment_code: E[i.equipment_id].equipment_code, type_name: E[i.equipment_id].type_name,
     vendor_id: i.vendor_id, vendor_name: V[i.vendor_id].vendor_name, vendor_code: V[i.vendor_id].vendor_code,
     site_id: i.site_id, site_code: S[i.site_id].site_code, site_name: S[i.site_id].site_name, billing_mode: i.billing_mode,
-    rate: i.rate_snapshot, fuel_diff: i.fuel_diff || null, monthly_calc: i.monthly_calc || null, plate_number: E[i.equipment_id].plate_number, days_recorded: i.days_recorded, worked_days: i.worked_days,
+    rate: i.rate_snapshot, fuel_diff: i.fuel_diff || null, monthly_calc: i.monthly_calc || null, site_allocation: i.site_allocation || null, plate_number: E[i.equipment_id].plate_number, days_recorded: i.days_recorded, worked_days: i.worked_days,
     work_hours: h(i.work_minutes), overtime_hours: h(i.overtime_minutes), standby_hours: h(i.standby_minutes), breakdown_hours: h(i.breakdown_minutes), topup_hours: h(i.topup_minutes),
     gross_amount: i.gross_cents / 100, deductions_amount: i.deductions_cents / 100, net_amount: i.net_cents / 100,
     lines: i.lines.map((l) => ({ line_type: l.line_type, quantity: l.quantity, unit: l.unit, unit_price: l.unit_price_exact ?? l.unit_price_cents / 100, amount: l.amount_cents / 100, note: l.note || null, source_table: l.source_table, source_id: l.source_id })),
@@ -225,7 +255,7 @@ async function modelFromCalc(conn, { kind, scope, items }) {
     total_gross: sum('gross_amount'), total_deductions: sum('deductions_amount'), total_net: sum('net_amount'), total_equipment: eqIds.length,
     scope_vendor_name: kind === 'vendor' ? out[0].vendor_name : null, scope_equipment_code: kind === 'machine' ? out[0].equipment_code : null,
   };
-  return { batch, items: out };
+  return { batch, items: await withSiteCodes(conn, out) };
 }
 
 // --------------------------------------------------------------- D2 machine invoice / statement
@@ -253,6 +283,7 @@ function drawMachine(doc, ctx, b, items) {
     P.text(doc, rateSummary(it.rate), doc.page.margins.left, y, { size: 7.2, color: COLORS.muted, width: doc.page.width - 48 });
     y = doc.y + 4;
     y = drawMonthlyCalc(doc, y, it, cur);
+    y = drawSiteAllocation(doc, y, it, cur);
     const rows = it.rows.map((r) => ({
       date: fmt.dayDate(r.record_date), status: r.day_status, op: r.operator_name || '', in: fmt.time(r.check_in_time), out: fmt.time(r.check_out_time),
       work: fmt.hours(r.work_minutes), ot: n(r.overtime_minutes) ? fmt.hours(r.overtime_minutes) : '', sb: n(r.standby_minutes) ? fmt.hours(r.standby_minutes) : '',
@@ -622,7 +653,7 @@ async function batchXlsx(conn, detail) {
     const vname = Object.fromEntries(items.map((i) => [i.vendor_id, i.vendor_name]));
     const mcode = Object.fromEntries(items.map((i) => [i.equipment_id, i.equipment_code]));
     for (const x of detail.invoices) {
-      const r = inv.addRow({ no: x.invoice_no, k: { Vendor: 'Vendor invoice', Machine: 'Machine invoice', FuelDiff: 'Fuel difference' }[x.kind], v: vname[x.vendor_id], m: x.equipment_id ? mcode[x.equipment_id] : '', a: n(x.amount), c: x.currency, i: x.issued_at });
+      const r = inv.addRow({ no: x.invoice_no, k: `${{ Vendor: 'Vendor invoice', Machine: 'Machine invoice', FuelDiff: 'Fuel difference', DebitNote: 'Debit note', CreditNote: 'Credit note' }[x.kind] || x.kind}${x.cancelled ? ' (cancelled)' : ''}`, v: vname[x.vendor_id], m: x.equipment_id ? mcode[x.equipment_id] : '', a: n(x.amount), c: x.currency, i: x.issued_at });
       r.getCell('a').numFmt = moneyFmt;
     }
   }

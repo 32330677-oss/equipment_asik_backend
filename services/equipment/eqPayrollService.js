@@ -19,7 +19,7 @@ function engineRate(rc) {
     overtime_multiplier: Number(rc.overtime_multiplier || 1), standby_billable_pct: Number(rc.standby_billable_pct),
     breakdown_billable_pct: Number(rc.breakdown_billable_pct), half_day_threshold_hours: toNum(rc.half_day_threshold_hours),
     monthly_working_days: Number(rc.monthly_working_days), operator_included: Number(rc.operator_included) === 1 || rc.operator_included === true,
-    operator_daily_rate: toNum(rc.operator_daily_rate),
+    operator_daily_rate: toNum(rc.operator_daily_rate), second_shift_pct: Number(rc.second_shift_pct || 0),
   };
 }
 
@@ -84,9 +84,20 @@ function hasStandby(r) { return r.day_status === 'Standby' || Number(r.standby_m
 
 /** The fields of an attendance row that the billing engine reads. */
 function engineRow(r) {
-  return { record_date: r.record_date, day_status: r.day_status, gross_minutes: r.gross_minutes, break_minutes: r.break_minutes,
+  return { eq_attendance_id: r.eq_attendance_id, record_date: r.record_date, shift_type: r.shift_type, check_in_time: r.check_in_time, check_out_time: r.check_out_time,
+    day_status: r.day_status, gross_minutes: r.gross_minutes, break_minutes: r.break_minutes,
     breakdown_minutes: r.breakdown_minutes, standby_minutes: r.standby_minutes,
-    standby_credit_minutes: r.standby_credit_minutes === undefined ? null : r.standby_credit_minutes };
+    standby_credit_minutes: r.standby_credit_minutes === undefined ? null : r.standby_credit_minutes,
+    regular_allow: r.regular_allow, day_used_before: r.day_used_before };
+}
+
+/** How a row was billed beside its minutes (continuous shifts, second shift): kept in the snapshot. */
+function calcDetail(r) {
+  const d = {};
+  if (r.regular_allow !== undefined && r.regular_allow !== null && Number.isFinite(r.regular_allow)) d.regular_allow = r.regular_allow;
+  if (r.block_shifts > 1) d.block_shifts = r.block_shifts;
+  if (r.day_used_before !== undefined && r.day_used_before !== null) d.day_used_before = Math.round(r.day_used_before * 1e6) / 1e6;
+  return Object.keys(d).length ? d : null;
 }
 
 /** Billed minutes of one row (what goes into the payroll snapshot). thr = overtime threshold in minutes. */
@@ -94,7 +105,7 @@ function rowFigures(r, rate, thr) {
   const m = engine.dayMinutes(r, rate);
   const credit = rate.billing_mode === 'Monthly' && r.standby_credit_minutes !== null && r.standby_credit_minutes !== undefined
     ? engine.standbyCredit(r, Math.round(Number(rate.standard_hours_per_day) * 60)) : null;
-  return { work: m.work, ot: Math.max(0, m.work - thr), standby: m.standby, breakdown: m.breakdown, brk: m.brk, topup: engine.minimumTopUp(m, rate), credit };
+  return { work: m.work, ot: Math.max(0, m.work - engine.allowOf(r, thr)), standby: m.standby, breakdown: m.breakdown, brk: m.brk, topup: engine.minimumTopUp(m, rate), credit };
 }
 
 /**
@@ -118,7 +129,8 @@ async function changedRows(conn, batchId) {
     const thr = r.billing_mode === 'Monthly' ? Infinity : engine.otThresholdMin(rate);
     const f = rowFigures(r, rate, thr);
     const same = r.s_day_status === r.day_status && String(r.s_in) === String(r.check_in_time) && String(r.s_out) === String(r.check_out_time)
-      && Number(r.s_work) === f.work && Number(r.s_ot) === f.ot && Number(r.s_standby) === f.standby && Number(r.s_breakdown) === f.breakdown
+      // overtime is not compared: with continuous shifts it depends on the neighbour rows (the amount check catches it)
+      && Number(r.s_work) === f.work && Number(r.s_standby) === f.standby && Number(r.s_breakdown) === f.breakdown
       && Number(r.s_break) === f.brk && Number(r.s_topup) === f.topup
       && (r.billing_mode !== 'Monthly' || (r.s_credit === null ? null : Number(r.s_credit)) === f.credit);
     if (!same) out.push({ eq_attendance_id: r.eq_attendance_id, reason: 'billed figures changed' });
@@ -201,6 +213,64 @@ async function sheetsMissingScan(conn, attendanceIds) {
     .map((r) => ({ ...r, needed_row: Number(r.needed_row), scanned_row: Number(r.scanned_row) }));
 }
 
+// ------------------------------------------------------------------ shifts (continuous shifts, second shift)
+/**
+ * Sets on each row of an Hourly / Daily machine:
+ *  - regular_allow: regular minutes it may use before overtime (continuous shifts share threshold x shifts);
+ *  - day_used_before (Daily): part of the calendar day already billed to earlier shifts of the machine.
+ * Every row of these machines around the period is read (any site, any status) so the split is the same in
+ * every batch and does not depend on the scope.
+ */
+async function applyShiftRules(conn, rows, cards, scope) {
+  const ids = [...new Set(rows.filter((r) => {
+    const c = cardFor(cards, r.equipment_id, r.record_date);
+    return c && c.billing_mode !== 'Monthly';
+  }).map((r) => r.equipment_id))];
+  if (!ids.length) return;
+  const gap = await settings.getInt('eq_shift_continuity_minutes');
+  const [ctx] = await conn.query(
+    `SELECT eq_attendance_id, equipment_id, record_date, shift_type, check_in_time, check_out_time, day_status, gross_minutes, break_minutes,
+       breakdown_minutes, standby_minutes FROM eq_attendance WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ?`,
+    [ids, addDays(scope.start_date, -2), addDays(scope.end_date, 2)]);
+  const rateOf = (r) => { const c = cardFor(cards, r.equipment_id, String(r.record_date).slice(0, 10)); return c ? engineRate(c) : null; };
+  const allow = {}; const used = {};
+  for (const id of ids) {
+    const mine = ctx.filter((r) => r.equipment_id === id && rateOf(r) && rateOf(r).billing_mode !== 'Monthly');
+    Object.assign(allow, engine.blockAllowances(mine, (r) => engine.otThresholdMin(rateOf(r)), (r) => engine.dayMinutes(r, rateOf(r)).work, gap));
+    const byCard = new Map();
+    for (const r of mine) {
+      const c = cardFor(cards, id, String(r.record_date).slice(0, 10));
+      if (c.billing_mode !== 'Daily') continue;
+      if (!byCard.has(c.rate_card_id)) byCard.set(c.rate_card_id, { c, list: [] });
+      byCard.get(c.rate_card_id).list.push(r);
+    }
+    for (const { c, list } of byCard.values()) Object.assign(used, engine.dayUsedBefore(list, engineRate(c)));
+  }
+  for (const r of rows) {
+    const a = allow[r.eq_attendance_id];
+    if (a && Number.isFinite(a.allow)) { r.regular_allow = a.allow; r.block_shifts = a.shifts; }
+    if (used[r.eq_attendance_id] !== undefined) r.day_used_before = used[r.eq_attendance_id];
+  }
+}
+
+/**
+ * Site-scoped runs: a MONTHLY machine that also works at another site in the period is one contract; its hours
+ * are only right when all its sites are billed together.
+ */
+async function monthlyMultiSite(conn, scope) {
+  if (!scope.site_id) return [];
+  const [rows] = await conn.query(
+    `SELECT DISTINCT e.equipment_code, a.equipment_id, s2.site_code AS other_site
+     FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id
+     JOIN eq_rate_cards rc ON rc.equipment_id = a.equipment_id AND rc.billing_mode = 'Monthly' AND rc.effective_from <= ? AND (rc.effective_to IS NULL OR rc.effective_to >= ?)
+     JOIN eq_site_assignments b ON b.equipment_id = a.equipment_id AND b.site_id <> a.site_id
+       AND b.assigned_date <= ? AND (b.unassigned_date IS NULL OR b.unassigned_date >= ?) AND (b.unassigned_date IS NULL OR b.unassigned_date >= b.assigned_date)
+     JOIN sites s2 ON s2.site_id = b.site_id
+     WHERE a.site_id = ? AND a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)`,
+    [scope.end_date, scope.start_date, scope.end_date, scope.start_date, scope.site_id, scope.end_date, scope.start_date]);
+  return rows;
+}
+
 /** Everything that prevents rows of the scope from being paid. */
 async function blockers(conn, scope) {
   const requirePaper = await settings.getBool('eq_payroll_requires_paper_match');
@@ -256,13 +326,15 @@ async function blockers(conn, scope) {
       add('FUEL_PRICE_MISSING', 'Machines with a fuel difference agreement have days without a national fuel price.', noPrice);
     }
   }
+  add('MONTHLY_MULTI_SITE', 'Monthly machines that also work at another site in this period: generate per vendor or per machine (not per site), so their hours due are counted once.',
+    await monthlyMultiSite(conn, scope));
   // signed monthly sheets: needed to FINALIZE (not to generate) — shown early as information
   const [toPay] = await conn.query(`SELECT ea.eq_attendance_id ${base} AND ea.status = 'Approved' AND ${notInActive}`, [...params, ...exParams]);
   add('SCAN_MISSING', 'Signed monthly sheets not uploaded yet (needed before finalizing).', await sheetsMissingScan(conn, toPay.map((r) => r.eq_attendance_id)));
   return out;
 }
 
-const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING'];
+const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING', 'MONTHLY_MULTI_SITE'];
 /** Shown with the blockers but never prevent generating. */
 const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING'];
 
@@ -313,8 +385,10 @@ async function calculate(conn, scope) {
   const fuelPrices = fuelTerms.length ? await loadFuelPrices(conn) : [];
   const allowNegative = await settings.getBool('eq_fuel_diff_allow_negative');
   const offDay = await settings.getInt('eq_weekly_off_day');
+  await applyShiftRules(conn, rows, cards, scope);
   // A machine deployed on two shifts at two sites the same day: its MONTHLY base is billed once, to the Day-shift site.
-  const depIds = [...new Set(deps.map((d) => d.equipment_id))];
+  // Every deployment of these machines is read (not only the site in scope) so the owner site is always right.
+  const depIds = [...new Set([...deps, ...rows].map((d) => d.equipment_id))];
   const [allDeps] = depIds.length ? await conn.query(
     `SELECT eq_assignment_id, equipment_id, site_id, shift_type, assigned_date, unassigned_date FROM eq_site_assignments
      WHERE equipment_id IN (?) AND assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)`,
@@ -398,6 +472,7 @@ async function calculate(conn, scope) {
       prices: fuelPrices.filter((p) => fd.days.some((d) => d.fuel_price_id === p.fuel_price_id)),
     } : null;
     const t = res.totals;
+    const siteAllocation = rate.billing_mode === 'Monthly' ? allocateBySite(perRow, res.lines, rate) : null;
     if (rate.billing_mode === 'Monthly' && !g.rows.length) warnings.push({ code: 'NO_ATTENDANCE_ROWS', equipment_id: g.equipment_id, site_id: g.site_id, message: 'Monthly base billed without any attendance row in the period.' });
     items.push({
       equipment_id: g.equipment_id, vendor_id: g.vendor_id, site_id: g.site_id, currency: g.card.currency,
@@ -405,10 +480,86 @@ async function calculate(conn, scope) {
       days_recorded: g.rows.length, worked_days: t.workedDays || 0,
       work_minutes: t.work || 0, overtime_minutes: t.ot || 0, standby_minutes: t.standby || 0, breakdown_minutes: t.breakdown || 0, topup_minutes: t.topup || 0,
       gross_cents: res.gross_cents, deductions_cents: res.deductions_cents, net_cents: res.net_cents,
-      lines: res.lines, per_row: perRow, months: ctx.months || null,
+      lines: res.lines, per_row: perRow, months: ctx.months || null, site_allocation: siteAllocation,
     });
   }
   return { items, warnings };
 }
 
-module.exports = { calculate, blockers, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };
+/**
+ * A monthly machine that worked at several sites is billed once (to its Day-shift site); its cost (base, overtime,
+ * missing hours, operator) is shown split between the sites by the hours each site got. Null when one site only.
+ */
+function allocateBySite(perRow, lines, rate) {
+  const bd = Number(rate.breakdown_billable_pct) / 100;
+  const hours = new Map();
+  for (const p of perRow) {
+    const sid = p.row.site_id;
+    const min = p.work + (p.credit || 0) + p.breakdown * bd;
+    hours.set(sid, (hours.get(sid) || 0) + min);
+  }
+  if (hours.size < 2) return null;
+  const cost = lines.filter((l) => ['MonthlyBase', 'Overtime', 'HoursShortfall', 'Operator'].includes(l.line_type)).reduce((a, l) => a + l.amount_cents, 0);
+  const total = [...hours.values()].reduce((a, x) => a + x, 0);
+  const entries = [...hours.entries()].sort((a, b) => a[0] - b[0]);
+  let left = cost;
+  return entries.map(([siteId, min], i) => {
+    const share = total > 0 ? min / total : 1 / entries.length;
+    const cents = i === entries.length - 1 ? left : Math.round(cost * share);
+    left -= cents;
+    return { site_id: siteId, hours: Math.round(min / 60 * 100) / 100, share_pct: Math.round(share * 10000) / 100, amount_cents: cents };
+  });
+}
+
+/** Settings that change amounts: frozen in each batch (shown on it, reused by corrections). */
+const BILLING_SETTINGS = ['eq_weekly_off_day', 'eq_fuel_diff_allow_negative', 'eq_payroll_requires_paper_match', 'eq_shift_continuity_minutes'];
+async function billingSettings() {
+  const out = {};
+  for (const k of BILLING_SETTINGS) out[k] = await settings.getString(k);
+  return out;
+}
+
+/**
+ * Would this batch come out differently if generated now? Re-runs the calculation for its scope (its own rows count
+ * as free) and compares machine by machine: amounts, the rows taken, and the settings it was made with. Catches every
+ * input: attendance, standby hours, fuel issued, adjustments, rate cards, fuel prices / terms, settings, rows approved
+ * since. Paper checks, scans and remarks change nothing here.
+ */
+async function batchDrift(conn, batch) {
+  const reasons = [];
+  const scope = { start_date: String(batch.start_date).slice(0, 10), end_date: String(batch.end_date).slice(0, 10),
+    vendor_id: batch.scope_vendor_id, equipment_id: batch.scope_equipment_id, site_id: batch.scope_site_id, exclude_batch_id: batch.eq_batch_id };
+  const frozen = parseJson(batch.settings_snapshot);
+  if (frozen) {
+    const now = await billingSettings();
+    for (const k of Object.keys(now)) if (frozen[k] !== undefined && String(frozen[k]) !== String(now[k])) reasons.push({ code: 'SETTING_CHANGED', setting: k, was: frozen[k], now: now[k] });
+  }
+  let calc;
+  try {
+    calc = await calculate(conn, scope);
+  } catch (e) {
+    if (!e.isAppError) throw e;
+    return [...reasons, { code: e.code, message: e.message }];
+  }
+  const items = calc.items.filter((i) => i.currency === batch.currency);
+  const [stored] = await conn.query('SELECT eq_item_id, equipment_id, site_id, rate_card_id, net_amount FROM eq_payroll_items WHERE eq_batch_id = ?', [batch.eq_batch_id]);
+  const key = (x) => `${x.equipment_id}|${x.site_id}|${x.rate_card_id || 'none'}`;
+  const was = new Map(stored.map((x) => [key(x), Math.round(Number(x.net_amount) * 100)]));
+  const now = new Map(items.map((x) => [key(x), x.net_cents]));
+  for (const [k, cents] of now) {
+    if (!was.has(k)) reasons.push({ code: 'ITEM_ADDED', item: k, net: cents / 100 });
+    else if (was.get(k) !== cents) reasons.push({ code: 'AMOUNT_CHANGED', item: k, was: was.get(k) / 100, now: cents / 100 });
+  }
+  for (const [k, cents] of was) if (!now.has(k)) reasons.push({ code: 'ITEM_REMOVED', item: k, was: cents / 100 });
+  const [snap] = await conn.query('SELECT eq_attendance_id FROM eq_payroll_attendance_snapshot WHERE eq_batch_id = ?', [batch.eq_batch_id]);
+  const inBatch = new Set(snap.map((r) => r.eq_attendance_id));
+  const taken = new Set(items.flatMap((i) => i.per_row.map((p) => p.row.eq_attendance_id)));
+  const added = [...taken].filter((id) => !inBatch.has(id));
+  const dropped = [...inBatch].filter((id) => !taken.has(id));
+  if (added.length) reasons.push({ code: 'ROWS_ADDED', count: added.length, ids: added.slice(0, 50) });
+  if (dropped.length) reasons.push({ code: 'ROWS_DROPPED', count: dropped.length, ids: dropped.slice(0, 50) });
+  for (const c of await changedRows(conn, batch.eq_batch_id)) reasons.push({ code: 'ROW_CHANGED', ...c });
+  return reasons;
+}
+
+module.exports = { calcDetail, applyShiftRules, allocateBySite, monthlyMultiSite, batchDrift, billingSettings, BILLING_SETTINGS, calculate, blockers, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };

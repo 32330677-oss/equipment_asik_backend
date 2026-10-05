@@ -5,6 +5,7 @@ const audit = require('../services/audit');
 const { businessToday, addDays } = require('../utils/businessDate');
 const { overlapsSql, activeOnSql } = require('../utils/ranges');
 const { supervisorSiteIdsEver } = require('../services/siteAccess');
+const lock = require('../services/equipment/eqLock');
 
 const SITE_FIELDS = {
   site_code: v.string({ max: 20, pattern: /^[A-Za-z0-9-]+$/, patternMessage: 'letters, digits and dash only' }),
@@ -142,6 +143,7 @@ async function insertPeriod(conn, req, { siteId, userId, shiftType, fromDate, to
   if (site.status !== 'Active') throw AppError.conflict('SITE_NOT_ACTIVE', 'The site is not Active.');
   if (shiftType === 'Night' && Number(site.has_night_shift) !== 1) throw AppError.badRequest('NO_NIGHT_SHIFT', 'This site has no Night shift.');
   if (toDate && toDate < fromDate) throw AppError.validation({ to_date: 'must be on or after from_date' });
+  await lock.assertSiteRangeOpen(conn, { siteId, from: fromDate, to: toDate || null, what: 'This supervisor period' });
   const [u] = await conn.execute('SELECT user_id, role, status FROM users WHERE user_id = ?', [userId]);
   if (!u[0] || u[0].role !== 'Supervisor' || u[0].status !== 'Active') {
     throw AppError.badRequest('NOT_A_SUPERVISOR', 'The user must be an Active user with the Supervisor role.');
@@ -183,6 +185,7 @@ exports.endSupervisor = async (req, res) => {
     if (!before) throw AppError.notFound('Supervisor period');
     if (to_date < addDays(before.from_date, -1)) throw AppError.validation({ to_date: 'cannot be before from_date - 1' });
     if (before.to_date && before.to_date < to_date) throw AppError.validation({ to_date: 'can only shorten a period' });
+    await lock.assertSiteRangeOpen(conn, { siteId: before.site_id, from: addDays(to_date, 1), to: before.to_date, what: 'Ending this supervisor period removes days that' });
     if (to_date < before.from_date) {
       // from_date - 1 = the period never happened: delete it (the CHECK to_date >= from_date forbids storing it)
       await conn.execute('DELETE FROM site_supervisors WHERE site_supervisor_id = ?', [id]);
@@ -212,6 +215,7 @@ exports.replaceSupervisor = async (req, res) => {
     if (cur[0]) {
       if (cur[0].user_id === data.user_id) throw AppError.conflict('SAME_SUPERVISOR', 'This user is already the supervisor on that date.');
       const newEnd = addDays(data.first_day, -1);
+      await lock.assertSiteRangeOpen(conn, { siteId, from: data.first_day, to: cur[0].to_date, what: 'This replacement' });
       if (newEnd < cur[0].from_date) {
         // replaced from its very first day: the old period never happened
         await conn.execute('DELETE FROM site_supervisors WHERE site_supervisor_id = ?', [cur[0].site_supervisor_id]);

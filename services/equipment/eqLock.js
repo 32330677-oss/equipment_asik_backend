@@ -54,4 +54,64 @@ async function sourceConsumed(executor, sourceTable, sourceId, finalizedOnly = f
   return rows[0] || null;
 }
 
-module.exports = { findLock, assertEqEditable, batchHoldingRow, sourceConsumed };
+const OPEN_END = '9999-12-31';
+
+/**
+ * A finalized active batch whose period overlaps [from, to] for this machine (its vendor, the machine, the site).
+ * siteId null = any site (an adjustment without site, a monthly deployment).
+ */
+async function finalizedOverlap(executor, { vendorId, equipmentId, siteId = null, from, to = null }) {
+  let vid = vendorId;
+  if (!vid && equipmentId) {
+    const [[m]] = await executor.execute('SELECT vendor_id FROM eq_equipment WHERE equipment_id = ?', [equipmentId]);
+    vid = m ? m.vendor_id : null;
+  }
+  const [rows] = await executor.execute(
+    `SELECT eq_batch_id, start_date, end_date, status FROM eq_payroll_batches
+     WHERE status IN ('Generated','Paid') AND is_finalized = 1 AND start_date <= ? AND end_date >= ?
+       AND (scope_vendor_id IS NULL OR scope_vendor_id = ?)
+       AND (scope_equipment_id IS NULL OR scope_equipment_id = ?)
+       AND (? IS NULL OR scope_site_id IS NULL OR scope_site_id = ?)
+     ORDER BY end_date DESC LIMIT 1`, [to || OPEN_END, String(from).slice(0, 10), vid, equipmentId, siteId, siteId]);
+  return rows[0] || null;
+}
+
+/** A finalized active batch overlapping [from, to] that covers a site (any vendor / machine). For supervisor periods. */
+async function finalizedOverlapForSite(executor, { siteId, from, to = null }) {
+  const [rows] = await executor.execute(
+    `SELECT eq_batch_id, start_date, end_date, status FROM eq_payroll_batches
+     WHERE status IN ('Generated','Paid') AND is_finalized = 1 AND start_date <= ? AND end_date >= ?
+       AND (scope_site_id IS NULL OR scope_site_id = ?)
+     ORDER BY end_date DESC LIMIT 1`, [to || OPEN_END, String(from).slice(0, 10), siteId]);
+  return rows[0] || null;
+}
+
+function closedError(b, what, from, to) {
+  const when = to && to !== from ? `${from} to ${to === OPEN_END ? 'open' : to}` : from;
+  return AppError.conflict('PAYROLL_PERIOD_FINALIZED',
+    `${what} (${when}) falls inside payroll batch #${b.eq_batch_id} (${b.start_date} to ${b.end_date}), which is ${b.status === 'Paid' ? 'Paid' : 'Finalized'}. `
+    + 'Use a date in an open period, or an official Correction for the closed period.',
+    { eq_batch_id: b.eq_batch_id, start_date: b.start_date, end_date: b.end_date });
+}
+
+/** Refuse an entry dated inside a finalized period of this machine (fuel, adjustment, deployment...). */
+async function assertOpen(executor, { vendorId, equipmentId, siteId = null, from, to = null, what = 'This date' }) {
+  const b = await finalizedOverlap(executor, { vendorId, equipmentId, siteId, from, to: to || from });
+  if (b) throw closedError(b, what, from, to || from);
+}
+
+/** Same for a range left open at the end (to = null means "and after"). */
+async function assertRangeOpen(executor, { vendorId, equipmentId, siteId = null, from, to = null, what }) {
+  const b = await finalizedOverlap(executor, { vendorId, equipmentId, siteId, from, to });
+  if (b) throw closedError(b, what, from, to || OPEN_END);
+}
+
+async function assertSiteRangeOpen(executor, { siteId, from, to = null, what }) {
+  const b = await finalizedOverlapForSite(executor, { siteId, from, to });
+  if (b) throw closedError(b, what, from, to || OPEN_END);
+}
+
+module.exports = {
+  findLock, assertEqEditable, batchHoldingRow, sourceConsumed,
+  finalizedOverlap, finalizedOverlapForSite, assertOpen, assertRangeOpen, assertSiteRangeOpen, OPEN_END,
+};

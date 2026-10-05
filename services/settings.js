@@ -19,6 +19,7 @@ const DEFINITIONS = {
   eq_weekly_off_day: { type: 'int', min: 0, max: 6, description: 'Weekly day off for monthly machines (0=Sunday ... 5=Friday ... 6=Saturday)' },
   eq_finalize_requires_scan: { type: 'bool', description: 'A batch can be finalized only when the signed monthly sheets are uploaded for all its rows' },
   eq_fuel_diff_allow_negative: { type: 'bool', description: 'Fuel price difference: deduct from the vendor when the official price falls below the base price' },
+  eq_shift_continuity_minutes: { type: 'int', min: 0, max: 180, description: 'Shifts of one machine closer than this (minutes) are continuous: overtime starts after threshold x shifts' },
 };
 
 const DEFAULTS = {
@@ -27,6 +28,7 @@ const DEFAULTS = {
   eq_live_refresh_seconds: '60', week_start_day: '6', week_gate_enabled: 'true',
   company_name: 'ASIK ENGINEERING CONSTRUCTION', app_time_zone: 'Asia/Beirut', payroll_finalize_admin_only: 'true',
   eq_finalize_requires_scan: 'true', eq_fuel_diff_allow_negative: 'true', eq_weekly_off_day: '5',
+  eq_shift_continuity_minutes: '30',
 };
 
 let cache = null;

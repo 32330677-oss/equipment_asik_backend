@@ -9,6 +9,7 @@ const { businessToday, businessNow } = require('../../utils/businessDate');
 const { assertCanActOnSite } = require('../../services/siteAccess');
 const C = require('../../services/equipment/eqCommon');
 const lock = require('../../services/equipment/eqLock');
+const FV = require('../../services/equipment/eqFileVersions');
 
 const SUPERVISOR_FUEL_COLS = 'f.fuel_issue_id, f.equipment_id, f.site_id, f.issue_date, f.liters, f.receipt_number, f.is_cancelled, e.equipment_code, s.site_code';
 
@@ -41,8 +42,10 @@ exports.createFuel = async (req, res) => {
     await assertCanActOnSite(req.user, d.site_id, d.shift_type, d.issue_date);
   }
   const row = await withTransaction(async (conn) => {
-    await C.loadMachine(conn, d.equipment_id);
+    const machine = await C.loadMachine(conn, d.equipment_id);
     await C.loadSite(conn, d.site_id);
+    // a fuel issue dated inside a finalized period would never be billed: refuse it
+    await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: d.equipment_id, siteId: d.site_id, from: d.issue_date, what: 'This fuel issue date' });
     const [r] = await conn.execute(
       'INSERT INTO eq_fuel_issues (equipment_id, site_id, issue_date, liters, price_per_liter, receipt_number, issued_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [d.equipment_id, d.site_id, d.issue_date, d.liters, d.price_per_liter ?? null, d.receipt_number || null, req.user.user_id]);
@@ -100,22 +103,38 @@ exports.uploadReceipt = [uploads.single('file'), async (req, res) => {
   const type = uploads.detect(req.file.buffer, ['jpg', 'png', 'webp', 'pdf']);
   const hash = storage.sha256(req.file.buffer);
   const key = `equipment/fuel/${id}-${hash.slice(0, 16)}.${type.ext}`;
-  await withTransaction(async (conn) => {
+  const out = await withTransaction(async (conn) => {
     const f = await loadFuel(conn, id);
     if (req.user.role === 'Supervisor') await assertCanActOnSite(req.user, f.site_id, 'Day', f.issue_date, conn).catch(async () => assertCanActOnSite(req.user, f.site_id, 'Night', f.issue_date, conn));
+    // a receipt of fuel already paid by a finalized batch: kept as evidence, but the reason is written down
+    const paid = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
+    const v = await FV.add(conn, {
+      ownerTable: 'eq_fuel_issues', ownerId: id, key, sha256: hash, contentType: type.mime, size: req.file.size || req.file.buffer.length,
+      originalName: req.file.originalname, reason: req.body && req.body.reason, userId: req.user.user_id, reasonRequired: Boolean(paid),
+    });
     await storage.put({ key, buffer: req.file.buffer, contentType: type.mime });
     await conn.execute('UPDATE eq_fuel_issues SET receipt_path = ? WHERE fuel_issue_id = ?', [key, id]);
-    await audit.log(conn, { table: 'eq_fuel_issues', id, action: 'upload_receipt', newValues: { receipt_path: key }, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_fuel_issues', id, action: v.replaced_version ? 'replace_receipt' : 'upload_receipt', oldValues: { receipt_path: f.receipt_path },
+      newValues: { receipt_path: key, version_no: v.version_no, sha256: hash }, reason: (req.body && req.body.reason) || null, ...audit.ctx(req) });
+    return v;
   });
-  res.status(201).json({ status: 'success', data: { fuel_issue_id: id, has_receipt: true } });
+  res.status(201).json({ status: 'success', data: { fuel_issue_id: id, has_receipt: true, version_no: out.version_no } });
 }];
+
+exports.listReceipts = async (req, res) => {
+  const id = parseId(req.params.id);
+  res.json({ status: 'success', data: await FV.list(pool, 'eq_fuel_issues', id) });
+};
 
 exports.downloadReceipt = async (req, res) => {
   const id = parseId(req.params.id);
-  const [[f]] = await pool.execute('SELECT receipt_path FROM eq_fuel_issues WHERE fuel_issue_id = ?', [id]);
-  if (!f || !f.receipt_path) throw AppError.notFound('Receipt');
-  const ext = f.receipt_path.split('.').pop();
-  await storage.send(res, f.receipt_path, { contentType: { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', pdf: 'application/pdf' }[ext], fileName: `fuel-receipt-${id}.${ext}` });
+  const version = req.query.version ? parseId(req.query.version) : null;
+  const fv = await FV.get(pool, 'eq_fuel_issues', id, version);
+  let key = fv ? fv.storage_key : null;
+  if (!key && !version) { const [[f]] = await pool.execute('SELECT receipt_path FROM eq_fuel_issues WHERE fuel_issue_id = ?', [id]); key = f && f.receipt_path; }
+  if (!key) throw AppError.notFound('Receipt');
+  const ext = FV.extOf(key);
+  await storage.send(res, key, { contentType: FV.MIME[ext], fileName: `fuel-receipt-${id}${fv ? `-v${fv.version_no}` : ''}.${ext}` });
 };
 
 // ------------------------------------------------------------------ adjustments
@@ -145,8 +164,9 @@ exports.createAdjustment = async (req, res) => {
   });
   if (d.amount === 0) throw AppError.validation({ amount: 'cannot be 0' });
   const row = await withTransaction(async (conn) => {
-    await C.loadMachine(conn, d.equipment_id);
+    const machine = await C.loadMachine(conn, d.equipment_id);
     if (d.site_id) await C.loadSite(conn, d.site_id);
+    await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: d.equipment_id, siteId: d.site_id || null, from: d.adjustment_date, what: 'This adjustment date' });
     const card = await C.rateCardOn(conn, d.equipment_id, d.adjustment_date);
     if (!card) throw AppError.conflict('NO_RATE_CARD', 'The machine has no rate card on that date; the currency is unknown.');
     const [r] = await conn.execute(

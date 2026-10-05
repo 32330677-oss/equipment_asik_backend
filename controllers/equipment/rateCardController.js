@@ -27,6 +27,7 @@ const FIELDS = {
   overtime_multiplier: v.number({ min: 0.5, max: 5, decimals: 2 }),
   standby_billable_pct: v.number({ min: 0, max: 100, decimals: 2 }),
   breakdown_billable_pct: v.number({ min: 0, max: 100, decimals: 2 }),
+  second_shift_pct: v.number({ min: 0, max: 100, decimals: 2 }),
   break_policy: v.enumOf(['Deduct', 'Paid']),
   daily_partial_rule: v.enumOf(['ProRata', 'FullDayIfWorked', 'HalfDayThreshold']),
   half_day_threshold_hours: HOURS(),
@@ -41,7 +42,7 @@ const COLUMNS = Object.keys(FIELDS);
 const DEFAULTS = {
   standard_hours_per_day: 8, overtime_enabled: false, overtime_multiplier: 1, standby_billable_pct: 50,
   breakdown_billable_pct: 0, break_policy: 'Deduct', daily_partial_rule: 'ProRata', monthly_working_days: 26,
-  operator_included: true, fuel_policy: 'VendorSupplies',
+  operator_included: true, fuel_policy: 'VendorSupplies', second_shift_pct: 0,
 };
 
 /** Cross-field rules of a complete card. Returns the normalized card. */
@@ -55,6 +56,8 @@ function checkCard(card) {
   if (card.daily_partial_rule === 'HalfDayThreshold' && mode === 'Daily' && !(Number(card.half_day_threshold_hours) > 0)) {
     f.half_day_threshold_hours = 'is required with HalfDayThreshold';
   }
+  if (mode !== 'Daily' && Number(card.second_shift_pct || 0) > 0) f.second_shift_pct = 'only for Daily billing';
+  if (card.second_shift_pct === null || card.second_shift_pct === undefined) card.second_shift_pct = 0;
   if (card.operator_included && card.operator_daily_rate != null) f.operator_daily_rate = 'only allowed when operator_included is false';
   if (card.effective_to && card.effective_from && card.effective_to < card.effective_from) f.effective_to = 'must be on or after effective_from';
   if (Object.keys(f).length) throw AppError.validation(f);
@@ -163,7 +166,7 @@ exports.preview = async (req, res) => {
     if (s.day_status === 'Working' && !(s.gross_hours > 0)) throw AppError.validation({ [`sample_rows[${i}].gross_hours`]: 'is required for Working' });
     // monthly: standby hours given by the accountant; default in the test = all the standby of the sample row
     const fullStandby = s.day_status === 'Standby' ? (toMin(s.gross_hours) || Math.round(Number(card.standard_hours_per_day) * 60)) : toMin(s.standby_hours);
-    return { day_status: s.day_status, gross_minutes: toMin(s.gross_hours), break_minutes: toMin(s.break_hours), breakdown_minutes: toMin(s.breakdown_hours), standby_minutes: toMin(s.standby_hours),
+    return { record_date: null, day_status: s.day_status, gross_minutes: toMin(s.gross_hours), break_minutes: toMin(s.break_hours), breakdown_minutes: toMin(s.breakdown_hours), standby_minutes: toMin(s.standby_hours),
       standby_credit_minutes: s.standby_paid_hours !== undefined && s.standby_paid_hours !== null ? toMin(s.standby_paid_hours) : fullStandby };
   });
   // Monthly: a real calendar month (working days = days minus the weekly day off)

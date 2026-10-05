@@ -137,13 +137,12 @@ test('finalize locks; supersede creates v2; void rules; accountant finalize sett
   const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-03'", [F.exc.equipment_id]);
   const edit = await h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'x' });
   assert.strictEqual(edit.body.code, 'PAYROLL_PERIOD_FINALIZED');
-  const voidPaid = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/mark-paid`).set(A()));
-  assert.strictEqual(voidPaid.status, 'Paid');
-  const v = await h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/void`).set(A()).send({ reason: 'test' });
-  assert.strictEqual(v.body.code, 'BATCH_STATE');
+  // finalized, not paid: a new version may replace it; the old invoice numbers stay, marked cancelled
   const sup = await ok(h.api().post(`/api/equipment/payroll/batches/${batch.eq_batch_id}/supersede`).set(A()).send({ reason: 'rate correction' }));
   assert.strictEqual(sup.version_number, 2);
   assert.strictEqual(sup.total_net, '8235.00');
+  const old = await ok(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}`).set(ACC()));
+  assert.ok(old.invoices.length > 0 && old.invoices.every((i) => i.cancelled), 'superseded invoices are cancelled, never reused');
   const chain = await ok(h.api().get(`/api/equipment/payroll/batches/${sup.eq_batch_id}/versions`).set(ACC()));
   assert.deepStrictEqual(chain.map((c) => c.status), ['Superseded', 'Generated']);
   const voided = await ok(h.api().patch(`/api/equipment/payroll/batches/${sup.eq_batch_id}/void`).set(A()).send({ reason: 'redo' }));
@@ -156,11 +155,11 @@ test('stale batch cannot be finalized', async () => {
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ ...SCOPE, equipment_id: F.exc.equipment_id }));
   const [row] = await h.query("SELECT eq_attendance_id, check_out_time FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-03'", [F.exc.equipment_id]);
   // remarks / paper do not move money: the batch stays finalizable
-  await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'changed after generation' }));
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'changed after generation', reason: 'remark added by the office' }));
   assert.strictEqual((await ok(h.api().get(`/api/equipment/payroll/batches/${b.eq_batch_id}`).set(ACC()))).stale, false);
   // a different check-out changes the billed hours: stale
   const { addMinutes } = require('../utils/dateTime');
-  await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: addMinutes(row.check_out_time, -30) }));
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: addMinutes(row.check_out_time, -30), reason: 'sheet shows earlier check-out' }));
   const d = await ok(h.api().get(`/api/equipment/payroll/batches/${b.eq_batch_id}`).set(ACC()));
   assert.strictEqual(d.stale, true);
   const f = await h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/finalize`).set(A());

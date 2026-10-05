@@ -36,7 +36,7 @@ async function namesFor(conn, items) {
   if (!eq.length) return names;
   const [e] = await conn.query('SELECT e.equipment_id, e.equipment_code, t.type_name FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)', [eq]);
   for (const r of e) names.eq[r.equipment_id] = r;
-  const [s] = await conn.query('SELECT site_id, site_code, site_name FROM sites WHERE site_id IN (?)', [[...new Set(items.map((i) => i.site_id))]]);
+  const [s] = await conn.query('SELECT site_id, site_code, site_name FROM sites WHERE site_id IN (?)', [[...new Set(items.flatMap((i) => [i.site_id, ...(i.site_allocation || []).map((a) => a.site_id)]))]]);
   for (const r of s) names.site[r.site_id] = r;
   const [vd] = await conn.query('SELECT vendor_id, vendor_code, vendor_name FROM eq_vendors WHERE vendor_id IN (?)', [[...new Set(items.map((i) => i.vendor_id))]]);
   for (const r of vd) names.vendor[r.vendor_id] = r;
@@ -53,6 +53,7 @@ function itemView(it, names) {
     gross: toDecimalString(it.gross_cents), deductions: toDecimalString(it.deductions_cents), net: toDecimalString(it.net_cents),
     lines: it.lines.map((l) => ({ line_type: l.line_type, quantity: l.quantity, unit: l.unit, unit_price: l.unit_price_exact ?? l.unit_price_cents / 100, amount: toDecimalString(l.amount_cents), note: l.note || null })),
     monthly_calc: it.monthly_calc || null,
+    site_allocation: it.site_allocation ? it.site_allocation.map((a) => ({ site_id: a.site_id, site_code: names.site[a.site_id]?.site_code, hours: a.hours, share_pct: a.share_pct, amount: toDecimalString(a.amount_cents) })) : null,
     fuel_difference: it.fuel_diff ? toDecimalString(it.lines.filter((l) => l.line_type === 'FuelPriceDifference').reduce((a, l) => a + l.amount_cents, 0)) : null,
   };
 }
@@ -105,12 +106,12 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
   const totals = items.reduce((t, i) => ({ g: t.g + i.gross_cents, d: t.d + i.deductions_cents, n: t.n + i.net_cents }), { g: 0, d: 0, n: 0 });
   const [b] = await conn.execute(
     `INSERT INTO eq_payroll_batches (start_date, end_date, scope_vendor_id, scope_equipment_id, scope_site_id, currency, version_number,
-       supersedes_batch_id, supersede_reason, total_equipment, total_gross, total_deductions, total_net, generated_by_user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       supersedes_batch_id, supersede_reason, total_equipment, total_gross, total_deductions, total_net, generated_by_user_id, settings_snapshot)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [scope.start_date, scope.end_date, scope.vendor_id || null, scope.equipment_id || null, scope.site_id || null, currency,
       extra.version_number || 1, extra.supersedes_batch_id || null, extra.supersede_reason || null,
       new Set(items.map((i) => i.equipment_id)).size, toDecimalString(totals.g), toDecimalString(totals.d), toDecimalString(totals.n),
-      req.user.user_id]);
+      req.user.user_id, JSON.stringify(await P.billingSettings())]);
   const batchId = b.insertId;
   const labels = await labelsFor(conn, items);
   for (const it of items) {
@@ -119,7 +120,7 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
          work_hours, overtime_hours, standby_hours, breakdown_hours, topup_hours, gross_amount, deductions_amount, net_amount)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [batchId, it.equipment_id, it.vendor_id, it.site_id, it.rate_card_id,
-        JSON.stringify({ ...it.rate_snapshot, months: it.months, monthly_calc: it.monthly_calc || null, fuel_diff: it.fuel_diff || null, labels: labels(it) }), it.billing_mode,
+        JSON.stringify({ ...it.rate_snapshot, months: it.months, monthly_calc: it.monthly_calc || null, fuel_diff: it.fuel_diff || null, site_allocation: it.site_allocation || null, labels: labels(it) }), it.billing_mode,
         it.days_recorded, it.worked_days, hoursOf(it.work_minutes), hoursOf(it.overtime_minutes), hoursOf(it.standby_minutes),
         hoursOf(it.breakdown_minutes), hoursOf(it.topup_minutes), toDecimalString(it.gross_cents), toDecimalString(it.deductions_cents), toDecimalString(it.net_cents)]);
     for (const l of it.lines) {
@@ -132,10 +133,11 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
       const r = pr.row;
       await conn.execute(
         `INSERT INTO eq_payroll_attendance_snapshot (eq_batch_id, eq_item_id, eq_attendance_id, record_date, day_status, check_in_time, check_out_time,
-           operator_name, work_minutes, overtime_minutes, standby_minutes, standby_credit_minutes, breakdown_minutes, break_minutes, topup_minutes, meter_start, meter_end, sheet_row_no, paper_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           operator_name, work_minutes, overtime_minutes, standby_minutes, standby_credit_minutes, breakdown_minutes, break_minutes, topup_minutes, meter_start, meter_end, sheet_row_no, paper_status, calc_detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [batchId, ir.insertId, r.eq_attendance_id, r.record_date, r.day_status, r.check_in_time, r.check_out_time, r.operator_name || null,
-          pr.work, pr.ot, pr.standby, pr.credit ?? null, pr.breakdown, pr.brk, pr.topup, r.meter_start, r.meter_end, r.sheet_row_no, r.paper_status]);
+          pr.work, pr.ot, pr.standby, pr.credit ?? null, pr.breakdown, pr.brk, pr.topup, r.meter_start, r.meter_end, r.sheet_row_no, r.paper_status,
+          P.calcDetail(r) ? JSON.stringify(P.calcDetail(r)) : null]);
     }
   }
   return batchId;
@@ -158,6 +160,8 @@ async function assertNoOverlappingMonthly(conn, scope, items, excludeBatchId) {
 async function generateInTx(conn, req, scope, extra = {}) {
   const blockers = await P.blockers(conn, { ...scope, exclude_batch_id: extra.supersedes_batch_id });
   const blocking = blockers.filter((b) => P.BLOCKING.includes(b.code));
+  const hard = blocking.find((b) => b.code === 'MONTHLY_MULTI_SITE'); // wrong hours due: never accepted
+  if (hard) throw AppError.conflict('MONTHLY_MULTI_SITE', hard.message, { blockers: [hard] });
   if (blocking.length && !scope.accept_blockers) {
     throw AppError.conflict('BLOCKERS_PRESENT', 'Some rows of this scope cannot be paid yet. Fix them or confirm with accept_blockers = true.', { blockers: blocking });
   }
@@ -187,9 +191,19 @@ async function loadBatch(conn, id, lock = false) {
   return rows[0];
 }
 
-/** Stale = a row's BILLED figures changed after generation (paper checks, scans, meters or remarks do not count). */
+/** Stale = generating the same scope now would give different amounts or rows (see eqPayrollService.batchDrift). */
+async function staleReasons(conn, batch) {
+  return P.batchDrift(conn, batch);
+}
 async function isStale(conn, batch) {
-  return (await P.changedRows(conn, batch.eq_batch_id)).length > 0;
+  return (await staleReasons(conn, batch)).length > 0;
+}
+
+/** Official numbers of a batch that no longer stands (voided or superseded): kept, never reused, marked cancelled. */
+async function cancelInvoices(conn, batchId, reason, userId) {
+  await conn.execute(
+    `INSERT IGNORE INTO eq_invoice_cancellations (invoice_id, reason, cancelled_by_user_id, cancelled_at)
+     SELECT invoice_id, ?, ?, ? FROM eq_invoices WHERE eq_batch_id = ?`, [reason, userId, businessNow(), batchId]);
 }
 
 async function batchDetail(conn, id) {
@@ -204,16 +218,25 @@ async function batchDetail(conn, id) {
   const byItem = {};
   for (const l of lines) (byItem[l.eq_item_id] = byItem[l.eq_item_id] || []).push(l);
   const [[u]] = await conn.execute('SELECT full_name FROM users WHERE user_id = ?', [batch.generated_by_user_id]);
-  const stale = batch.status === 'Generated' && !Number(batch.is_finalized) ? await isStale(conn, batch) : false;
-  const [invoices] = await conn.execute('SELECT * FROM eq_invoices WHERE eq_batch_id = ? ORDER BY kind, seq', [id]);
+  const reasons = batch.status === 'Generated' && !Number(batch.is_finalized) ? await staleReasons(conn, batch) : [];
+  const stale = reasons.length > 0;
+  const [invoices] = await conn.execute(
+    `SELECT i.*, c.reason AS cancel_reason, c.cancelled_at, (c.invoice_id IS NOT NULL) AS cancelled
+     FROM eq_invoices i LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = i.invoice_id WHERE i.eq_batch_id = ? ORDER BY i.kind, i.seq`, [id]);
+  for (const x of invoices) x.cancelled = Boolean(Number(x.cancelled));
+  const allocSites = [...new Set(items.flatMap((i) => ((P.parseJson(i.rate_snapshot) || {}).site_allocation || []).map((a) => a.site_id)))];
+  const [sc] = allocSites.length ? await conn.query('SELECT site_id, site_code FROM sites WHERE site_id IN (?)', [allocSites]) : [[]];
+  const siteCode = Object.fromEntries(sc.map((x) => [x.site_id, x.site_code]));
   return {
-    ...batch, is_finalized: Boolean(Number(batch.is_finalized)), generated_by: u ? u.full_name : null, stale, invoices,
+    ...batch, settings_snapshot: P.parseJson(batch.settings_snapshot) || null, is_finalized: Boolean(Number(batch.is_finalized)),
+    generated_by: u ? u.full_name : null, stale, stale_reasons: reasons, invoices,
     items: items.map((i) => {
       const snap = P.parseJson(i.rate_snapshot) || {};
       const inv = (kind) => (invoices.find((x) => x.kind === kind && x.eq_item_id === i.eq_item_id) || {}).invoice_no || null;
       return {
         ...i, ...(snap.labels || {}), rate_snapshot: snap, lines: byItem[i.eq_item_id] || [],
         fuel_difference: (byItem[i.eq_item_id] || []).filter((l) => l.line_type === 'FuelPriceDifference').reduce((a, l) => a + Number(l.amount), 0).toFixed(2),
+        site_allocation: snap.site_allocation ? snap.site_allocation.map((a) => ({ site_id: a.site_id, site_code: siteCode[a.site_id], hours: a.hours, share_pct: a.share_pct, amount: (a.amount_cents / 100).toFixed(2) })) : null,
         invoice_no: inv('Machine'), fuel_invoice_no: inv('FuelDiff'),
         vendor_invoice_no: (invoices.find((x) => x.kind === 'Vendor' && x.vendor_id === i.vendor_id) || {}).invoice_no || null,
       };
@@ -302,7 +325,8 @@ exports.finalize = async (req, res) => {
   await withTransaction(async (conn) => {
     const b = await loadBatch(conn, id, true);
     if (b.status !== 'Generated' || Number(b.is_finalized)) throw AppError.conflict('BATCH_STATE', `Batch is ${b.status}${Number(b.is_finalized) ? ' (finalized)' : ''}.`);
-    if (await isStale(conn, b)) throw AppError.conflict('BATCH_STALE', 'Some rows changed after this batch was generated. Void it and generate again.');
+    const drift = await staleReasons(conn, b);
+    if (drift.length) throw AppError.conflict('BATCH_STALE', 'Something that changes the amounts changed after this batch was generated. Void it and generate again.', { reasons: drift });
     if (await settings.getBool('eq_finalize_requires_scan')) {
       const [rows] = await conn.execute('SELECT eq_attendance_id FROM eq_payroll_attendance_snapshot WHERE eq_batch_id = ?', [id]);
       const missing = await P.sheetsMissingScan(conn, rows.map((r) => r.eq_attendance_id));
@@ -340,6 +364,7 @@ exports.void = async (req, res) => {
     const b = await loadBatch(conn, id, true);
     if (b.status !== 'Generated') throw AppError.conflict('BATCH_STATE', `A ${b.status} batch cannot be voided.`);
     await conn.execute("UPDATE eq_payroll_batches SET status = 'Voided', voided_by_user_id = ?, voided_at = ?, void_reason = ? WHERE eq_batch_id = ?", [req.user.user_id, businessNow(), reason, id]);
+    if (Number(b.is_finalized)) await cancelInvoices(conn, id, `Batch voided: ${reason}`, req.user.user_id);
     await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'void', reason, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: await batchDetail(pool, id) });
@@ -350,10 +375,12 @@ exports.supersede = async (req, res) => {
   const { reason, accept_blockers } = validate(req.body, { reason: v.string({ required: true, min: 3, max: 500 }), accept_blockers: v.bool({ default: false }) });
   const out = await withTransaction(async (conn) => {
     const old = await loadBatch(conn, id, true);
-    if (!Number(old.is_finalized) || !['Generated', 'Paid'].includes(old.status)) throw AppError.conflict('BATCH_STATE', 'Only a finalized batch can be superseded.');
+    if (old.status === 'Paid') throw AppError.conflict('BATCH_PAID', 'A paid batch is never recalculated. Settle any difference with an official Correction (debit / credit note).');
+    if (!Number(old.is_finalized) || old.status !== 'Generated') throw AppError.conflict('BATCH_STATE', 'Only a finalized, unpaid batch can be superseded.');
     const scope = { start_date: old.start_date, end_date: old.end_date, vendor_id: old.scope_vendor_id, equipment_id: old.scope_equipment_id, site_id: old.scope_site_id, currency: old.currency, accept_blockers };
     const r = await generateInTx(conn, req, scope, { version_number: Number(old.version_number) + 1, supersedes_batch_id: id, supersede_reason: reason });
     await conn.execute("UPDATE eq_payroll_batches SET status = 'Superseded' WHERE eq_batch_id = ?", [id]);
+    await cancelInvoices(conn, id, `Replaced by batch #${r.id} (version ${Number(old.version_number) + 1}): ${reason}`, req.user.user_id);
     await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'superseded', newValues: { by: r.id }, reason, ...audit.ctx(req) });
     await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate_version', newValues: { supersedes: id }, reason, ...audit.ctx(req) });
     return r;

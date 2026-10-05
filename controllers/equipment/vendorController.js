@@ -8,6 +8,7 @@ const uploads = require('../../services/uploads');
 const settings = require('../../services/settings');
 const { businessToday } = require('../../utils/businessDate');
 const C = require('../../services/equipment/eqCommon');
+const FV = require('../../services/equipment/eqFileVersions');
 
 const VENDOR_FIELDS = {
   vendor_name: v.string({ max: 255 }),
@@ -174,19 +175,33 @@ exports.uploadDocument = [uploads.single('file'), async (req, res) => {
   const key = `equipment/contracts/${id}/${hash.slice(0, 16)}.${type.ext}`;
   const contract = await withTransaction(async (conn) => {
     const before = await C.loadContract(conn, id, true);
+    const v = await FV.add(conn, {
+      ownerTable: 'eq_vendor_contracts', ownerId: id, key, sha256: hash, contentType: type.mime, size: req.file.size || req.file.buffer.length,
+      originalName: req.file.originalname, reason: req.body && req.body.reason, userId: req.user.user_id,
+    });
     await storage.put({ key, buffer: req.file.buffer, contentType: type.mime });
     await conn.execute('UPDATE eq_vendor_contracts SET document_path = ?, document_sha256 = ? WHERE vendor_contract_id = ?', [key, hash, id]);
-    await audit.log(conn, { table: 'eq_vendor_contracts', id, action: 'upload_document', oldValues: { document_path: before.document_path }, newValues: { document_path: key, sha256: hash }, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_vendor_contracts', id, action: v.replaced_version ? 'replace_document' : 'upload_document', oldValues: { document_path: before.document_path },
+      newValues: { document_path: key, sha256: hash, version_no: v.version_no }, reason: (req.body && req.body.reason) || null, ...audit.ctx(req) });
     return C.loadContract(conn, id);
   });
   res.status(201).json({ status: 'success', data: contract });
 }];
 
+exports.listDocuments = async (req, res) => {
+  const id = parseId(req.params.id);
+  await C.loadContract(pool, id);
+  res.json({ status: 'success', data: await FV.list(pool, 'eq_vendor_contracts', id) });
+};
+
 exports.downloadDocument = async (req, res) => {
   const id = parseId(req.params.id);
   const c = await C.loadContract(pool, id);
-  if (!c.document_path) throw AppError.notFound('Contract document');
-  const ext = c.document_path.split('.').pop();
+  const version = req.query.version ? parseId(req.query.version) : null;
+  const fv = await FV.get(pool, 'eq_vendor_contracts', id, version);
+  const key = fv ? fv.storage_key : (version ? null : c.document_path);
+  if (!key) throw AppError.notFound('Contract document');
+  const ext = FV.extOf(key);
   const mime = { pdf: 'application/pdf', jpg: 'image/jpeg', png: 'image/png' }[ext] || 'application/octet-stream';
-  await storage.send(res, c.document_path, { contentType: mime, fileName: `contract-${c.contract_number}.${ext}` });
+  await storage.send(res, key, { contentType: mime, fileName: `contract-${c.contract_number}${fv ? `-v${fv.version_no}` : ''}.${ext}` });
 };

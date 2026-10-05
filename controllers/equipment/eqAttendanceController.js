@@ -75,6 +75,7 @@ async function rowView(conn, id) {
     standby_credit_minutes: row.standby_credit_minutes ?? null, standby_credit_at: row.standby_credit_at ?? null, standby_credit_note: row.standby_credit_note ?? null,
     work_description: row.work_description, remarks: row.remarks, admin_rejection_notes: row.admin_rejection_notes,
     anomaly_code: row.anomaly_code, anomaly_detail: row.anomaly_detail, anomaly_acknowledged: Boolean(row.anomaly_ack_at),
+    edited_after_approval: Boolean(row.edited_after_approval), admin_edit_reason: row.admin_edit_reason ?? null, admin_edit_at: row.admin_edit_at ?? null,
     paper_status: row.paper_status, sheet: sheet ? { ...sheet, sheet_row_no: row.sheet_row_no } : null,
     open_downtime: open, downtime: periods, live_state: S.liveState(row, open),
   };
@@ -149,12 +150,14 @@ exports.siteDay = async (req, res) => {
   const [[drafts]] = await pool.execute(
     "SELECT COUNT(*) AS n, SUM(day_status = 'Working' AND check_out_time IS NULL) AS open_rows FROM eq_attendance WHERE site_id = ? AND shift_type = ? AND record_date = ? AND status = 'Draft'",
     [siteId, shift, date]);
+  const [[submitted]] = await pool.execute(
+    "SELECT COUNT(*) AS n FROM eq_attendance WHERE site_id = ? AND shift_type = ? AND record_date = ? AND status = 'Submitted'", [siteId, shift, date]);
   res.json({
     status: 'success',
     data: {
       site: { site_id: site.site_id, site_code: site.site_code, site_name: site.site_name, shift_type: shift },
       date, summary, machines: out,
-      submit: { draft_rows: Number(drafts.n), open_rows: Number(drafts.open_rows || 0), can_submit: Number(drafts.n) > 0 && !Number(drafts.open_rows || 0) && !gate.blocked, week_gate: gate },
+      submit: { draft_rows: Number(drafts.n), open_rows: Number(drafts.open_rows || 0), can_submit: Number(drafts.n) > 0 && !Number(drafts.open_rows || 0) && !gate.blocked, week_gate: gate, submitted_rows: Number(submitted.n) },
     },
   });
 };
@@ -402,6 +405,8 @@ async function applyEdit(conn, row, d) {
 }
 
 exports.applyEdit = applyEdit;
+exports.assertOperatorUsable = assertOperatorUsable;
+exports.assertNotFutureTime = assertNotFutureTime;
 exports.EDIT_FIELDS = EDIT_FIELDS;
 exports.rowView = rowView;
 
@@ -461,6 +466,53 @@ exports.submit = async (req, res) => {
     return { submitted: rows.length, machines_without_row: missing.map((m) => m.equipment_code) };
   });
   res.json({ status: 'success', data: result, message: `${result.submitted} row(s) submitted.` });
+};
+
+// ------------------------------------------------------------------ recall (supervisor takes back a Submitted row before approval)
+/** A Submitted row the office has not approved yet goes back to Draft; the reason is kept in the history. */
+async function resetPaper(conn, row, userId) {
+  if (row.paper_status !== 'Pending') {
+    await conn.execute("UPDATE eq_attendance SET paper_status = 'Pending' WHERE eq_attendance_id = ?", [row.eq_attendance_id]);
+    await conn.execute('UPDATE eq_paper_checks SET is_current = 0 WHERE eq_attendance_id = ?', [row.eq_attendance_id]);
+    if (row.timesheet_id) await sheets.refreshStatus(conn, row.timesheet_id, userId);
+  }
+}
+exports.resetPaper = resetPaper;
+
+async function recallRows(conn, req, rows, reason) {
+  for (const row of rows) {
+    if (row.status !== 'Submitted') throw AppError.conflict('INVALID_STATE', `Row #${row.sheet_row_no} is ${row.status}; only Submitted rows (not approved yet) can be recalled.`);
+    await lock.assertEqEditable(conn, row);
+    await conn.execute("UPDATE eq_attendance SET status = 'Draft', submitted_by_user_id = NULL, submitted_at = NULL WHERE eq_attendance_id = ?", [row.eq_attendance_id]);
+    await resetPaper(conn, row, req.user.user_id);
+    await audit.log(conn, { table: 'eq_attendance', id: row.eq_attendance_id, action: 'recall', reason, ...audit.ctx(req) });
+  }
+  return rows.length;
+}
+
+exports.recall = async (req, res) => {
+  const id = parseId(req.params.id);
+  const { reason } = validate(req.body, { reason: v.string({ required: true, min: 3, max: 1000 }) });
+  await withTransaction(async (conn) => {
+    const row = await S.loadRow(conn, id, true);
+    await assertCanActOnSite(req.user, row.site_id, row.shift_type, row.record_date, conn);
+    await recallRows(conn, req, [row], reason);
+  });
+  res.json({ status: 'success', data: await rowView(pool, id), message: 'Row recalled to Draft. Fix it and submit the day again.' });
+};
+
+exports.recallDay = async (req, res) => {
+  const d = validate(req.body, { site_id: v.id({ required: true }), shift_type: SHIFT, record_date: v.date({ required: true }), reason: v.string({ required: true, min: 3, max: 1000 }) });
+  const n = await withTransaction(async (conn) => {
+    await assertCanActOnSite(req.user, d.site_id, d.shift_type, d.record_date, conn);
+    const [ids] = await conn.execute("SELECT eq_attendance_id FROM eq_attendance WHERE site_id = ? AND shift_type = ? AND record_date = ? AND status = 'Submitted' FOR UPDATE",
+      [d.site_id, d.shift_type, d.record_date]);
+    if (!ids.length) throw AppError.conflict('NOTHING_TO_RECALL', 'No Submitted row waits for approval on this day.');
+    const rows = [];
+    for (const r of ids) rows.push(await S.loadRow(conn, r.eq_attendance_id, true));
+    return recallRows(conn, req, rows, d.reason);
+  });
+  res.json({ status: 'success', data: { recalled: n }, message: `${n} row(s) recalled to Draft.` });
 };
 
 exports.rejected = async (req, res) => {

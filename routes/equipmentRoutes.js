@@ -35,6 +35,7 @@ router.post('/vendors/:id/contracts', A, vendor.createContract);
 router.put('/contracts/:id', A, vendor.updateContract);
 router.post('/contracts/:id/document', A, uploadLimiter, vendor.uploadDocument);
 router.get('/contracts/:id/document', AC, vendor.downloadDocument);
+router.get('/contracts/:id/documents', AC, vendor.listDocuments);
 
 // 5.2 types, machines, operators
 router.get('/types', ACS, fleet.listTypes);
@@ -80,7 +81,9 @@ router.post('/attendance/:id/downtime/start', AS, att.downtimeStart);
 router.post('/attendance/:id/downtime/:downtimeId/end', AS, att.downtimeEnd);
 router.delete('/attendance/:id/downtime/:downtimeId', AS, att.downtimeDelete);
 router.post('/attendance/:id/check-out', AS, att.checkOut);
+router.post('/attendance/recall', AS, att.recallDay);
 router.patch('/attendance/:id/resubmit', AS, att.resubmit);
+router.patch('/attendance/:id/recall', AS, att.recall);
 router.patch('/attendance/:id', AS, att.edit);
 router.delete('/attendance/:id', AS, att.remove);
 
@@ -95,6 +98,11 @@ router.patch('/admin/attendance/:id', A, review.adminEdit);
 router.post('/admin/attendance/:id/correction', A, review.correction);
 router.get('/admin/corrections', AC, review.listCorrections);
 router.patch('/admin/corrections/:id/resolve', AC, review.resolveCorrection);
+router.get('/admin/corrections/:id', AC, review.getCorrection);
+router.patch('/admin/corrections/:id/review', AC, review.reviewCorrection);
+router.patch('/admin/corrections/:id/return', A, review.returnCorrection);
+router.patch('/admin/corrections/:id/approve', A, review.approveCorrection);
+router.patch('/admin/corrections/:id/cancel', A, review.cancelCorrection);
 
 // 5.7 fuel & adjustments
 router.get('/fuel-issues', AC, fuel.listFuel);
@@ -102,6 +110,7 @@ router.post('/fuel-issues', ACS, fuel.createFuel);
 router.patch('/fuel-issues/:id/cancel', AC, fuel.cancelFuel);
 router.post('/fuel-issues/:id/receipt', ACS, uploadLimiter, fuel.uploadReceipt);
 router.get('/fuel-issues/:id/receipt', AC, fuel.downloadReceipt);
+router.get('/fuel-issues/:id/receipts', AC, fuel.listReceipts);
 router.patch('/fuel-issues/:id', AC, fuel.updateFuel);
 router.get('/adjustments', AC, fuel.listAdjustments);
 router.post('/adjustments', AC, fuel.createAdjustment);

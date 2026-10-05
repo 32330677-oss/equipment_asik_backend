@@ -169,11 +169,33 @@ test('payroll lock blocks edits; correction is logged and payroll untouched', as
   assert.strictEqual(edit.body.code, 'PAYROLL_PERIOD_FINALIZED');
   const newRow = await h.api().post('/api/equipment/attendance/day-status').set(S8()).send({ equipment_id: F.exc.equipment_id, site_id: 8, record_date: '2026-10-09', day_status: 'Absent' });
   assert.strictEqual(newRow.body.code, 'PAYROLL_PERIOD_FINALIZED');
+  // official correction: Admin requests -> Accountant reviews -> Admin returns / approves
+  const ACCT = () => h.auth(h.T.accountant());
   const corr = await ok(h.api().post(`/api/equipment/admin/attendance/${r.eq_attendance_id}/correction`).set(A()).send({ reason: 'Paper shows check-out 17:45', changes: { check_out_time: '2026-10-05 17:45' } }));
   assert.strictEqual(corr.locked_batch_id, b.insertId);
-  const list = await ok(h.api().get('/api/equipment/admin/corrections?status=Open').set(h.auth(h.T.accountant())));
-  assert.strictEqual(list.length, 1);
-  assert.strictEqual(list[0].corrected_values.check_out_time, '2026-10-05 17:45:00');
+  assert.strictEqual(corr.request_status, 'Requested');
+  const [still] = await h.query('SELECT check_out_time FROM eq_attendance WHERE eq_attendance_id = ?', [r.eq_attendance_id]);
+  assert.notStrictEqual(still.check_out_time, '2026-10-05 17:45:00', 'nothing changes before approval');
+  const early = await h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/approve`).set(A()).send({});
+  assert.strictEqual(early.body.code, 'INVALID_STATE');
+  // this row was never paid by a real batch: the accountant must give the amount
+  const noAmount = await h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/review`).set(ACCT()).send({ note: 'checked' });
+  assert.strictEqual(noAmount.body.code, 'VALIDATION_ERROR');
+  await ok(h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/review`).set(ACCT()).send({ note: 'checked', amount_override: 12.5, override_reason: 'hours from the paper sheet' }));
+  const ret = await ok(h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/return`).set(A()).send({ note: 'check the meter too' }));
+  assert.strictEqual(ret.request_status, 'Requested');
+  assert.strictEqual(ret.return_count, 1);
+  await ok(h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/review`).set(ACCT()).send({ note: 'meter fine' }));
+  const done = await ok(h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/approve`).set(A()).send({ note: 'ok' }));
+  assert.strictEqual(done.request_status, 'Approved');
+  assert.match(done.note.invoice_no, /^DN-\d{4}-\d{5}$/);
+  assert.deepStrictEqual(done.events.map((e) => e.action), ['request', 'review', 'return', 'review', 'approve']);
+  const [after] = await h.query('SELECT check_out_time FROM eq_attendance WHERE eq_attendance_id = ?', [r.eq_attendance_id]);
+  assert.strictEqual(after.check_out_time, '2026-10-05 17:45:00');
+  const [adj] = await h.query("SELECT amount, adjustment_type, adjustment_date FROM eq_adjustments WHERE correction_id = ?", [corr.correction_id]);
+  assert.strictEqual(Number(adj.amount), 12.5);
+  assert.strictEqual(adj.adjustment_type, 'Correction');
+  assert.ok(adj.adjustment_date > '2026-10-10', 'settled in the first open day');
   await h.query('UPDATE eq_payroll_batches SET status = \'Voided\' WHERE eq_batch_id = ?', [b.insertId]);
 });
 

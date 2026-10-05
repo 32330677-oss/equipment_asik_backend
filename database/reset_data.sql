@@ -1,18 +1,22 @@
 -- database/reset_data.sql — wipes ALL business data of equipment_asik and keeps:
 --   the tables, the settings, the machine types, the Admin users, and the applied migrations.
 -- Run it on the equipment_asik database ONLY (DBeaver: select the database first).
+-- After `npm run harden-db` the app user cannot empty the append-only tables: run this with the migration / root user.
 -- After it: restart the backend (npm run dev) so the settings cache is fresh.
 
 USE equipment_asik;
 SET FOREIGN_KEY_CHECKS = 0;
 
+TRUNCATE TABLE eq_invoice_cancellations;
 TRUNCATE TABLE eq_invoices;
 TRUNCATE TABLE eq_invoice_counters;
 TRUNCATE TABLE eq_payroll_attendance_snapshot;
 TRUNCATE TABLE eq_payroll_lines;
 TRUNCATE TABLE eq_payroll_items;
 TRUNCATE TABLE eq_payroll_batches;
+TRUNCATE TABLE eq_correction_events;
 TRUNCATE TABLE eq_attendance_corrections;
+TRUNCATE TABLE eq_file_versions;
 TRUNCATE TABLE eq_paper_checks;
 TRUNCATE TABLE eq_timesheet_scans;
 TRUNCATE TABLE eq_downtime_periods;
