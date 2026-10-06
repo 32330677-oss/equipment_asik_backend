@@ -98,7 +98,7 @@ async function submitted(m, date, inT, outT) {
 
 test('the supervisor recalls a Submitted row (reason kept) until the office approves it', async () => {
   const id = await submitted(F.exc, '2026-11-10', '07:00', '15:00');
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/attendance/${id}/recall`).set(S8()).send({})), 'VALIDATION');
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/attendance/${id}/recall`).set(S8()).send({})), 'VALIDATION_ERROR');
   const r = await ok(h.api().patch(`/api/equipment/attendance/${id}/recall`).set(S8()).send({ reason: 'wrong check-out' }));
   assert.strictEqual(r.status, 'Draft');
   await ok(h.api().patch(`/api/equipment/attendance/${id}`).set(S8()).send({ check_out_time: '2026-11-10 16:00' }));
@@ -119,7 +119,7 @@ test('the Admin edits an Approved row with a reason: it stays Approved, is flagg
   const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-11-10'", [F.exc.equipment_id]);
   const [row2] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-11-11'", [F.exc.equipment_id]);
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-11-01', end_date: '2026-11-15', equipment_id: F.exc.equipment_id }));
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: '2026-11-10 17:00' })), 'VALIDATION');
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: '2026-11-10 17:00' })), 'VALIDATION_ERROR');
   const e = await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: '2026-11-10 17:00', reason: 'Signed sheet says 17:00' }));
   assert.strictEqual(e.status, 'Approved');
   assert.strictEqual(e.edited_after_approval, true);

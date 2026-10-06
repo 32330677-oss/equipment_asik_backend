@@ -74,7 +74,7 @@ exports.me = async (req, res) => {
   const user = publicUser(rows[0]);
   const today = businessToday();
   const sites = user.role === 'Supervisor' ? await supervisorSitesOn(user.user_id, today) : [];
-  res.json({ status: 'success', data: { user, today, sites } });
+  res.json({ status: 'success', data: { user, today, now: businessNow(), time_zone: env.timeZone, sites } });
 };
 
 exports.changePassword = async (req, res) => {

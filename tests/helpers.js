@@ -22,7 +22,7 @@ const request = require('supertest');
 
 const ROOT = path.join(__dirname, '..');
 
-// Freeze the business clock: 2026-10-20 12:00 Asia/Beirut, so date rules are stable whenever tests run.
+// Freeze the business clock: 2026-10-20 12:00 Syria time (Asia/Damascus), so date rules are stable whenever tests run.
 const FIXED_NOW = new Date(Date.UTC(2026, 9, 20, 9, 0, 0));
 require('../utils/businessDate').setClock(() => FIXED_NOW);
 const PASSWORD = 'Passw0rd123';

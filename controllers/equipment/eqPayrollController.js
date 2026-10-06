@@ -148,9 +148,9 @@ async function assertNoOverlappingMonthly(conn, scope, items, excludeBatchId) {
   for (const it of items.filter((i) => i.billing_mode === 'Monthly')) {
     const [rows] = await conn.execute(
       `SELECT b.eq_batch_id, b.start_date, b.end_date FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-       WHERE i.equipment_id = ? AND i.site_id = ? AND i.billing_mode = 'Monthly' AND b.status IN ('Generated','Paid')
+       WHERE i.equipment_id = ? AND i.billing_mode = 'Monthly' AND b.status IN ('Generated','Paid')
          AND b.start_date <= ? AND b.end_date >= ? AND b.eq_batch_id <> ? LIMIT 1`,
-      [it.equipment_id, it.site_id, scope.end_date, scope.start_date, excludeBatchId || 0]);
+      [it.equipment_id, scope.end_date, scope.start_date, excludeBatchId || 0]);
     if (rows[0]) {
       throw AppError.conflict('OVERLAPPING_BATCH', `A monthly machine in this scope is already billed by batch #${rows[0].eq_batch_id} (${rows[0].start_date} to ${rows[0].end_date}).`, rows[0]);
     }
@@ -203,7 +203,20 @@ async function isStale(conn, batch) {
 async function cancelInvoices(conn, batchId, reason, userId) {
   await conn.execute(
     `INSERT IGNORE INTO eq_invoice_cancellations (invoice_id, reason, cancelled_by_user_id, cancelled_at)
-     SELECT invoice_id, ?, ?, ? FROM eq_invoices WHERE eq_batch_id = ?`, [reason, userId, businessNow(), batchId]);
+     SELECT invoice_id, ?, ?, ? FROM eq_invoices WHERE eq_batch_id = ? AND kind IN ('Vendor','Machine','FuelDiff')`, [reason, userId, businessNow(), batchId]);
+}
+
+/**
+ * A finalized batch with official corrections is never replaced or voided: the corrected rows would be billed again
+ * while their debit / credit note adjustment still pays the difference (paid twice).
+ */
+async function assertNoCorrections(conn, batchId) {
+  const [[c]] = await conn.execute(
+    "SELECT correction_id, request_status FROM eq_attendance_corrections WHERE locked_batch_id = ? AND request_status IN ('Requested','Reviewed','Approved') LIMIT 1", [batchId]);
+  if (c) {
+    throw AppError.conflict('BATCH_HAS_CORRECTIONS', `Correction #${c.correction_id} (${c.request_status}) is based on this batch. It cannot be voided or replaced; settle further differences with corrections.`,
+      { correction_id: c.correction_id });
+  }
 }
 
 async function batchDetail(conn, id) {
@@ -227,8 +240,12 @@ async function batchDetail(conn, id) {
   const allocSites = [...new Set(items.flatMap((i) => ((P.parseJson(i.rate_snapshot) || {}).site_allocation || []).map((a) => a.site_id)))];
   const [sc] = allocSites.length ? await conn.query('SELECT site_id, site_code FROM sites WHERE site_id IN (?)', [allocSites]) : [[]];
   const siteCode = Object.fromEntries(sc.map((x) => [x.site_id, x.site_code]));
+  const [requests] = await conn.execute(
+    `SELECT r.*, u.full_name AS requested_by, d.full_name AS decided_by FROM eq_batch_requests r JOIN users u ON u.user_id = r.requested_by_user_id
+     LEFT JOIN users d ON d.user_id = r.decided_by_user_id WHERE r.eq_batch_id = ? ORDER BY r.request_id DESC`, [id]);
   return {
     ...batch, settings_snapshot: P.parseJson(batch.settings_snapshot) || null, is_finalized: Boolean(Number(batch.is_finalized)),
+    requests, pending_request: requests.find((r) => r.status === 'Pending') || null,
     generated_by: u ? u.full_name : null, stale, stale_reasons: reasons, invoices,
     items: items.map((i) => {
       const snap = P.parseJson(i.rate_snapshot) || {};
@@ -253,7 +270,8 @@ exports.list = async (req, res) => {
   if (req.query.from) f('b.end_date >= ?', String(req.query.from));
   if (req.query.to) f('b.start_date <= ?', String(req.query.to));
   const [rows] = await pool.query(
-    `SELECT b.*, vd.vendor_name AS scope_vendor_name, e.equipment_code AS scope_equipment_code, s.site_code AS scope_site_code, u.full_name AS generated_by
+    `SELECT b.*, vd.vendor_name AS scope_vendor_name, e.equipment_code AS scope_equipment_code, s.site_code AS scope_site_code, u.full_name AS generated_by,
+       (SELECT COUNT(*) FROM eq_batch_requests r WHERE r.eq_batch_id = b.eq_batch_id AND r.status = 'Pending') AS pending_requests
      FROM eq_payroll_batches b LEFT JOIN eq_vendors vd ON vd.vendor_id = b.scope_vendor_id LEFT JOIN eq_equipment e ON e.equipment_id = b.scope_equipment_id
      LEFT JOIN sites s ON s.site_id = b.scope_site_id JOIN users u ON u.user_id = b.generated_by_user_id
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY b.eq_batch_id DESC LIMIT 500`, params);
@@ -357,16 +375,60 @@ exports.markPaid = async (req, res) => {
   res.json({ status: 'success', data: await batchDetail(pool, id) });
 };
 
+/** Voids a Generated batch (inside the caller's transaction). */
+async function doVoid(conn, req, id, reason) {
+  const b = await loadBatch(conn, id, true);
+  if (b.status !== 'Generated') throw AppError.conflict('BATCH_STATE', `A ${b.status} batch cannot be voided.`);
+  if (Number(b.is_finalized)) await assertNoCorrections(conn, id);
+  await conn.execute("UPDATE eq_payroll_batches SET status = 'Voided', voided_by_user_id = ?, voided_at = ?, void_reason = ? WHERE eq_batch_id = ?", [req.user.user_id, businessNow(), reason, id]);
+  if (Number(b.is_finalized)) await cancelInvoices(conn, id, `Batch voided: ${reason}`, req.user.user_id);
+  await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'void', reason, ...audit.ctx(req) });
+  return { id };
+}
+
+/** Replaces a finalized, unpaid batch by a recalculated version (inside the caller's transaction). */
+async function doSupersede(conn, req, id, reason, acceptBlockers) {
+  const old = await loadBatch(conn, id, true);
+  if (old.status === 'Paid') throw AppError.conflict('BATCH_PAID', 'A paid batch is never recalculated. Settle any difference with an official Correction (debit / credit note).');
+  if (!Number(old.is_finalized) || old.status !== 'Generated') throw AppError.conflict('BATCH_STATE', 'Only a finalized, unpaid batch can be superseded.');
+  await assertNoCorrections(conn, id);
+  const scope = { start_date: old.start_date, end_date: old.end_date, vendor_id: old.scope_vendor_id, equipment_id: old.scope_equipment_id, site_id: old.scope_site_id, currency: old.currency, accept_blockers: acceptBlockers };
+  const r = await generateInTx(conn, req, scope, { version_number: Number(old.version_number) + 1, supersedes_batch_id: id, supersede_reason: reason });
+  await conn.execute("UPDATE eq_payroll_batches SET status = 'Superseded' WHERE eq_batch_id = ?", [id]);
+  await cancelInvoices(conn, id, `Replaced by batch #${r.id} (version ${Number(old.version_number) + 1}): ${reason}`, req.user.user_id);
+  await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'superseded', newValues: { by: r.id }, reason, ...audit.ctx(req) });
+  await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate_version', newValues: { supersedes: id }, reason, ...audit.ctx(req) });
+  return r;
+}
+
+/**
+ * When only the Admin closes payroll, an Accountant cannot undo a FINALIZED batch alone: the void / new version is
+ * stored as a request and runs when an Admin approves it. Returns the request, or null when the user may act now.
+ */
+async function requestIfNeeded(conn, req, id, action, reason, acceptBlockers) {
+  if (req.user.role !== 'Accountant' || !(await settings.getBool('payroll_finalize_admin_only'))) return null;
+  const b = await loadBatch(conn, id, true);
+  if (!Number(b.is_finalized)) return null;
+  if (b.status !== 'Generated') throw AppError.conflict('BATCH_STATE', `A ${b.status} batch cannot be ${action === 'void' ? 'voided' : 'replaced'}.`);
+  await assertNoCorrections(conn, id);
+  const [[open]] = await conn.execute("SELECT request_id FROM eq_batch_requests WHERE eq_batch_id = ? AND status = 'Pending' LIMIT 1", [id]);
+  if (open) throw AppError.conflict('REQUEST_PENDING', `Request #${open.request_id} for this batch is already waiting for the Admin.`);
+  const [r] = await conn.execute(
+    'INSERT INTO eq_batch_requests (eq_batch_id, action, reason, accept_blockers, requested_by_user_id, requested_at) VALUES (?, ?, ?, ?, ?, ?)',
+    [id, action, reason, acceptBlockers ? 1 : 0, req.user.user_id, businessNow()]);
+  await audit.log(conn, { table: 'eq_payroll_batches', id, action: `request_${action}`, reason, newValues: { request_id: r.insertId }, ...audit.ctx(req) });
+  return { request_id: r.insertId, action, status: 'Pending' };
+}
+
 exports.void = async (req, res) => {
   const id = parseId(req.params.id);
   const { reason } = validate(req.body, { reason: v.string({ required: true, min: 3, max: 500 }) });
-  await withTransaction(async (conn) => {
-    const b = await loadBatch(conn, id, true);
-    if (b.status !== 'Generated') throw AppError.conflict('BATCH_STATE', `A ${b.status} batch cannot be voided.`);
-    await conn.execute("UPDATE eq_payroll_batches SET status = 'Voided', voided_by_user_id = ?, voided_at = ?, void_reason = ? WHERE eq_batch_id = ?", [req.user.user_id, businessNow(), reason, id]);
-    if (Number(b.is_finalized)) await cancelInvoices(conn, id, `Batch voided: ${reason}`, req.user.user_id);
-    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'void', reason, ...audit.ctx(req) });
+  const request = await withTransaction(async (conn) => {
+    const rq = await requestIfNeeded(conn, req, id, 'void', reason, false);
+    if (!rq) await doVoid(conn, req, id, reason);
+    return rq;
   });
+  if (request) return res.status(202).json({ status: 'success', data: await batchDetail(pool, id), message: 'The batch is finalized: your request was sent to the Admin for approval.' });
   res.json({ status: 'success', data: await batchDetail(pool, id) });
 };
 
@@ -374,18 +436,47 @@ exports.supersede = async (req, res) => {
   const id = parseId(req.params.id);
   const { reason, accept_blockers } = validate(req.body, { reason: v.string({ required: true, min: 3, max: 500 }), accept_blockers: v.bool({ default: false }) });
   const out = await withTransaction(async (conn) => {
-    const old = await loadBatch(conn, id, true);
-    if (old.status === 'Paid') throw AppError.conflict('BATCH_PAID', 'A paid batch is never recalculated. Settle any difference with an official Correction (debit / credit note).');
-    if (!Number(old.is_finalized) || old.status !== 'Generated') throw AppError.conflict('BATCH_STATE', 'Only a finalized, unpaid batch can be superseded.');
-    const scope = { start_date: old.start_date, end_date: old.end_date, vendor_id: old.scope_vendor_id, equipment_id: old.scope_equipment_id, site_id: old.scope_site_id, currency: old.currency, accept_blockers };
-    const r = await generateInTx(conn, req, scope, { version_number: Number(old.version_number) + 1, supersedes_batch_id: id, supersede_reason: reason });
-    await conn.execute("UPDATE eq_payroll_batches SET status = 'Superseded' WHERE eq_batch_id = ?", [id]);
-    await cancelInvoices(conn, id, `Replaced by batch #${r.id} (version ${Number(old.version_number) + 1}): ${reason}`, req.user.user_id);
-    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'superseded', newValues: { by: r.id }, reason, ...audit.ctx(req) });
-    await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate_version', newValues: { supersedes: id }, reason, ...audit.ctx(req) });
-    return r;
+    const rq = await requestIfNeeded(conn, req, id, 'supersede', reason, accept_blockers);
+    if (rq) return { request: rq };
+    return doSupersede(conn, req, id, reason, accept_blockers);
   });
+  if (out.request) return res.status(202).json({ status: 'success', data: await batchDetail(pool, id), message: 'The batch is finalized: your request was sent to the Admin for approval.' });
   res.status(201).json({ status: 'success', data: await batchDetail(pool, out.id), warnings: out.warnings });
+};
+
+async function loadRequest(conn, rid) {
+  const [[r]] = await conn.execute('SELECT * FROM eq_batch_requests WHERE request_id = ? FOR UPDATE', [rid]);
+  if (!r) throw AppError.notFound('Request');
+  if (r.status !== 'Pending') throw AppError.conflict('INVALID_STATE', `This request is ${r.status}.`);
+  return r;
+}
+
+/** Admin: approve an Accountant's void / new-version request; the action runs now, in the Admin's name. */
+exports.approveRequest = async (req, res) => {
+  const rid = parseId(req.params.id);
+  const { note } = validate(req.body, { note: v.string({ max: 500 }) });
+  const out = await withTransaction(async (conn) => {
+    const r = await loadRequest(conn, rid);
+    const reason = `${r.reason} (requested by the accountant, approved by the Admin${note ? `: ${note}` : ''})`;
+    const result = r.action === 'void' ? await doVoid(conn, req, r.eq_batch_id, reason) : await doSupersede(conn, req, r.eq_batch_id, reason, Boolean(r.accept_blockers));
+    await conn.execute("UPDATE eq_batch_requests SET status = 'Approved', decided_by_user_id = ?, decided_at = ?, decision_note = ?, result_batch_id = ? WHERE request_id = ?",
+      [req.user.user_id, businessNow(), note || null, r.action === 'supersede' ? result.id : null, rid]);
+    return { batchId: r.action === 'supersede' ? result.id : r.eq_batch_id, warnings: result.warnings };
+  });
+  res.json({ status: 'success', data: await batchDetail(pool, out.batchId), warnings: out.warnings });
+};
+
+exports.rejectRequest = async (req, res) => {
+  const rid = parseId(req.params.id);
+  const { note } = validate(req.body, { note: v.string({ required: true, min: 3, max: 500 }) });
+  const batchId = await withTransaction(async (conn) => {
+    const r = await loadRequest(conn, rid);
+    await conn.execute("UPDATE eq_batch_requests SET status = 'Rejected', decided_by_user_id = ?, decided_at = ?, decision_note = ? WHERE request_id = ?",
+      [req.user.user_id, businessNow(), note, rid]);
+    await audit.log(conn, { table: 'eq_payroll_batches', id: r.eq_batch_id, action: `reject_${r.action}_request`, reason: note, ...audit.ctx(req) });
+    return r.eq_batch_id;
+  });
+  res.json({ status: 'success', data: await batchDetail(pool, batchId) });
 };
 
 exports.versions = async (req, res) => {

@@ -44,7 +44,7 @@ test('a Daily machine on a second shift the same day (another site): 1 day + 50%
   const cards = await ok(h.api().get(`/api/equipment/machines/${F.loader.equipment_id}/rate-cards`).set(ACC()));
   await ok(h.api().put(`/api/equipment/rate-cards/${cards[0].rate_card_id}`).set(ACC()).send({ second_shift_pct: 50 }));
   const bad = await h.api().put(`/api/equipment/rate-cards/${(await ok(h.api().get(`/api/equipment/machines/${F.exc.equipment_id}/rate-cards`).set(ACC())))[0].rate_card_id}`).set(ACC()).send({ second_shift_pct: 50 });
-  assert.strictEqual(bad.body.code, 'VALIDATION', 'second shift % is for Daily cards only');
+  assert.strictEqual(bad.body.code, 'VALIDATION_ERROR', 'second shift % is for Daily cards only');
   await shift(F.loader, 8, 'Day', '2026-11-05 07:00', '2026-11-05 15:00');
   await shift(F.loader, 9, 'Night', '2026-11-05 15:20', '2026-11-05 23:20');
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-11-01', end_date: '2026-11-15', equipment_id: F.loader.equipment_id }));
@@ -54,7 +54,8 @@ test('a Daily machine on a second shift the same day (another site): 1 day + 50%
   assert.strictEqual(second, 150, 'the second shift at 50% of 300');
   const [snap] = await h.query("SELECT s.calc_detail FROM eq_payroll_attendance_snapshot s JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id WHERE s.eq_batch_id = ? AND a.shift_type = 'Night'", [b.eq_batch_id]);
   const detail = typeof snap.calc_detail === 'string' ? JSON.parse(snap.calc_detail) : snap.calc_detail;
-  assert.strictEqual(detail.day_used_before, 1, 'the snapshot keeps how the day was shared');
+  assert.strictEqual(detail.day_plan.extra, 1, 'the snapshot keeps how the day was shared');
+  assert.strictEqual(detail.day_plan.wp, 0);
   await ok(h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/void`).set(ACC()).send({ reason: 'test' }));
 });
 

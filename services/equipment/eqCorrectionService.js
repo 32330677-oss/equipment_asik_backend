@@ -128,10 +128,33 @@ function rowFromSnapshot(s, rate) {
     gross_minutes: gross, break_minutes: Number(s.break_minutes || 0), breakdown_minutes: s.day_status === 'Working' ? Number(s.breakdown_minutes || 0) : 0,
     standby_minutes: s.day_status === 'Working' ? Number(s.standby_minutes || 0) : 0,
     standby_credit_minutes: s.standby_credit_minutes === undefined ? null : s.standby_credit_minutes,
-    check_in_time: s.check_in_time, check_out_time: s.check_out_time,
-    // continuous shifts / second shift: the corrected row keeps the share it had (neighbour rows are not re-split)
-    regular_allow: detail.regular_allow, day_used_before: detail.day_used_before,
+    check_in_time: s.check_in_time, check_out_time: s.check_out_time, shift_type: s.shift_type,
+    regular_allow: detail.regular_allow, day_plan: detail.day_plan,
   };
+}
+
+/**
+ * Re-splits the shifts of one machine (continuous-shift overtime, minimum top-up per day, second shift) over a set
+ * of rows; each entry is { row, rate, cardId }. Rows are copied, never changed in place.
+ */
+function resplit(entries, gapMin) {
+  const out = entries.map((e) => ({ ...e, row: { ...e.row, regular_allow: undefined, day_plan: undefined } }));
+  const hourlyDaily = out.filter((e) => e.rate.billing_mode !== 'Monthly');
+  const byId = new Map(hourlyDaily.map((e) => [e.row, e]));
+  const allow = engine.blockAllowances(hourlyDaily.map((e) => e.row), (r) => engine.otThresholdMin(byId.get(r).rate),
+    (r) => engine.dayMinutes(r, byId.get(r).rate).work, gapMin);
+  const byCard = new Map();
+  for (const e of hourlyDaily) {
+    const a = allow[e.row.eq_attendance_id];
+    if (a && Number.isFinite(a.allow)) e.row.regular_allow = a.allow;
+    if (!byCard.has(e.cardId)) byCard.set(e.cardId, []);
+    byCard.get(e.cardId).push(e);
+  }
+  for (const list of byCard.values()) {
+    const plans = engine.planDays(list.map((e) => e.row), list[0].rate);
+    for (const e of list) e.row.day_plan = plans.get(e.row);
+  }
+  return out;
 }
 
 /** The finalized batch item that paid this row, with everything frozen in it. */
@@ -168,20 +191,43 @@ async function computeDelta(rowId, changes, userId) {
     const fig = (r) => ({ day_status: r.day_status, check_in_time: r.check_in_time, check_out_time: r.check_out_time, working_minutes: r.working_minutes,
       break_minutes: r.break_minutes, breakdown_minutes: r.breakdown_minutes, standby_minutes: r.standby_minutes, standby_credit_minutes: r.standby_credit_minutes });
     if (!item) return { auto: false, before: fig(before), after: fig(after) };
-    const snap = P.parseJson(item.rate_snapshot) || {};
-    const rate = P.engineRate(snap);
-    const [srows] = await conn.query('SELECT * FROM eq_payroll_attendance_snapshot WHERE eq_item_id = ? ORDER BY record_date', [item.eq_item_id]);
-    const paid = srows.map((s) => rowFromSnapshot(s, rate));
-    const corrected = paid.map((r) => (r.eq_attendance_id === rowId
-      ? { ...P.engineRow(after), eq_attendance_id: rowId, regular_allow: r.regular_allow, day_used_before: r.day_used_before } : r));
-    const ctx = rate.billing_mode === 'Monthly' ? { months: snap.months || [] } : {};
     const settings = P.parseJson(item.settings_snapshot) || {};
-    const fdInput = snap.fuel_diff ? { equipmentId: item.equipment_id, currency: item.currency, terms: snap.fuel_diff.terms || [], prices: snap.fuel_diff.prices || [],
-      allowNegative: ['true', '1'].includes(String(settings.eq_fuel_diff_allow_negative ?? 'true')) } : null;
-    const b = billWith(paid, rate, ctx, fdInput);
-    const a = billWith(corrected, rate, ctx, fdInput);
+    const gap = Number(settings.eq_shift_continuity_minutes ?? 30);
+    const allowNegative = ['true', '1'].includes(String(settings.eq_fuel_diff_allow_negative ?? 'true'));
+    // every item of this machine in the batch: a change on one shift can move the split of the other shifts of the day
+    const [items] = await conn.query('SELECT eq_item_id, rate_card_id, rate_snapshot FROM eq_payroll_items WHERE eq_batch_id = ? AND equipment_id = ?',
+      [item.eq_batch_id, item.equipment_id]);
+    const meta = new Map(items.map((i) => {
+      const snap = P.parseJson(i.rate_snapshot) || {};
+      return [i.eq_item_id, { snap, rate: P.engineRate(snap), cardId: i.rate_card_id }];
+    }));
+    const [srows] = await conn.query(
+      `SELECT s.*, a.shift_type FROM eq_payroll_attendance_snapshot s LEFT JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id
+       WHERE s.eq_batch_id = ? AND s.eq_item_id IN (?) ORDER BY s.record_date`, [item.eq_batch_id, items.map((i) => i.eq_item_id)]);
+    const paidEntries = srows.map((x) => {
+      const m = meta.get(x.eq_item_id);
+      return { itemId: x.eq_item_id, rate: m.rate, cardId: m.cardId, row: rowFromSnapshot(x, m.rate) };
+    });
+    const correctedEntries = paidEntries.map((e) => (e.row.eq_attendance_id === rowId
+      ? { ...e, row: { ...P.engineRow(after), eq_attendance_id: rowId, shift_type: after.shift_type } } : e));
+    const billAll = (entries) => {
+      let net = 0; let mainNet = 0;
+      for (const [itemId, m] of meta) {
+        const rows = entries.filter((e) => e.itemId === itemId).map((e) => e.row);
+        if (!rows.length) continue;
+        const ctx = m.rate.billing_mode === 'Monthly' ? { months: m.snap.months || [] } : {};
+        const fdInput = m.snap.fuel_diff ? { equipmentId: item.equipment_id, currency: item.currency, terms: m.snap.fuel_diff.terms || [],
+          prices: m.snap.fuel_diff.prices || [], allowNegative } : null;
+        const r = billWith(rows, m.rate, ctx, fdInput);
+        net += r.net;
+        if (itemId === item.eq_item_id) mainNet = r.net;
+      }
+      return { net, mainNet };
+    };
+    const b = billAll(resplit(paidEntries, gap));
+    const a = billAll(resplit(correctedEntries, gap));
     return { auto: true, delta_cents: a.net - b.net, currency: item.currency, eq_batch_id: item.eq_batch_id, eq_item_id: item.eq_item_id,
-      invoice_no: item.invoice_no, before: fig(before), after: fig(after), item_net_before: b.net / 100, item_net_after: a.net / 100 };
+      invoice_no: item.invoice_no, before: fig(before), after: fig(after), item_net_before: b.mainNet / 100, item_net_after: a.mainNet / 100 };
   });
 }
 
@@ -212,4 +258,4 @@ async function issueNote(conn, { kind, batchId, vendorId, equipmentId, itemId, c
   return { invoice_id: r.insertId, invoice_no: no };
 }
 
-module.exports = { CHANGE_FIELDS, normalizeChanges, applyChanges, computeDelta, firstOpenDate, issueNote, paidItemOf, rowFromSnapshot, dryRun };
+module.exports = { CHANGE_FIELDS, normalizeChanges, applyChanges, computeDelta, firstOpenDate, issueNote, paidItemOf, rowFromSnapshot, resplit, dryRun };

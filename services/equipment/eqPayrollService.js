@@ -88,7 +88,7 @@ function engineRow(r) {
     day_status: r.day_status, gross_minutes: r.gross_minutes, break_minutes: r.break_minutes,
     breakdown_minutes: r.breakdown_minutes, standby_minutes: r.standby_minutes,
     standby_credit_minutes: r.standby_credit_minutes === undefined ? null : r.standby_credit_minutes,
-    regular_allow: r.regular_allow, day_used_before: r.day_used_before };
+    regular_allow: r.regular_allow, day_plan: r.day_plan };
 }
 
 /** How a row was billed beside its minutes (continuous shifts, second shift): kept in the snapshot. */
@@ -96,7 +96,7 @@ function calcDetail(r) {
   const d = {};
   if (r.regular_allow !== undefined && r.regular_allow !== null && Number.isFinite(r.regular_allow)) d.regular_allow = r.regular_allow;
   if (r.block_shifts > 1) d.block_shifts = r.block_shifts;
-  if (r.day_used_before !== undefined && r.day_used_before !== null) d.day_used_before = Math.round(r.day_used_before * 1e6) / 1e6;
+  if (r.day_plan) d.day_plan = Object.fromEntries(Object.entries(r.day_plan).map(([k, v]) => [k, Math.round(Number(v) * 1e6) / 1e6]));
   return Object.keys(d).length ? d : null;
 }
 
@@ -105,7 +105,7 @@ function rowFigures(r, rate, thr) {
   const m = engine.dayMinutes(r, rate);
   const credit = rate.billing_mode === 'Monthly' && r.standby_credit_minutes !== null && r.standby_credit_minutes !== undefined
     ? engine.standbyCredit(r, Math.round(Number(rate.standard_hours_per_day) * 60)) : null;
-  return { work: m.work, ot: Math.max(0, m.work - engine.allowOf(r, thr)), standby: m.standby, breakdown: m.breakdown, brk: m.brk, topup: engine.minimumTopUp(m, rate), credit };
+  return { work: m.work, ot: Math.max(0, m.work - engine.allowOf(r, thr)), standby: m.standby, breakdown: m.breakdown, brk: m.brk, topup: r.day_plan ? r.day_plan.topup : engine.minimumTopUp(m, rate), credit };
 }
 
 /**
@@ -131,7 +131,7 @@ async function changedRows(conn, batchId) {
     const same = r.s_day_status === r.day_status && String(r.s_in) === String(r.check_in_time) && String(r.s_out) === String(r.check_out_time)
       // overtime is not compared: with continuous shifts it depends on the neighbour rows (the amount check catches it)
       && Number(r.s_work) === f.work && Number(r.s_standby) === f.standby && Number(r.s_breakdown) === f.breakdown
-      && Number(r.s_break) === f.brk && Number(r.s_topup) === f.topup
+      && Number(r.s_break) === f.brk // top-up is shared by the shifts of a day: the amount check catches it
       && (r.billing_mode !== 'Monthly' || (r.s_credit === null ? null : Number(r.s_credit)) === f.credit);
     if (!same) out.push({ eq_attendance_id: r.eq_attendance_id, reason: 'billed figures changed' });
   }
@@ -217,8 +217,9 @@ async function sheetsMissingScan(conn, attendanceIds) {
 /**
  * Sets on each row of an Hourly / Daily machine:
  *  - regular_allow: regular minutes it may use before overtime (continuous shifts share threshold x shifts);
- *  - day_used_before (Daily): part of the calendar day already billed to earlier shifts of the machine.
- * Every row of these machines around the period is read (any site, any status) so the split is the same in
+ *  - day_plan: the share of the calendar day of each shift (minimum top-up once per day; Daily: work first,
+ *    second shift, then breakdown and standby).
+ * Every row of these machines around the period is read (any site, any status but Rejected) so the split is the same in
  * every batch and does not depend on the scope.
  */
 async function applyShiftRules(conn, rows, cards, scope) {
@@ -230,26 +231,25 @@ async function applyShiftRules(conn, rows, cards, scope) {
   const gap = await settings.getInt('eq_shift_continuity_minutes');
   const [ctx] = await conn.query(
     `SELECT eq_attendance_id, equipment_id, record_date, shift_type, check_in_time, check_out_time, day_status, gross_minutes, break_minutes,
-       breakdown_minutes, standby_minutes FROM eq_attendance WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ?`,
+       breakdown_minutes, standby_minutes FROM eq_attendance WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ? AND status <> 'Rejected'`,
     [ids, addDays(scope.start_date, -2), addDays(scope.end_date, 2)]);
   const rateOf = (r) => { const c = cardFor(cards, r.equipment_id, String(r.record_date).slice(0, 10)); return c ? engineRate(c) : null; };
-  const allow = {}; const used = {};
+  const allow = {}; const plans = {};
   for (const id of ids) {
     const mine = ctx.filter((r) => r.equipment_id === id && rateOf(r) && rateOf(r).billing_mode !== 'Monthly');
     Object.assign(allow, engine.blockAllowances(mine, (r) => engine.otThresholdMin(rateOf(r)), (r) => engine.dayMinutes(r, rateOf(r)).work, gap));
     const byCard = new Map();
     for (const r of mine) {
       const c = cardFor(cards, id, String(r.record_date).slice(0, 10));
-      if (c.billing_mode !== 'Daily') continue;
       if (!byCard.has(c.rate_card_id)) byCard.set(c.rate_card_id, { c, list: [] });
       byCard.get(c.rate_card_id).list.push(r);
     }
-    for (const { c, list } of byCard.values()) Object.assign(used, engine.dayUsedBefore(list, engineRate(c)));
+    for (const { c, list } of byCard.values()) Object.assign(plans, engine.dayPlans(list, engineRate(c)));
   }
   for (const r of rows) {
     const a = allow[r.eq_attendance_id];
     if (a && Number.isFinite(a.allow)) { r.regular_allow = a.allow; r.block_shifts = a.shifts; }
-    if (used[r.eq_attendance_id] !== undefined) r.day_used_before = used[r.eq_attendance_id];
+    if (plans[r.eq_attendance_id]) r.day_plan = plans[r.eq_attendance_id];
   }
 }
 
@@ -310,6 +310,16 @@ async function blockers(conn, scope) {
       const c = cardFor(cards, r.equipment_id, r.record_date);
       return c && c.billing_mode === 'Monthly' && hasStandby(r) && (r.standby_credit_minutes === null || r.standby_credit_minutes === undefined);
     }).map(({ standby_credit_minutes: _x, ...r }) => r));
+  // monthly machines are billed from their deployments: a row on a day without deployment would be billed in no month
+  const monthlyRows = approved.filter((r) => { const c = cardFor(cards, r.equipment_id, r.record_date); return c && c.billing_mode === 'Monthly'; });
+  if (monthlyRows.length) {
+    const [dps] = await conn.query(
+      'SELECT equipment_id, assigned_date, unassigned_date FROM eq_site_assignments WHERE equipment_id IN (?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)',
+      [[...new Set(monthlyRows.map((r) => r.equipment_id))]]);
+    add('MONTHLY_ROW_NOT_DEPLOYED', 'Monthly machines with attendance on days they were not deployed (fix the deployment dates).',
+      monthlyRows.filter((r) => !dps.some((d) => d.equipment_id === r.equipment_id && covers(d.assigned_date, d.unassigned_date, String(r.record_date).slice(0, 10))))
+        .map(({ standby_credit_minutes: _x, standby_minutes: _y, ...r }) => r));
+  }
   const fs = scopeSql(scope, 'f');
   const [fuel] = await conn.query(
     `SELECT f.fuel_issue_id, e.equipment_code, f.issue_date, f.liters FROM eq_fuel_issues f JOIN eq_equipment e ON e.equipment_id = f.equipment_id
@@ -334,7 +344,7 @@ async function blockers(conn, scope) {
   return out;
 }
 
-const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING', 'MONTHLY_MULTI_SITE'];
+const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING', 'MONTHLY_MULTI_SITE', 'MONTHLY_ROW_NOT_DEPLOYED'];
 /** Shown with the blockers but never prevent generating. */
 const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING'];
 
@@ -400,17 +410,28 @@ async function calculate(conn, scope) {
   };
   const warnings = [];
   const groups = new Map();
+  // A MONTHLY card is one contract per machine: one group whatever the site (hours due settled once per month);
+  // it is billed on the site where the machine spent most deployed days, with the cost split by site.
+  const mainSite = (equipmentId) => {
+    const count = new Map();
+    for (let d = scope.start_date; d <= scope.end_date; d = addDays(d, 1)) {
+      const s = ownerSite(equipmentId, d);
+      if (s) count.set(s, (count.get(s) || 0) + 1);
+    }
+    let best = null; let n = -1;
+    for (const [s, c] of count) if (c > n) { best = s; n = c; }
+    return best;
+  };
   const groupFor = (equipmentId, siteId, card, vendorId) => {
-    const key = `${equipmentId}|${siteId}|${card ? card.rate_card_id : 'none'}`;
+    if (card && card.billing_mode === 'Monthly') siteId = mainSite(equipmentId) || siteId;
+    const key = `${equipmentId}|${card && card.billing_mode === 'Monthly' ? 'M' : siteId}|${card ? card.rate_card_id : 'none'}`;
     if (!groups.has(key)) groups.set(key, { equipment_id: equipmentId, site_id: siteId, vendor_id: vendorId, card, rows: [], fuel: [], adjustments: [] });
     return groups.get(key);
   };
   for (const r of rows) {
     const card = cardFor(cards, r.equipment_id, r.record_date);
     if (!card) throw AppError.conflict('NO_RATE_CARD', `${r.equipment_code} has no rate card on ${r.record_date}.`);
-    // a monthly machine working two shifts on two sites is ONE monthly contract: its hours go to the owner (Day-shift) site
-    const site = card.billing_mode === 'Monthly' ? (ownerSite(r.equipment_id, r.record_date) || r.site_id) : r.site_id;
-    groupFor(r.equipment_id, site, card, r.vendor_id).rows.push(r);
+    groupFor(r.equipment_id, r.site_id, card, r.vendor_id).rows.push(r);
   }
   // monthly bases from deployments
   for (const d of deps) {
@@ -446,7 +467,7 @@ async function calculate(conn, scope) {
     if (rate.billing_mode === 'Monthly') {
       const ranges = g.deployRanges || [];
       const holidays = new Set(g.rows.filter((r) => r.day_status === 'Holiday').map((r) => String(r.record_date)));
-      ctx = { months: monthsContext(scope.start_date, scope.end_date, ranges, g.card, (d) => ownerSite(g.equipment_id, d) === g.site_id, offDay, holidays) };
+      ctx = { months: monthsContext(scope.start_date, scope.end_date, ranges, g.card, null, offDay, holidays) };
       if (!ranges.length) ctx.months = [];
     }
     if (rate.billing_mode !== 'Monthly' && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;

@@ -1,4 +1,4 @@
-// utils/businessDate.js — the ONE definition of the business date (default Asia/Beirut).
+// utils/businessDate.js — the ONE definition of the business date (default Asia/Damascus, Syria time, UTC+3 all year).
 // Every "today" used by a business rule comes from here: never new Date().toISOString() (UTC)
 // and never MySQL NOW()/CURDATE() (server time zone).
 const { env } = require('../config/env');

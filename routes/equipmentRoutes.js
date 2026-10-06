@@ -151,6 +151,8 @@ router.patch('/payroll/batches/:id/finalize', AC, pay.finalize);
 router.patch('/payroll/batches/:id/mark-paid', AC, pay.markPaid);
 router.patch('/payroll/batches/:id/void', AC, pay.void);
 router.post('/payroll/batches/:id/supersede', AC, pay.supersede);
+router.patch('/payroll/requests/:id/approve', A, pay.approveRequest);
+router.patch('/payroll/requests/:id/reject', A, pay.rejectRequest);
 router.get('/statements/machine/:id.pdf', AC, pay.provisionalMachine);
 router.get('/statements/vendor/:id.pdf', AC, pay.provisionalVendor);
 

@@ -19,6 +19,20 @@ const pool = mysql.createPool({
   ssl: env.db.ssl ? { rejectUnauthorized: false } : undefined,
 });
 
+/** UTC offset of the business time zone now, e.g. '+03:00' (Syria). */
+function businessOffset() {
+  const d = new Date();
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: env.timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(d).map((x) => [x.type, x.value]));
+  const wall = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+  const min = Math.round((wall - d.getTime()) / 60000);
+  const sign = min < 0 ? '-' : '+'; const a = Math.abs(min);
+  return `${sign}${String(Math.floor(a / 60)).padStart(2, '0')}:${String(a % 60).padStart(2, '0')}`;
+}
+// Every connection uses the business time zone, so automatic timestamps (created_at, audit log) are Syria time
+// whatever the time zone of the MySQL server.
+if (pool.pool && pool.pool.on) pool.pool.on('connection', (c) => { c.query(`SET time_zone = '${businessOffset()}'`); });
+
 /** Run fn(conn) inside a transaction; commits on success, rolls back on any error. */
 async function withTransaction(fn) {
   const conn = await pool.getConnection();

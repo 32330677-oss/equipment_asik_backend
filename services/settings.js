@@ -14,7 +14,7 @@ const DEFINITIONS = {
   week_start_day: { type: 'int', min: 0, max: 6, description: 'First day of the attendance week (0=Sunday ... 6=Saturday)' },
   week_gate_enabled: { type: 'bool', description: 'Block submitting a day while the previous week has Draft rows' },
   company_name: { type: 'string', max: 255, description: 'Company name printed on documents' },
-  app_time_zone: { type: 'string', max: 64, description: 'Business time zone (APP_TIME_ZONE env overrides it)' },
+  app_time_zone: { type: 'string', max: 64, readOnly: true, description: 'Business time zone (Syria time). Set on the server with APP_TIME_ZONE; shown here for information' },
   payroll_finalize_admin_only: { type: 'bool', description: 'Only Admin may finalize / mark paid payroll batches' },
   eq_weekly_off_day: { type: 'int', min: 0, max: 6, description: 'Weekly day off for monthly machines (0=Sunday ... 5=Friday ... 6=Saturday)' },
   eq_finalize_requires_scan: { type: 'bool', description: 'A batch can be finalized only when the signed monthly sheets are uploaded for all its rows' },
@@ -26,7 +26,7 @@ const DEFAULTS = {
   eq_payroll_requires_paper_match: 'false', eq_paper_tolerance_minutes: '10', eq_meter_tolerance_pct: '15',
   eq_long_session_review_hours: '16', eq_default_currency: 'USD', eq_timesheet_blank_rows: '6',
   eq_live_refresh_seconds: '60', week_start_day: '6', week_gate_enabled: 'true',
-  company_name: 'ASIK ENGINEERING CONSTRUCTION', app_time_zone: 'Asia/Beirut', payroll_finalize_admin_only: 'true',
+  company_name: 'ASIK ENGINEERING CONSTRUCTION', app_time_zone: 'Asia/Damascus', payroll_finalize_admin_only: 'true',
   eq_finalize_requires_scan: 'true', eq_fuel_diff_allow_negative: 'true', eq_weekly_off_day: '5',
   eq_shift_continuity_minutes: '30',
 };
@@ -57,6 +57,7 @@ async function getBool(key) {
 function normalizeValue(key, value) {
   const def = DEFINITIONS[key];
   if (!def) throw AppError.notFound('Setting');
+  if (def.readOnly) throw AppError.conflict('SETTING_READ_ONLY', 'This value is fixed on the server (Syria time); it cannot be changed here.');
   const raw = value === undefined || value === null ? '' : String(value).trim();
   if (def.type === 'bool') {
     if (['true', 'false'].includes(raw.toLowerCase())) return raw.toLowerCase();
@@ -78,7 +79,8 @@ function normalizeValue(key, value) {
 async function list() {
   await load();
   return Object.entries(DEFINITIONS).map(([key, def]) => ({
-    setting_key: key, setting_value: cache[key] ?? DEFAULTS[key], type: def.type,
+    setting_key: key, setting_value: key === 'app_time_zone' ? require('../config/env').env.timeZone : (cache[key] ?? DEFAULTS[key]), type: def.type,
+    read_only: Boolean(def.readOnly),
     description: def.description, ...(def.values ? { values: def.values } : {}),
     ...(def.min !== undefined ? { min: def.min, max: def.max } : {}),
   }));

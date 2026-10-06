@@ -4,6 +4,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const { env } = require('./config/env');
 const requestId = require('./middleware/requestId');
+const { businessNow } = require('./utils/businessDate');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 
 function buildApp() {
@@ -15,8 +16,10 @@ function buildApp() {
   const any = env.corsOrigins.includes('*');
   app.use(cors({
     origin: any ? true : (origin, cb) => cb(null, !origin || env.corsOrigins.includes(origin)),
-    exposedHeaders: ['Content-Disposition', 'x-request-id'],
+    exposedHeaders: ['Content-Disposition', 'x-request-id', 'x-business-now'],
   }));
+  // the business clock (Syria time): the app uses it instead of the phone clock
+  app.use((req, res, next) => { res.setHeader('X-Business-Now', businessNow()); next(); });
   app.use(express.json({ limit: '2mb' }));
   app.use('/api', require('./routes'));
   app.get('/', (req, res) => res.json({ status: 'ok', service: 'Equipment Flow API', docs: '/api/health' }));

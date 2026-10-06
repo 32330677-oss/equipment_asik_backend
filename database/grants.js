@@ -22,17 +22,29 @@ async function applyGrants(conn, { database, appUser, hosts = ['localhost', '%']
   const [tables] = await conn.query(
     "SELECT table_name AS t FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name", [database]);
   const done = [];
-  for (const host of hosts) {
+  // only the hosts the app user really exists on (granting to a missing account fails on MySQL 8)
+  let existing = hosts;
+  try {
+    const [rows] = await conn.query('SELECT host FROM mysql.user WHERE user = ?', [appUser]);
+    existing = hosts.filter((h) => rows.some((r) => r.host === h));
+  } catch (_) { /* no read right on mysql.user (migration user): try every host */ }
+  for (const host of existing) {
     const who = account(appUser, host);
     try {
       await conn.query(`REVOKE ALL PRIVILEGES ON ${db}.* FROM ${who}`);
     } catch (e) {
-      if (/no such grant|There is no such grant/i.test(e.message)) { /* had no database-wide rights */ } else if (/doesn't exist|unknown user|1133|1141/i.test(`${e.code} ${e.errno} ${e.message}`)) { log(`skip ${who}: ${e.message}`); continue; } else throw e;
+      const msg = `${e.code} ${e.errno} ${e.message}`;
+      if (/1141|no such grant/i.test(msg)) { /* had no database-wide rights */ } else if (/1133|3162|1396|doesn't exist|does not exist|unknown user/i.test(msg)) { log(`skip ${who}: ${e.message}`); continue; } else throw e;
     }
     for (const { t } of tables) {
       const rights = APPEND_ONLY.includes(t) ? 'SELECT, INSERT' : 'SELECT, INSERT, UPDATE, DELETE';
       try { await conn.query(`REVOKE ALL PRIVILEGES ON ${db}.${ident(t)} FROM ${who}`); } catch (_) { /* no table grant yet */ }
-      await conn.query(`GRANT ${rights} ON ${db}.${ident(t)} TO ${who}`);
+      try {
+        await conn.query(`GRANT ${rights} ON ${db}.${ident(t)} TO ${who}`);
+      } catch (e) {
+        if (/1410|1133|3162/.test(`${e.errno}`)) { log(`skip ${who}: ${e.message}`); break; }
+        throw e;
+      }
     }
     done.push(host);
     log(`${who}: ${tables.length} tables, append-only: ${APPEND_ONLY.filter((x) => tables.some((r) => r.t === x)).join(', ')}`);

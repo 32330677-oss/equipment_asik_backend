@@ -46,7 +46,7 @@ function minimumTopUp(m, rate) {
 /** Overtime price per hour in cents. */
 function otRateCents(rate, baseHourlyCents) {
   if (rate.overtime_rate != null) return toCents(rate.overtime_rate);
-  return roundCents(baseHourlyCents * Number(rate.overtime_multiplier || 1));
+  return baseHourlyCents * Number(rate.overtime_multiplier || 1); // not rounded: the AMOUNT is rounded once
 }
 
 // ---------------------------------------------------------------- Hourly
@@ -54,6 +54,7 @@ function billHourly(rows, rate) {
   const hourly = toCents(rate.hourly_rate);
   const thr = otThresholdMin(rate);
   const t = { work: 0, regular: 0, ot: 0, standby: 0, breakdown: 0, topup: 0, standbyBill: 0, breakdownBill: 0, workedDays: 0 };
+  const plans = plansFor(rows, rate);
   for (const r of rows) {
     const m = dayMinutes(r, rate);
     const regular = Math.min(m.work, allowOf(r, thr));
@@ -61,7 +62,7 @@ function billHourly(rows, rate) {
     t.standby += m.standby; t.breakdown += m.breakdown;
     t.standbyBill += m.standby * Number(rate.standby_billable_pct) / 100;
     t.breakdownBill += m.breakdown * Number(rate.breakdown_billable_pct) / 100;
-    t.topup += minimumTopUp(m, rate);
+    t.topup += plans.get(r).topup;
     if (m.status === 'Working' && m.work > 0) t.workedDays += 1;
   }
   const lines = [
@@ -125,34 +126,6 @@ function blockAllowances(rows, thrOf, workOf, gapMin) {
   return out;
 }
 
-/** Raw day fractions of one Daily row: work (with top-up), standby x %, breakdown x %. */
-function dailyFractions(r, rate) {
-  const stdMin = Math.round(Number(rate.standard_hours_per_day) * 60);
-  const m = dayMinutes(r, rate);
-  const topup = minimumTopUp(m, rate);
-  return {
-    m, topup,
-    wf: workFraction(m.work + topup, stdMin, rate),
-    sf: Math.min(1, m.standby / stdMin) * Number(rate.standby_billable_pct) / 100,
-    bf: Math.min(1, m.breakdown / stdMin) * Number(rate.breakdown_billable_pct) / 100,
-  };
-}
-
-/**
- * Shares one calendar day between the shifts of a Daily machine. `used` = part of the day already taken by the
- * earlier shifts. Work first, then breakdown, then standby, never above one day; work above one day is the
- * SECOND SHIFT (billed at second_shift_pct %).
- *   billed day = min(1, sum of work) + second_shift_pct x max(0, sum of work - 1)
- */
-function allocateDay(f, used) {
-  let avail = Math.max(0, 1 - used);
-  const wp = Math.min(f.wf, avail); avail -= wp;
-  const extra = f.wf - wp;
-  const bf = Math.min(f.bf, avail); avail -= bf;
-  const sf = Math.min(f.sf, avail);
-  return { wp, extra, bf, sf, used: used + wp + bf + sf };
-}
-
 /** Order of the shifts inside one day: Day shift first, then by check-in. */
 function shiftOrder(a, b) {
   const sa = a.shift_type === 'Night' ? 1 : 0; const sb = b.shift_type === 'Night' ? 1 : 0;
@@ -160,29 +133,65 @@ function shiftOrder(a, b) {
 }
 
 /**
- * Part of the day used before each row, for rows of ONE machine (any site): { [eq_attendance_id]: used }.
- * The caller passes every row of the machine on those days so a second shift at another site is seen.
+ * Plan of ONE calendar day for all the rows of ONE machine that day (any site, same rate card).
+ *  - minimum top-up: once per day, = minimum - (work + standby + breakdown of all shifts), on the last Working/Standby shift;
+ *  - Daily day shares: work of all shifts first (up to one day; the rest is the SECOND SHIFT), then breakdown, then
+ *    standby fill what is left of the day. billed day = min(1, sum of work) + second_shift_pct x max(0, sum of work - 1).
+ * Returns Map(row -> { topup, wp, extra, bf, sf }) (minutes / day fractions).
  */
-function usedBeforeMap(rows, rate) {
+function planDay(list, rate) {
+  const stdMin = Math.round(Number(rate.standard_hours_per_day) * 60);
+  const rows = [...list].sort(shiftOrder);
+  const ms = rows.map((r) => dayMinutes(r, rate));
+  let topIdx = -1; let topup = 0;
+  if (rate.min_billable_hours_per_day != null) {
+    ms.forEach((m, i) => { if (m.status === 'Working' || m.status === 'Standby') topIdx = i; });
+    if (topIdx >= 0) {
+      const covered = ms.reduce((acc, m) => acc + m.work + m.standby + m.breakdown, 0); // breakdown is never topped up
+      topup = Math.max(0, Math.round(Number(rate.min_billable_hours_per_day) * 60) - covered);
+    }
+  }
+  const f = rows.map((r, i) => {
+    const m = ms[i]; const tu = i === topIdx ? topup : 0;
+    return { r, topup: tu, wf: workFraction(m.work + tu, stdMin, rate),
+      sf: Math.min(1, m.standby / stdMin) * Number(rate.standby_billable_pct) / 100,
+      bf: Math.min(1, m.breakdown / stdMin) * Number(rate.breakdown_billable_pct) / 100 };
+  });
+  let used = 0;
+  for (const x of f) { x.wp = Math.min(x.wf, Math.max(0, 1 - used)); used += x.wp; x.extra = x.wf - x.wp; }
+  let avail = Math.max(0, 1 - used);
+  for (const x of f) { x.bfx = Math.min(x.bf, avail); avail -= x.bfx; }
+  for (const x of f) { x.sfx = Math.min(x.sf, avail); avail -= x.sfx; }
+  const out = new Map();
+  for (const x of f) out.set(x.r, { topup: x.topup, wp: x.wp, extra: x.extra, bf: x.bfx, sf: x.sfx });
+  return out;
+}
+
+/** Day plans of rows of ONE machine: Map(row -> plan). A row without a date is a day of its own. */
+function planDays(rows, rate) {
   const byDay = new Map();
   for (const r of rows) {
-    const k = r.record_date ? String(r.record_date).slice(0, 10) : {}; // a row without a date is a day of its own
+    const k = r.record_date ? String(r.record_date).slice(0, 10) : {};
     if (!byDay.has(k)) byDay.set(k, []);
     byDay.get(k).push(r);
   }
   const out = new Map();
-  for (const list of byDay.values()) {
-    let used = 0;
-    for (const r of [...list].sort(shiftOrder)) {
-      out.set(r, used);
-      used = allocateDay(dailyFractions(r, rate), used).used;
-    }
-  }
+  for (const list of byDay.values()) for (const [r, p] of planDay(list, rate)) out.set(r, p);
   return out;
 }
-function dayUsedBefore(rows, rate) {
+
+/** Same, keyed by eq_attendance_id (the payroll passes every row of the machine those days, any site). */
+function dayPlans(rows, rate) {
   const out = {};
-  for (const [r, used] of usedBeforeMap(rows, rate)) out[r.eq_attendance_id] = used;
+  for (const [r, p] of planDays(rows, rate)) out[r.eq_attendance_id] = p;
+  return out;
+}
+
+/** Plan of each row of an item: the one given by the caller (row.day_plan), else computed among the item's rows. */
+function plansFor(rows, rate) {
+  const local = planDays(rows.filter((r) => !r.day_plan), rate);
+  const out = new Map();
+  for (const r of rows) out.set(r, r.day_plan || local.get(r));
   return out;
 }
 
@@ -192,16 +201,14 @@ function billDaily(rows, rate) {
   const hourlyEquiv = daily / Number(rate.standard_hours_per_day);
   const pct = Number(rate.second_shift_pct || 0) / 100;
   const t = { work: 0, ot: 0, standby: 0, breakdown: 0, topup: 0, workDays: 0, standbyDays: 0, breakdownDays: 0, workedDays: 0, secondShiftDays: 0 };
-  // rows without a given day_used_before share the day with the other rows of this item on the same date
-  const local = usedBeforeMap(rows.filter((r) => r.day_used_before === null || r.day_used_before === undefined), rate);
+  const plans = plansFor(rows, rate);
   for (const r of rows) {
-    const f = dailyFractions(r, rate);
-    const used = r.day_used_before !== null && r.day_used_before !== undefined ? Number(r.day_used_before) : (local.get(r) || 0);
-    const d = allocateDay(f, used);
-    t.work += f.m.work; t.ot += Math.max(0, f.m.work - allowOf(r, thr)); t.topup += f.topup;
-    t.standby += f.m.standby; t.breakdown += f.m.breakdown;
+    const m = dayMinutes(r, rate);
+    const d = plans.get(r);
+    t.work += m.work; t.ot += Math.max(0, m.work - allowOf(r, thr)); t.topup += d.topup;
+    t.standby += m.standby; t.breakdown += m.breakdown;
     t.workDays += d.wp; t.standbyDays += d.sf; t.breakdownDays += d.bf; t.secondShiftDays += d.extra;
-    if (f.m.status === 'Working' && f.m.work > 0) t.workedDays += 1;
+    if (m.status === 'Working' && m.work > 0) t.workedDays += 1;
   }
   const lines = [
     line('Work', t.workDays, 'day', daily),
@@ -247,7 +254,7 @@ function billMonthly(rows, rate, ctx) {
   const details = [];
   const months = ctx.months || [];
   for (const mo of months) {
-    const mRows = rows.filter((r) => !r.record_date || months.length === 1 || String(r.record_date).slice(0, 7) === mo.month);
+    const mRows = rows.filter((r) => !r.record_date || String(r.record_date).slice(0, 7) === mo.month);
     let work = 0; let standby = 0; let breakdown = 0; let credit = 0;
     for (const r of mRows) {
       const m = dayMinutes(r, rate);
@@ -285,8 +292,10 @@ function billMonthly(rows, rate, ctx) {
 
 function round4(x) { return Math.round(x * 10000) / 10000; }
 function line(type, quantity, unit, unitPriceCents) {
-  return { line_type: type, quantity: round4(quantity), unit, unit_price_cents: roundCents(unitPriceCents),
-           amount_cents: roundCents(quantity * unitPriceCents) };
+  const l = { line_type: type, quantity: round4(quantity), unit, unit_price_cents: roundCents(unitPriceCents),
+    amount_cents: roundCents(quantity * unitPriceCents) };
+  if (Math.abs(unitPriceCents - Math.round(unitPriceCents)) > 1e-9) l.unit_price_exact = Math.round(unitPriceCents * 10) / 1000;
+  return l;
 }
 
 /**
@@ -324,5 +333,5 @@ function billItem(rows, rate, ctx = {}, extras = {}) {
 
 module.exports = {
   standbyCredit, exactCents, dayMinutes, billItem, billHourly, billDaily, billMonthly, minimumTopUp, otThresholdMin,
-  allowOf, dailyFractions, allocateDay, dayUsedBefore, shiftOrder, blockAllowances,
+  allowOf, planDay, planDays, dayPlans, plansFor, shiftOrder, blockAllowances,
 };

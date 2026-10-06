@@ -32,7 +32,7 @@ const env = {
   jwtSecret: str('JWT_SECRET'),
   jwtExpiresIn: str('JWT_EXPIRES_IN', '12h'),
   corsOrigins: str('CORS_ORIGINS', '*').split(',').map((s) => s.trim()).filter(Boolean),
-  timeZone: str('APP_TIME_ZONE', 'Asia/Beirut'),
+  timeZone: str('APP_TIME_ZONE', 'Asia/Damascus'), // Syria: UTC+3 all year
   storage: {
     driver: str('FILE_STORAGE_DRIVER', 'local'),
     dir: str('FILE_STORAGE_DIR', require('path').join(__dirname, '..', 'storage')),

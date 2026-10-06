@@ -33,10 +33,13 @@ test('unknown route -> 404 JSON', async () => {
   assert.strictEqual(r.body.code, 'NOT_FOUND');
 });
 
-test('businessDate uses Asia/Beirut, not UTC', () => {
+test('businessDate uses Syria time (UTC+3 all year), not UTC', () => {
   const bd = require('../utils/businessDate');
-  // 2026-10-02 22:30 UTC = 2026-10-03 01:30 in Beirut (UTC+3)
+  // 2026-10-02 22:30 UTC = 2026-10-03 01:30 in Damascus (UTC+3)
   assert.strictEqual(bd.businessToday(new Date(Date.UTC(2026, 9, 2, 22, 30))), '2026-10-03');
+  // winter too: 2026-01-15 21:30 UTC = 2026-01-16 00:30 in Damascus (Beirut would still be the 15th)
+  assert.strictEqual(bd.businessToday(new Date(Date.UTC(2026, 0, 15, 21, 30))), '2026-01-16');
+  assert.strictEqual(bd.businessNow(new Date(Date.UTC(2026, 0, 15, 9, 0))), '2026-01-15 12:00:00');
   assert.strictEqual(bd.addDays('2026-02-28', 1), '2026-03-01');
   assert.strictEqual(bd.daysInMonth('2026-02'), 28);
   assert.strictEqual(bd.daysBetweenInclusive('2026-10-10', '2026-10-31'), 22);
