@@ -115,19 +115,33 @@ exports.create = async (req, res) => {
   res.status(201).json({ status: 'success', data: created });
 };
 
+/** Active batch (Generated, not finalized) billed with this card: editing the card turns it stale. */
+async function rateCardInGeneratedBatch(conn, rateCardId) {
+  const [rows] = await conn.execute(
+    `SELECT b.eq_batch_id FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
+     WHERE i.rate_card_id = ? AND b.status = 'Generated' AND b.is_finalized = 0 LIMIT 1`, [rateCardId]);
+  return rows[0] ? rows[0].eq_batch_id : null;
+}
+
 exports.update = async (req, res) => {
   const id = parseId(req.params.id);
-  const d = validate(req.body, FIELDS);
+  const d = validate(req.body, { ...FIELDS, reason: v.string({ max: 500 }) });
+  const reason = d.reason ? d.reason.trim() : ''; delete d.reason;
   const updated = await withTransaction(async (conn) => {
     const before = await C.loadRateCard(conn, id, true);
     const lockedBy = await C.rateCardLocked(conn, id);
-    if (lockedBy) throw AppError.conflict('RATE_CARD_LOCKED', `This rate card is used by finalized payroll batch #${lockedBy}. Close it and create a new one instead.`, { eq_batch_id: lockedBy });
+    if (lockedBy) throw AppError.conflict('RATE_CARD_LOCKED', `This rate card is used by finalized payroll batch #${lockedBy}. Use "Change from a date" for the future; a wrong price already paid is fixed by an official Correction.`, { eq_batch_id: lockedBy });
+    const generated = await rateCardInGeneratedBatch(conn, id);
+    if (generated && reason.length < 5) {
+      throw AppError.validation({ reason: `draft payroll batch #${generated} uses this card: say why it changes (at least 5 characters); that batch will need to be regenerated` });
+    }
     const card = checkCard({ ...before, overtime_enabled: Boolean(before.overtime_enabled), operator_included: Boolean(before.operator_included), ...d });
     const machine = await C.loadMachine(conn, before.equipment_id, true);
     await assertContractAndOverlap(conn, machine, card, id);
     await conn.execute(`UPDATE eq_rate_cards SET ${COLUMNS.map((k) => `${k} = ?`).join(', ')} WHERE rate_card_id = ?`, [...toDb(card), id]);
     const after = await C.loadRateCard(conn, id);
-    await audit.log(conn, { table: 'eq_rate_cards', id, action: 'update', oldValues: before, newValues: after, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_rate_cards', id, action: 'update', oldValues: before, newValues: after, reason: reason || null,
+      payrollEffect: generated ? `stale:${generated}` : 'none', ...audit.ctx(req) });
     return after;
   });
   res.json({ status: 'success', data: updated });

@@ -136,7 +136,7 @@ exports.getMachine = async (req, res) => {
        ea.check_out_time, ea.working_minutes, ea.paper_status, ea.anomaly_code
      FROM eq_attendance ea JOIN sites s ON s.site_id = ea.site_id WHERE ea.equipment_id = ? ORDER BY ea.record_date DESC LIMIT 10`, [id]);
   const [open] = await pool.execute(
-    'SELECT eq_attendance_id, site_id, shift_type, record_date, check_in_time FROM eq_attendance WHERE equipment_id = ? AND check_in_time IS NOT NULL AND check_out_time IS NULL', [id]);
+    'SELECT eq_attendance_id, site_id, shift_type, record_date, check_in_time FROM eq_attendance WHERE equipment_id = ? AND check_in_time IS NOT NULL AND check_out_time IS NULL AND status <> \'Cancelled\'', [id]);
   const [fuelTerms] = await pool.execute('SELECT * FROM eq_fuel_terms WHERE equipment_id = ? ORDER BY effective_from DESC', [id]);
   res.json({ status: 'success', data: { ...machine, has_photo: Boolean(photo_path), deployments, rate_cards: rateCards, recent_attendance: attendance, open_session: open[0] || null, fuel_terms: fuelTerms } });
 };

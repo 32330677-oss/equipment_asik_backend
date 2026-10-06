@@ -1,5 +1,6 @@
 // services/equipment/eqLock.js — rows/dates covered by a FINALIZED active equipment payroll batch are
-// locked for normal operations (BR-23). Only the Admin correction workflow may change them.
+// locked for normal operations (BR-23). Only the official correction workflow may change them, and no new batch
+// may pay anything that belongs to them (a closed month is never reopened financially).
 const AppError = require('../../utils/AppError');
 
 async function batchHoldingRow(executor, eqAttendanceId) {
@@ -39,9 +40,41 @@ async function assertEqEditable(executor, row) {
   const b = await findLock(executor, row);
   if (b) {
     throw AppError.conflict('PAYROLL_PERIOD_FINALIZED',
-      `${String(row.record_date).slice(0, 10)} is inside equipment payroll batch #${b.eq_batch_id} (${b.start_date} to ${b.end_date}), which is ${b.status === 'Paid' ? 'Paid' : 'Finalized'}. Normal changes are locked; an Admin can use "Correction" (reason required).`,
+      `${String(row.record_date).slice(0, 10)} is inside equipment payroll batch #${b.eq_batch_id} (${b.start_date} to ${b.end_date}), which is ${b.status === 'Paid' ? 'Paid' : 'Finalized'}. Normal changes are locked; ask for an official Correction (Admin or Accountant, reason required).`,
       { eq_batch_id: b.eq_batch_id });
   }
+}
+
+/** The active, NOT finalized (Generated) batch that holds this row: changing the row makes that batch stale. */
+async function generatedBatchHoldingRow(executor, eqAttendanceId) {
+  const [rows] = await executor.execute(
+    `SELECT b.eq_batch_id FROM eq_payroll_attendance_snapshot s JOIN eq_payroll_batches b ON b.eq_batch_id = s.eq_batch_id
+     WHERE s.eq_attendance_id = ? AND b.status = 'Generated' AND b.is_finalized = 0 ORDER BY b.eq_batch_id DESC LIMIT 1`, [eqAttendanceId]);
+  return rows[0] ? rows[0].eq_batch_id : null;
+}
+
+/** Text for audit_logs.payroll_effect of a change to an attendance row. */
+async function rowPayrollEffect(executor, eqAttendanceId) {
+  const g = await generatedBatchHoldingRow(executor, eqAttendanceId);
+  return g ? `stale:${g}` : 'none';
+}
+
+/** Every finalized active batch overlapping [start, end] (except one, for a new version of it). */
+async function finalizedBatchesOverlapping(executor, start, end, excludeBatchId = null) {
+  const [rows] = await executor.execute(
+    `SELECT eq_batch_id, start_date, end_date, status, scope_vendor_id, scope_equipment_id, scope_site_id FROM eq_payroll_batches
+     WHERE status IN ('Generated','Paid') AND is_finalized = 1 AND start_date <= ? AND end_date >= ? AND eq_batch_id <> ?`,
+    [end, start, excludeBatchId || 0]);
+  return rows.map((b) => ({ ...b, start_date: String(b.start_date).slice(0, 10), end_date: String(b.end_date).slice(0, 10) }));
+}
+
+/** The finalized batch (from a preloaded list) that closed this machine / site / date, or null. siteId null = any site. */
+function closedBy(batches, { vendorId, equipmentId, siteId = null, date }) {
+  const d = String(date).slice(0, 10);
+  return batches.find((b) => b.start_date <= d && b.end_date >= d
+    && (b.scope_vendor_id === null || b.scope_vendor_id === vendorId)
+    && (b.scope_equipment_id === null || b.scope_equipment_id === equipmentId)
+    && (siteId === null || b.scope_site_id === null || b.scope_site_id === siteId)) || null;
 }
 
 /** Is a fuel issue / adjustment already consumed by an active batch? (finalizedOnly limits to finalized ones) */
@@ -112,6 +145,7 @@ async function assertSiteRangeOpen(executor, { siteId, from, to = null, what }) 
 }
 
 module.exports = {
-  findLock, assertEqEditable, batchHoldingRow, sourceConsumed,
+  findLock, assertEqEditable, batchHoldingRow, sourceConsumed, generatedBatchHoldingRow, rowPayrollEffect,
+  finalizedBatchesOverlapping, closedBy,
   finalizedOverlap, finalizedOverlapForSite, assertOpen, assertRangeOpen, assertSiteRangeOpen, OPEN_END,
 };

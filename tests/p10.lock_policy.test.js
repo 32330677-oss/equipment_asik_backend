@@ -25,7 +25,7 @@ before(async () => {
   oct = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-10-01', end_date: '2026-10-31', equipment_id: F.exc.equipment_id }));
   const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-10&equipment_id=${F.exc.equipment_id}`).set(ACC()));
   await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${oct.eq_batch_id}/finalize`).set(A()));
+  await ok(h.api().patch(`/api/equipment/payroll/batches/${oct.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
 });
 after(h.closePool);
 
@@ -54,7 +54,9 @@ test('a generated batch turns stale when a fuel issue of its period changes, not
   assert.strictEqual(nov.stale, false);
   assert.ok(nov.settings_snapshot && nov.settings_snapshot.eq_weekly_off_day !== undefined, 'billing settings are frozen in the batch');
   const fuel = await ok(h.api().get(`/api/equipment/fuel-issues?equipment_id=${F.exc.equipment_id}&from=2026-11-01`).set(ACC()));
-  await ok(h.api().patch(`/api/equipment/fuel-issues/${fuel[0].fuel_issue_id}`).set(ACC()).send({ price_per_liter: 1.25 }));
+  // a price already set changes money: a reason is required (C4)
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/fuel-issues/${fuel[0].fuel_issue_id}`).set(ACC()).send({ price_per_liter: 1.25 })), 'VALIDATION_ERROR');
+  await ok(h.api().patch(`/api/equipment/fuel-issues/${fuel[0].fuel_issue_id}`).set(ACC()).send({ price_per_liter: 1.25, reason: 'invoice price is 1.25' }));
   const d = await ok(h.api().get(`/api/equipment/payroll/batches/${nov.eq_batch_id}`).set(ACC()));
   assert.strictEqual(d.stale, true);
   assert.ok(d.stale_reasons.find((r) => r.code === 'AMOUNT_CHANGED'));

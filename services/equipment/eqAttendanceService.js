@@ -71,7 +71,7 @@ async function evaluateAnomalies(conn, id) {
   if (!code && row.meter_start !== null && row.meter_start !== undefined) {
     const [prev] = await conn.execute(
       `SELECT meter_end, record_date FROM eq_attendance
-       WHERE equipment_id = ? AND eq_attendance_id <> ? AND meter_end IS NOT NULL
+       WHERE equipment_id = ? AND eq_attendance_id <> ? AND meter_end IS NOT NULL AND status <> 'Cancelled'
          AND (record_date < ? OR (record_date = ? AND check_in_time < ?))
        ORDER BY record_date DESC, check_in_time DESC LIMIT 1`,
       [row.equipment_id, id, row.record_date, row.record_date, row.check_in_time || '9999-12-31 00:00:00']);
@@ -100,7 +100,8 @@ async function evaluateAnomalies(conn, id) {
 async function assertNoOpenSession(conn, equipmentId, exceptId = 0) {
   const [rows] = await conn.execute(
     `SELECT ea.eq_attendance_id, s.site_code, ea.shift_type, ea.check_in_time FROM eq_attendance ea JOIN sites s ON s.site_id = ea.site_id
-     WHERE ea.equipment_id = ? AND ea.eq_attendance_id <> ? AND ea.check_in_time IS NOT NULL AND ea.check_out_time IS NULL FOR UPDATE`,
+     WHERE ea.equipment_id = ? AND ea.eq_attendance_id <> ? AND ea.check_in_time IS NOT NULL AND ea.check_out_time IS NULL
+       AND ea.status <> 'Cancelled' FOR UPDATE`,
     [equipmentId, exceptId]);
   if (rows[0]) {
     throw AppError.conflict('MACHINE_HAS_OPEN_SESSION',
@@ -112,7 +113,7 @@ async function assertNoOpenSession(conn, equipmentId, exceptId = 0) {
 async function assertNoTimeOverlap(conn, equipmentId, checkIn, checkOut, exceptId = 0) {
   const [rows] = await conn.execute(
     `SELECT ea.eq_attendance_id, s.site_code, ea.check_in_time, ea.check_out_time FROM eq_attendance ea JOIN sites s ON s.site_id = ea.site_id
-     WHERE ea.equipment_id = ? AND ea.eq_attendance_id <> ? AND ea.check_in_time IS NOT NULL
+     WHERE ea.equipment_id = ? AND ea.eq_attendance_id <> ? AND ea.check_in_time IS NOT NULL AND ea.status <> 'Cancelled'
        AND ea.check_in_time < ? AND COALESCE(ea.check_out_time, '9999-12-31 23:59:59') > ? LIMIT 1`,
     [equipmentId, exceptId, checkOut || '9999-12-31 23:59:59', checkIn]);
   if (rows[0]) {
@@ -124,7 +125,9 @@ async function assertNoTimeOverlap(conn, equipmentId, checkIn, checkOut, exceptI
 function assertSessionLength(checkIn, checkOut) {
   const m = diffMinutes(checkIn, checkOut);
   if (m === null || m <= 0) throw AppError.validation({ check_out_time: 'must be after check_in_time' });
-  if (m > MAX_SESSION_MINUTES) throw AppError.badRequest('SESSION_TOO_LONG', 'A session cannot be longer than 24 hours. Use a correction for exceptional cases.');
+  if (m > MAX_SESSION_MINUTES) {
+    throw AppError.badRequest('SESSION_TOO_LONG', 'A session cannot be longer than 24 hours. Check the date and time of the check-out; work longer than 24 hours is recorded as one session per day.');
+  }
   return m;
 }
 

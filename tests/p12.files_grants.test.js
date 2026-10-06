@@ -61,7 +61,7 @@ test('an accountant cannot void or replace a finalized batch alone: the Admin ap
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-11-01', end_date: '2026-11-15', equipment_id: F.exc.equipment_id }));
   const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-11&equipment_id=${F.exc.equipment_id}`).set(ACC()));
   await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/finalize`).set(A()));
+  await ok(h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
 
   const asked = await h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/void`).set(ACC()).send({ reason: 'wrong period' });
   assert.strictEqual(asked.status, 202);

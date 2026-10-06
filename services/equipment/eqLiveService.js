@@ -39,11 +39,11 @@ async function live(opts = {}) {
       `SELECT ea.eq_attendance_id, ea.equipment_id, ea.site_id, ea.shift_type, ea.record_date, ea.day_status, ea.status, ea.check_in_time, ea.check_out_time,
               ea.working_minutes, ea.anomaly_code, ea.remarks, ea.work_description, o.full_name AS operator_name
        FROM eq_attendance ea LEFT JOIN eq_operators o ON o.operator_id = ea.operator_id
-       WHERE ea.record_date = ? OR (ea.record_date = ? AND ea.check_in_time IS NOT NULL AND (ea.check_out_time IS NULL OR ea.check_out_time > ?))`,
+       WHERE ea.status <> 'Cancelled' AND (ea.record_date = ? OR (ea.record_date = ? AND ea.check_in_time IS NOT NULL AND (ea.check_out_time IS NULL OR ea.check_out_time > ?)))`,
       [date, prev, `${date} 00:00:00`]),
     pool.query(
       `SELECT d.* FROM eq_downtime_periods d JOIN eq_attendance ea ON ea.eq_attendance_id = d.eq_attendance_id
-       WHERE ea.record_date IN (?, ?) ORDER BY d.start_time`, [date, prev]),
+       WHERE ea.record_date IN (?, ?) AND ea.status <> 'Cancelled' ORDER BY d.start_time`, [date, prev]),
     opts.withMoney ? pool.query(
       `SELECT rc.*, vc.currency FROM eq_rate_cards rc JOIN eq_vendor_contracts vc ON vc.vendor_contract_id = rc.vendor_contract_id
        WHERE ${activeOnSql('rc', 'effective_from', 'effective_to')}`, [date, date]) : Promise.resolve([[]]),

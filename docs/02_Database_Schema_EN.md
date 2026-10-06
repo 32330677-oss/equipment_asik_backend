@@ -1074,7 +1074,7 @@ SET FOREIGN_KEY_CHECKS = 1;
 |---|---|---|
 | `DB_MIGRATE_USER` | ALL on `equipment_flow.*` WITH GRANT OPTION | `npm run migrate` (it re-applies the app rights to new tables after each run) |
 | `DB_USER` (app) | SELECT, INSERT, UPDATE, DELETE on each table | the backend |
-| `DB_USER` (app) on append-only tables | **SELECT, INSERT only** | `audit_logs`, `login_history`, `eq_invoices`, `eq_invoice_cancellations`, `eq_correction_events`, `eq_file_versions` |
+| `DB_USER` (app) on append-only tables | **SELECT, INSERT only** | `audit_logs`, `login_history`, `eq_invoices`, `eq_invoice_cancellations`, `eq_correction_events`, `eq_file_versions`, `eq_payroll_items`, `eq_payroll_lines`, `eq_payroll_attendance_snapshot` |
 
 ```bash
 DB_ROOT_USER=root DB_ROOT_PASSWORD=*** DB_MIGRATE_USER=equipment_flow_migrator DB_MIGRATE_PASSWORD=*** npm run harden-db
@@ -1082,3 +1082,20 @@ DB_ROOT_USER=root DB_ROOT_PASSWORD=*** DB_MIGRATE_USER=equipment_flow_migrator D
 ```
 
 The list lives in `database/grants.js` (`APPEND_ONLY`). After hardening, `database/reset_data.sql` must be run with the migration or root account (the app user cannot empty append-only tables).
+
+
+## 5.5 Migration 012 — correction policy (6 Oct 2026)
+
+Additive only (no data deleted or rewritten; rollback script in `database/migrations/rollback/012_correction_policy.down.sql`):
+
+| Table | Change |
+|---|---|
+| `eq_attendance` | status `Cancelled`; `cancelled_by_user_id`, `cancelled_at`, `cancel_reason`; `late_entry`, `late_entry_days`, `late_entry_reason`; generated `live_slot` (NULL when Cancelled) with unique key `uq_eqa_live_slot (equipment_id, site_id, shift_type, record_date, live_slot)` replacing `uq_eqa_machine_site_shift_date` (one live row per slot, cancelled rows kept beside it) |
+| `eq_attendance_change_requests` | new: supervisor change requests (Pending / Applied / Rejected / Withdrawn) |
+| `eq_attendance_corrections` | `eq_attendance_id` nullable; `target_type`, `target_id`, `eq_item_id` (official corrections of non-attendance money) |
+| `eq_correction_events` | action `amend` |
+| `eq_payroll_batches` | `payment_reference`, `paid_marked_at` (undo window starts here), `paid_undo_count`, `accept_blockers_reason` |
+| `audit_logs` | `changed_fields` (`{field: [old, new]}`), `related_type`, `related_id`, `payroll_effect`, `source` |
+| `settings` | `eq_paid_undo_hours` = 168, `eq_late_entry_days` = 3 (`INSERT IGNORE`) |
+
+The stored generated column rebuilds `eq_attendance`: run it in a maintenance window after a backup.

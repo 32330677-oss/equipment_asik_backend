@@ -31,7 +31,7 @@ async function refreshStatus(conn, timesheetId, userId = null) {
   const [[sheet]] = await conn.execute('SELECT * FROM eq_timesheets WHERE timesheet_id = ? FOR UPDATE', [timesheetId]);
   if (!sheet || sheet.status === 'Open') return sheet;
   const [[c]] = await conn.execute(
-    "SELECT COUNT(*) AS total, SUM(paper_status = 'Matched') AS matched FROM eq_attendance WHERE timesheet_id = ?", [timesheetId]);
+    "SELECT COUNT(*) AS total, SUM(paper_status = 'Matched') AS matched FROM eq_attendance WHERE timesheet_id = ? AND status <> 'Cancelled'", [timesheetId]);
   const all = Number(c.total) > 0 && Number(c.matched) === Number(c.total);
   if (sheet.status === 'Closed' && all) {
     await conn.execute("UPDATE eq_timesheets SET status = 'Reconciled', reconciled_at = ?, reconciled_by_user_id = ? WHERE timesheet_id = ?", [businessNow(), userId, timesheetId]);

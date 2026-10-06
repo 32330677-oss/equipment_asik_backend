@@ -67,6 +67,7 @@ router.post('/rate-cards/:id/close', AC, rate.close);
 router.get('/deployments', AC, dep.list);
 router.post('/deployments', AC, dep.create);
 router.patch('/deployments/:id/end', AC, dep.end);
+router.patch('/deployments/:id/start', AC, dep.changeStart);
 router.post('/deployments/:id/transfer', AC, dep.transfer);
 router.patch('/deployments/:id', AC, dep.update);
 
@@ -74,16 +75,21 @@ router.patch('/deployments/:id', AC, dep.update);
 router.get('/my-sites', AS, att.mySites);
 router.get('/attendance/site/:siteId', AS, att.siteDay);
 router.get('/attendance/rejected', AS, att.rejected);
+router.get('/attendance/change-requests', AS, review.listChangeRequests);
+router.patch('/attendance/change-requests/:id/withdraw', AS, review.withdrawChangeRequest);
 router.post('/attendance/check-in', AS, att.checkIn);
 router.post('/attendance/day-status', AS, att.dayStatus);
 router.post('/attendance/submit', AS, att.submit);
 router.post('/attendance/:id/downtime/start', AS, att.downtimeStart);
 router.post('/attendance/:id/downtime/:downtimeId/end', AS, att.downtimeEnd);
+router.patch('/attendance/:id/downtime/:downtimeId', AS, att.downtimeUpdate);
 router.delete('/attendance/:id/downtime/:downtimeId', AS, att.downtimeDelete);
 router.post('/attendance/:id/check-out', AS, att.checkOut);
 router.post('/attendance/recall', AS, att.recallDay);
 router.patch('/attendance/:id/resubmit', AS, att.resubmit);
 router.patch('/attendance/:id/recall', AS, att.recall);
+router.patch('/attendance/:id/cancel', AS, att.cancel);
+router.post('/attendance/:id/change-requests', AS, review.createChangeRequest);
 router.patch('/attendance/:id', AS, att.edit);
 router.delete('/attendance/:id', AS, att.remove);
 
@@ -94,15 +100,21 @@ router.post('/admin/attendance/reject', A, review.reject);
 router.get('/admin/attendance/:id', AC, review.get);
 router.post('/admin/attendance/:id/ack-anomaly', A, review.ackAnomaly);
 router.patch('/admin/attendance/:id/standby-credit', AC, review.standbyCredit);
-router.patch('/admin/attendance/:id', A, review.adminEdit);
-router.post('/admin/attendance/:id/correction', A, review.correction);
+router.patch('/admin/attendance/:id/cancel', AC, review.voidRow);
+// not financially committed: the office (Admin or Accountant) corrects the row directly, with a reason once Approved
+router.patch('/admin/attendance/:id', AC, review.adminEdit);
+// financially committed: official correction, requested by an Admin or an Accountant, approved by another one
+router.post('/admin/attendance/:id/correction', AC, review.correction);
+router.get('/admin/change-requests', AC, review.listChangeRequests);
+router.patch('/admin/change-requests/:id/approve', AC, review.approveChangeRequest);
+router.patch('/admin/change-requests/:id/reject', AC, review.rejectChangeRequest);
 router.get('/admin/corrections', AC, review.listCorrections);
-router.patch('/admin/corrections/:id/resolve', AC, review.resolveCorrection);
+router.post('/admin/corrections/financial', AC, review.financialCorrection);
 router.get('/admin/corrections/:id', AC, review.getCorrection);
 router.patch('/admin/corrections/:id/review', AC, review.reviewCorrection);
-router.patch('/admin/corrections/:id/return', A, review.returnCorrection);
-router.patch('/admin/corrections/:id/approve', A, review.approveCorrection);
-router.patch('/admin/corrections/:id/cancel', A, review.cancelCorrection);
+router.patch('/admin/corrections/:id/return', AC, review.returnCorrection);
+router.patch('/admin/corrections/:id/approve', AC, review.approveCorrection);
+router.patch('/admin/corrections/:id/cancel', AC, review.cancelCorrection);
 
 // 5.7 fuel & adjustments
 router.get('/fuel-issues', AC, fuel.listFuel);
@@ -149,6 +161,9 @@ router.get('/payroll/batches/:id/export.pdf', AC, pay.exportPdf);
 router.get('/payroll/batches/:id/export.xlsx', AC, pay.exportXlsx);
 router.patch('/payroll/batches/:id/finalize', AC, pay.finalize);
 router.patch('/payroll/batches/:id/mark-paid', AC, pay.markPaid);
+router.patch('/payroll/batches/:id/undo-paid', AC, pay.undoPaid);
+router.patch('/payroll/batches/:id/payment-reference', AC, pay.setPaymentReference);
+router.get('/payroll/batches/:id/review-summary', AC, pay.reviewSummary);
 router.patch('/payroll/batches/:id/void', AC, pay.void);
 router.post('/payroll/batches/:id/supersede', AC, pay.supersede);
 router.patch('/payroll/requests/:id/approve', A, pay.approveRequest);

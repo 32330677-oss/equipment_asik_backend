@@ -88,13 +88,15 @@ exports.update = async (req, res) => {
     full_name: v.string({ max: 255 }),
     email: v.string({ max: 255, pattern: /^[^@\s]+@[^@\s]+\.[^@\s]+$/, patternMessage: 'must be a valid email' }),
     phone_number: v.string({ max: 50 }),
-    role: v.enumOf(ROLES),
+    role: v.enumOf(ROLES), reason: v.string({ max: 500 }),
   });
+  const reason = data.reason ? data.reason.trim() : ''; delete data.reason;
   const updated = await withTransaction(async (conn) => {
     const before = await loadUser(conn, id, true);
     if (data.role && data.role !== before.role) {
       await assertNotLastAdmin(conn, before);
       if (before.role === 'Supervisor') await assertNoOpenSitePeriods(conn, id);
+      if (reason.length < 5) throw AppError.validation({ reason: 'a role change gives or removes permissions: say why (at least 5 characters)' });
     }
     const sets = []; const params = [];
     for (const k of ['full_name', 'email', 'phone_number', 'role']) {
@@ -103,7 +105,8 @@ exports.update = async (req, res) => {
     if (!sets.length) return before;
     await conn.execute(`UPDATE users SET ${sets.join(', ')} WHERE user_id = ?`, [...params, id]);
     const after = await loadUser(conn, id);
-    await audit.log(conn, { table: 'users', id, action: 'update', oldValues: before, newValues: after, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'users', id, action: data.role && data.role !== before.role ? 'role_change' : 'update', oldValues: before, newValues: after,
+      reason: reason || null, ...audit.ctx(req) });
     return after;
   });
   res.json({ status: 'success', data: updated });
@@ -121,6 +124,7 @@ exports.setStatus = async (req, res) => {
     if (status === 'Inactive') {
       await assertNotLastAdmin(conn, before);
       if (before.role === 'Supervisor') await assertNoOpenSitePeriods(conn, id);
+      if (!reason || reason.trim().length < 5) throw AppError.validation({ reason: 'say why the account is deactivated (at least 5 characters)' });
     }
     await conn.execute('UPDATE users SET status = ? WHERE user_id = ?', [status, id]);
     const after = await loadUser(conn, id);

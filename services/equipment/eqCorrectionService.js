@@ -1,7 +1,8 @@
 // services/equipment/eqCorrectionService.js — official corrections of rows inside a FINALIZED payroll period.
 // The finalized batch is never touched: the difference is recalculated with the batch's own frozen prices and settings
 // and settled by an adjustment in the first open period, with an official debit / credit note number.
-// Flow: Admin requests -> Accountant reviews (may change it) -> Admin approves or returns it (as often as needed).
+// Flow (6 Oct 2026): an Admin or an Accountant requests it (several fields at once) -> ANOTHER Admin/Accountant approves it.
+// Whoever changes a request (amends it) cannot approve that version: the content is always seen by two people.
 const { pool } = require('../../config/db');
 const AppError = require('../../utils/AppError');
 const { v, validate } = require('../../utils/validate');
@@ -23,6 +24,7 @@ const CHANGE_FIELDS = {
   work_description: v.string({ max: 500 }), remarks: v.string({ max: 2000 }),
   standby_credit_hours: v.number({ min: 0, max: 24, decimals: 2 }),
   downtime: v.any(),
+  cancel_row: v.bool(), // the row should not exist (wrong machine / date / duplicate): it is cancelled, its value settled
 };
 
 /** Validates a changes object; `downtime` (when given) replaces every downtime period of the row. */
@@ -44,16 +46,21 @@ function normalizeChanges(body) {
       }
     });
   }
+  if (d.cancel_row === false) delete d.cancel_row;
+  if (d.cancel_row && Object.keys(d).length > 1) throw AppError.validation({ cancel_row: 'cancelling a row cannot be mixed with other changes' });
   if (!Object.keys(d).length) throw AppError.validation({ changes: 'nothing to change' });
   return d;
 }
 
 /**
  * Writes the changes on the live row (inside the caller's transaction) and recomputes its minutes.
- * No payroll-lock check here: only the correction flow calls it, on purpose.
+ * No payroll-lock check here: the callers (office edit before the lock, official correction after it) check it.
+ * opts.allowOpen: an office edit may fix a session still running (Working, no check-out yet).
  */
-async function applyChanges(conn, rowId, changes, userId) {
+async function applyChanges(conn, rowId, changes, userId, opts = {}) {
   let row = await S.loadRow(conn, rowId, true);
+  if (changes.cancel_row) return row; // status handled by the caller (it needs the reason)
+  const wasOpen = row.day_status === 'Working' && row.check_in_time && !row.check_out_time;
   const status = changes.day_status || row.day_status;
   if (changes.day_status && changes.day_status !== row.day_status) {
     const keepTimes = ['Standby', 'Breakdown', 'Working'].includes(status);
@@ -69,12 +76,15 @@ async function applyChanges(conn, rowId, changes, userId) {
   const next = { ...row };
   for (const k of fields) if (changes[k] !== undefined) next[k] = changes[k];
   if (next.check_in_time && datePart(next.check_in_time) !== String(row.record_date).slice(0, 10)) throw AppError.validation({ check_in_time: `must stay on ${row.record_date}` });
-  if (status === 'Working' && (!next.check_in_time || !next.check_out_time)) throw AppError.validation({ check_out_time: 'a Working day needs a check-in and a check-out' });
+  const stillOpen = opts.allowOpen && wasOpen && status === 'Working' && next.check_in_time && !next.check_out_time && changes.check_out_time === undefined;
+  if (status === 'Working' && (!next.check_in_time || (!next.check_out_time && !stillOpen))) throw AppError.validation({ check_out_time: 'a Working day needs a check-in and a check-out' });
   if (['Absent', 'Holiday'].includes(status) && (next.check_in_time || next.check_out_time)) throw AppError.validation({ check_in_time: `${status} rows have no times` });
-  if (Boolean(next.check_in_time) !== Boolean(next.check_out_time)) throw AppError.validation({ check_out_time: 'give both times or none' });
+  if (!stillOpen && Boolean(next.check_in_time) !== Boolean(next.check_out_time)) throw AppError.validation({ check_out_time: 'give both times or none' });
   if (next.check_in_time && next.check_out_time) {
     S.assertSessionLength(next.check_in_time, next.check_out_time);
     await S.assertNoTimeOverlap(conn, row.equipment_id, next.check_in_time, next.check_out_time, rowId);
+  } else if (stillOpen) {
+    await S.assertNoTimeOverlap(conn, row.equipment_id, next.check_in_time, null, rowId);
   }
   if (next.meter_start != null && next.meter_end != null && Number(next.meter_end) < Number(next.meter_start)) throw AppError.validation({ meter_end: 'must be >= meter_start' });
   const sets = fields.filter((k) => changes[k] !== undefined);
@@ -188,9 +198,10 @@ async function computeDelta(rowId, changes, userId) {
     const item = await paidItemOf(conn, rowId);
     const before = await S.loadRow(conn, rowId);
     const after = await applyChanges(conn, rowId, changes, userId);
-    const fig = (r) => ({ day_status: r.day_status, check_in_time: r.check_in_time, check_out_time: r.check_out_time, working_minutes: r.working_minutes,
-      break_minutes: r.break_minutes, breakdown_minutes: r.breakdown_minutes, standby_minutes: r.standby_minutes, standby_credit_minutes: r.standby_credit_minutes });
-    if (!item) return { auto: false, before: fig(before), after: fig(after) };
+    const fig = (r, cancelled = false) => ({ day_status: r.day_status, check_in_time: r.check_in_time, check_out_time: r.check_out_time, working_minutes: r.working_minutes,
+      break_minutes: r.break_minutes, breakdown_minutes: r.breakdown_minutes, standby_minutes: r.standby_minutes, standby_credit_minutes: r.standby_credit_minutes,
+      ...(cancelled ? { status: 'Cancelled' } : {}) });
+    if (!item) return { auto: false, before: fig(before), after: fig(after, changes.cancel_row) };
     const settings = P.parseJson(item.settings_snapshot) || {};
     const gap = Number(settings.eq_shift_continuity_minutes ?? 30);
     const allowNegative = ['true', '1'].includes(String(settings.eq_fuel_diff_allow_negative ?? 'true'));
@@ -208,8 +219,10 @@ async function computeDelta(rowId, changes, userId) {
       const m = meta.get(x.eq_item_id);
       return { itemId: x.eq_item_id, rate: m.rate, cardId: m.cardId, row: rowFromSnapshot(x, m.rate) };
     });
-    const correctedEntries = paidEntries.map((e) => (e.row.eq_attendance_id === rowId
-      ? { ...e, row: { ...P.engineRow(after), eq_attendance_id: rowId, shift_type: after.shift_type } } : e));
+    const correctedEntries = changes.cancel_row
+      ? paidEntries.filter((e) => e.row.eq_attendance_id !== rowId)
+      : paidEntries.map((e) => (e.row.eq_attendance_id === rowId
+        ? { ...e, row: { ...P.engineRow(after), eq_attendance_id: rowId, shift_type: after.shift_type } } : e));
     const billAll = (entries) => {
       let net = 0; let mainNet = 0;
       for (const [itemId, m] of meta) {
@@ -227,7 +240,7 @@ async function computeDelta(rowId, changes, userId) {
     const b = billAll(resplit(paidEntries, gap));
     const a = billAll(resplit(correctedEntries, gap));
     return { auto: true, delta_cents: a.net - b.net, currency: item.currency, eq_batch_id: item.eq_batch_id, eq_item_id: item.eq_item_id,
-      invoice_no: item.invoice_no, before: fig(before), after: fig(after), item_net_before: b.mainNet / 100, item_net_after: a.mainNet / 100 };
+      invoice_no: item.invoice_no, before: fig(before), after: fig(after, changes.cancel_row), item_net_before: b.mainNet / 100, item_net_after: a.mainNet / 100 };
   });
 }
 

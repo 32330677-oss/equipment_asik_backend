@@ -5,7 +5,7 @@ const AppError = require('../../utils/AppError');
 const { v, validate, parseId } = require('../../utils/validate');
 const { businessToday, businessNow, addDays, daysBetweenInclusive } = require('../../utils/businessDate');
 const { covers } = require('../../utils/ranges');
-const { assertCanActOnSite } = require('../../services/siteAccess');
+const { assertCanViewSite } = require('../../services/siteAccess');
 const settings = require('../../services/settings');
 const L = require('../../services/equipment/eqLiveService');
 const P = require('../../services/pdfKit');
@@ -43,7 +43,7 @@ exports.liveSite = async (req, res) => {
 // ------------------------------------------------------------------ D5 daily site report
 exports.dailyPdf = async (req, res) => {
   const q = validate(req.query, { site_id: v.id({ required: true }), date: v.date({ default: businessToday() }), shift: v.enumOf(['Day', 'Night'], { default: 'Day' }) });
-  await assertCanActOnSite(req.user.role === 'Accountant' ? { ...req.user, role: 'Admin' } : req.user, q.site_id, q.shift, q.date);
+  await assertCanViewSite(req.user, q.site_id, q.shift, q.date); // a report is a read: history stays visible
   const data = await L.live({ date: q.date, siteId: q.site_id });
   const machines = data.machines.filter((m) => m.shift_type === q.shift);
   const [[site]] = await pool.execute('SELECT * FROM sites WHERE site_id = ?', [q.site_id]);
@@ -104,7 +104,7 @@ async function utilizationData(q) {
   if (!ids.length) return [];
   const [rows] = await pool.query(
     `SELECT equipment_id, day_status, working_minutes, breakdown_minutes, standby_minutes, gross_minutes FROM eq_attendance
-     WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ?${q.site_id ? ' AND site_id = ?' : ''}`, [ids, q.from, q.to, ...(q.site_id ? [q.site_id] : [])]);
+     WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ? AND status <> 'Cancelled'${q.site_id ? ' AND site_id = ?' : ''}`, [ids, q.from, q.to, ...(q.site_id ? [q.site_id] : [])]);
   const [cards] = await pool.query('SELECT equipment_id, standard_hours_per_day FROM eq_rate_cards WHERE equipment_id IN (?) AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)', [ids, q.to, q.from]);
   const std = Object.fromEntries(cards.map((c) => [c.equipment_id, Number(c.standard_hours_per_day)]));
   const out = [];

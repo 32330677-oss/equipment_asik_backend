@@ -75,7 +75,7 @@ exports.create = async (req, res) => {
 async function assertNoRowsAfter(conn, dep, lastDay) {
   const [rows] = await conn.execute(
     `SELECT MIN(record_date) AS first_after, COUNT(*) AS n FROM eq_attendance
-     WHERE equipment_id = ? AND site_id = ? AND shift_type = ? AND record_date > ?`,
+     WHERE equipment_id = ? AND site_id = ? AND shift_type = ? AND record_date > ? AND status <> 'Cancelled'`,
     [dep.equipment_id, dep.site_id, dep.shift_type, lastDay]);
   if (Number(rows[0].n) > 0) {
     throw AppError.conflict('ATTENDANCE_AFTER_END', `There is attendance on ${rows[0].first_after}, after the new end date.`, { first_after: rows[0].first_after, rows: Number(rows[0].n) });
@@ -93,6 +93,41 @@ exports.end = async (req, res) => {
     await assertNoRowsAfter(conn, before, unassigned_date);
     await conn.execute('UPDATE eq_site_assignments SET unassigned_date = ? WHERE eq_assignment_id = ?', [unassigned_date, id]);
     await audit.log(conn, { table: 'eq_site_assignments', id, action: 'end', oldValues: { unassigned_date: before.unassigned_date }, newValues: { unassigned_date }, reason: reason || null, ...audit.ctx(req) });
+    return C.loadDeployment(conn, id);
+  });
+  res.json({ status: 'success', data: row });
+};
+
+/**
+ * Correct the FIRST day of a deployment (entered too early or too late). Refused when it would remove days that have
+ * attendance, add days that clash with another deployment, or touch a finalized period (official Correction there).
+ */
+exports.changeStart = async (req, res) => {
+  const id = parseId(req.params.id);
+  const { assigned_date: from, reason } = validate(req.body, { assigned_date: v.date({ required: true }), reason: v.string({ required: true, min: 5, max: 500 }) });
+  const row = await withTransaction(async (conn) => {
+    const before = await C.loadDeployment(conn, id, true);
+    const old = String(before.assigned_date).slice(0, 10);
+    if (from === old) throw AppError.validation({ assigned_date: 'is already the first day' });
+    if (before.unassigned_date && from > String(before.unassigned_date).slice(0, 10)) throw AppError.validation({ assigned_date: 'must be on or before the last day of the deployment' });
+    if (from > old) {
+      // days [old, from - 1] leave the deployment
+      await lock.assertRangeOpen(conn, { equipmentId: before.equipment_id, from: old, to: addDays(from, -1), what: 'Moving the first day removes days that' });
+      const [[r]] = await conn.execute(
+        `SELECT MIN(record_date) AS first_row, COUNT(*) AS n FROM eq_attendance WHERE equipment_id = ? AND site_id = ? AND shift_type = ?
+           AND record_date >= ? AND record_date < ? AND status <> 'Cancelled'`, [before.equipment_id, before.site_id, before.shift_type, old, from]);
+      if (Number(r.n)) throw AppError.conflict('ATTENDANCE_BEFORE_START', `There is attendance on ${r.first_row}, before the new first day. Cancel or move those rows first.`, { first_row: r.first_row, rows: Number(r.n) });
+    } else {
+      // days [from, old - 1] join the deployment
+      await lock.assertRangeOpen(conn, { equipmentId: before.equipment_id, from, to: addDays(old, -1), what: 'Moving the first day earlier adds days that' });
+      const [clash] = await conn.execute(
+        `SELECT a.eq_assignment_id, s.site_code FROM eq_site_assignments a JOIN sites s ON s.site_id = a.site_id
+         WHERE a.equipment_id = ? AND a.shift_type = ? AND a.eq_assignment_id <> ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)
+           AND ${overlapsSql('a', 'assigned_date', 'unassigned_date')}`, [before.equipment_id, before.shift_type, id, addDays(old, -1), from]);
+      if (clash.length) throw AppError.conflict('DEPLOYMENT_OVERLAP', `The machine is already deployed on the ${before.shift_type} shift at ${clash[0].site_code} in that period.`, { conflicts: clash });
+    }
+    await conn.execute('UPDATE eq_site_assignments SET assigned_date = ? WHERE eq_assignment_id = ?', [from, id]);
+    await audit.log(conn, { table: 'eq_site_assignments', id, action: 'change_start', oldValues: { assigned_date: old }, newValues: { assigned_date: from }, reason, ...audit.ctx(req) });
     return C.loadDeployment(conn, id);
   });
   res.json({ status: 'success', data: row });

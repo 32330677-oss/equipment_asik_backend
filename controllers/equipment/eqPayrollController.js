@@ -5,6 +5,7 @@ const { v, validate, parseId } = require('../../utils/validate');
 const audit = require('../../services/audit');
 const settings = require('../../services/settings');
 const { businessNow } = require('../../utils/businessDate');
+const { diffMinutes } = require('../../utils/dateTime');
 const { toDecimalString } = require('../../utils/money');
 const P = require('../../services/equipment/eqPayrollService');
 const statements = require('../../services/equipment/eqStatements');
@@ -12,7 +13,7 @@ const statements = require('../../services/equipment/eqStatements');
 const SCOPE = {
   start_date: v.date({ required: true }), end_date: v.date({ required: true }),
   vendor_id: v.id(), equipment_id: v.id(), site_id: v.id(), currency: v.currency(),
-  accept_blockers: v.bool({ default: false }),
+  accept_blockers: v.bool({ default: false }), accept_reason: v.string({ max: 500 }),
 };
 
 function hoursOf(min) { return (Number(min || 0) / 60).toFixed(2); }
@@ -112,6 +113,7 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
       extra.version_number || 1, extra.supersedes_batch_id || null, extra.supersede_reason || null,
       new Set(items.map((i) => i.equipment_id)).size, toDecimalString(totals.g), toDecimalString(totals.d), toDecimalString(totals.n),
       req.user.user_id, JSON.stringify(await P.billingSettings())]);
+  if (extra.accept_reason) await conn.execute('UPDATE eq_payroll_batches SET accept_blockers_reason = ? WHERE eq_batch_id = ?', [extra.accept_reason, b.insertId]);
   const batchId = b.insertId;
   const labels = await labelsFor(conn, items);
   for (const it of items) {
@@ -157,7 +159,8 @@ async function assertNoOverlappingMonthly(conn, scope, items, excludeBatchId) {
   }
 }
 
-async function generateInTx(conn, req, scope, extra = {}) {
+async function generateInTx(conn, req, scope, extraIn = {}) {
+  let extra = extraIn;
   const blockers = await P.blockers(conn, { ...scope, exclude_batch_id: extra.supersedes_batch_id });
   const blocking = blockers.filter((b) => P.BLOCKING.includes(b.code));
   const hard = blocking.find((b) => b.code === 'MONTHLY_MULTI_SITE'); // wrong hours due: never accepted
@@ -165,6 +168,11 @@ async function generateInTx(conn, req, scope, extra = {}) {
   if (blocking.length && !scope.accept_blockers) {
     throw AppError.conflict('BLOCKERS_PRESENT', 'Some rows of this scope cannot be paid yet. Fix them or confirm with accept_blockers = true.', { blockers: blocking });
   }
+  const acceptReason = (scope.accept_reason || extra.supersede_reason || '').trim();
+  if (blocking.length && acceptReason.length < 5) {
+    throw AppError.validation({ accept_reason: 'say why the batch is generated while some rows cannot be paid yet (at least 5 characters)' });
+  }
+  if (blocking.length) extra = { ...extra, accept_reason: `${blocking.map((b) => b.code).join(', ')}: ${acceptReason}`.slice(0, 500) };
   const { items: all, warnings } = await P.calculate(conn, { ...scope, lock: true, exclude_batch_id: extra.supersedes_batch_id });
   const items = pickCurrency(all, scope.currency);
   if (!items.length) throw AppError.conflict('NOTHING_TO_PAY', 'Nothing to pay in this scope and period.');
@@ -179,7 +187,8 @@ exports.generate = async (req, res) => {
   const scope = validate(req.body, SCOPE);
   const out = await withTransaction(async (conn) => {
     const r = await generateInTx(conn, req, scope);
-    await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate', newValues: { scope, accepted_blockers: r.accepted_blockers }, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate', newValues: { scope, accepted_blockers: r.accepted_blockers },
+      reason: r.accepted_blockers.length ? scope.accept_reason : null, ...audit.ctx(req) });
     return r;
   });
   res.status(201).json({ status: 'success', data: await batchDetail(pool, out.id), warnings: out.warnings });
@@ -243,8 +252,11 @@ async function batchDetail(conn, id) {
   const [requests] = await conn.execute(
     `SELECT r.*, u.full_name AS requested_by, d.full_name AS decided_by FROM eq_batch_requests r JOIN users u ON u.user_id = r.requested_by_user_id
      LEFT JOIN users d ON d.user_id = r.decided_by_user_id WHERE r.eq_batch_id = ? ORDER BY r.request_id DESC`, [id]);
+  const undoHours = await settings.getInt('eq_paid_undo_hours');
+  const undo = paidUndoState(batch, undoHours);
   return {
     ...batch, settings_snapshot: P.parseJson(batch.settings_snapshot) || null, is_finalized: Boolean(Number(batch.is_finalized)),
+    finalize_admin_only: await settings.getBool('payroll_finalize_admin_only'), paid_undo: undo,
     requests, pending_request: requests.find((r) => r.status === 'Pending') || null,
     generated_by: u ? u.full_name : null, stale, stale_reasons: reasons, invoices,
     items: items.map((i) => {
@@ -261,6 +273,18 @@ async function batchDetail(conn, id) {
   };
 }
 exports.batchDetail = batchDetail;
+
+/** Can Mark Paid still be undone? Only within eq_paid_undo_hours of marking it, and only while no payment reference exists. */
+function paidUndoState(batch, hours) {
+  if (batch.status !== 'Paid') return { possible: false, reason: 'not_paid' };
+  if (batch.payment_reference) return { possible: false, reason: 'payment_reference' };
+  if (!batch.paid_marked_at) return { possible: false, reason: 'marked_before_rule' };
+  const marked = String(batch.paid_marked_at).slice(0, 19).replace('T', ' ');
+  const minutes = diffMinutes(marked, businessNow());
+  const left = hours * 60 - minutes;
+  if (hours <= 0 || left <= 0) return { possible: false, reason: 'window_passed', window_hours: hours };
+  return { possible: true, window_hours: hours, minutes_left: left };
+}
 
 exports.list = async (req, res) => {
   const where = []; const params = [];
@@ -340,6 +364,7 @@ async function assertMayFinalize(req) {
 exports.finalize = async (req, res) => {
   const id = parseId(req.params.id);
   await assertMayFinalize(req);
+  const { acknowledge_changes: ack } = validate(req.body || {}, { acknowledge_changes: v.bool({ default: false }) });
   await withTransaction(async (conn) => {
     const b = await loadBatch(conn, id, true);
     if (b.status !== 'Generated' || Number(b.is_finalized)) throw AppError.conflict('BATCH_STATE', `Batch is ${b.status}${Number(b.is_finalized) ? ' (finalized)' : ''}.`);
@@ -354,10 +379,15 @@ exports.finalize = async (req, res) => {
           { sheets: missing });
       }
     }
+    // what people changed by hand that this batch pays: the person who finalizes sees it and confirms it (four eyes)
+    const summary = await reviewSummaryOf(conn, b);
+    if (summary.items.length && !ack) {
+      throw AppError.conflict('CHANGES_NOT_ACKNOWLEDGED', `This batch pays ${summary.items.length} manual change(s) (edits after approval, adjustments, standby hours, price changes...). Review them and confirm.`, summary);
+    }
     const now = businessNow();
     await conn.execute('UPDATE eq_payroll_batches SET is_finalized = 1, finalized_by_user_id = ?, finalized_at = ? WHERE eq_batch_id = ?', [req.user.user_id, now, id]);
     await issueInvoices(conn, id, b.currency, now);
-    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'finalize', ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'finalize', newValues: { acknowledged_changes: summary.items.length }, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: await batchDetail(pool, id) });
 };
@@ -365,14 +395,117 @@ exports.finalize = async (req, res) => {
 exports.markPaid = async (req, res) => {
   const id = parseId(req.params.id);
   await assertMayFinalize(req);
-  const { paid_at } = validate(req.body, { paid_at: v.datetime() });
+  const { paid_at, payment_reference } = validate(req.body, { paid_at: v.datetime(), payment_reference: v.string({ max: 100 }) });
   await withTransaction(async (conn) => {
     const b = await loadBatch(conn, id, true);
     if (b.status !== 'Generated' || !Number(b.is_finalized)) throw AppError.conflict('BATCH_STATE', 'Only a finalized, unpaid batch can be marked paid.');
-    await conn.execute("UPDATE eq_payroll_batches SET status = 'Paid', paid_by_user_id = ?, paid_at = ? WHERE eq_batch_id = ?", [req.user.user_id, paid_at || businessNow(), id]);
-    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'mark_paid', ...audit.ctx(req) });
+    const now = businessNow();
+    await conn.execute("UPDATE eq_payroll_batches SET status = 'Paid', paid_by_user_id = ?, paid_at = ?, paid_marked_at = ?, payment_reference = ? WHERE eq_batch_id = ?",
+      [req.user.user_id, paid_at || now, now, payment_reference || null, id]);
+    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'mark_paid', oldValues: { status: 'Generated' },
+      newValues: { status: 'Paid', paid_at: paid_at || now, payment_reference: payment_reference || null }, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: await batchDetail(pool, id) });
+};
+
+/**
+ * Undo a Mark Paid done by mistake (decision of 6 Oct 2026): Admin (or whoever may mark paid), reason required, only within
+ * eq_paid_undo_hours of marking it and only while no payment reference was recorded. Afterwards: official Correction.
+ */
+exports.undoPaid = async (req, res) => {
+  const id = parseId(req.params.id);
+  await assertMayFinalize(req);
+  const { reason } = validate(req.body, { reason: v.string({ required: true, min: 5, max: 500 }) });
+  await withTransaction(async (conn) => {
+    const b = await loadBatch(conn, id, true);
+    const state = paidUndoState(b, await settings.getInt('eq_paid_undo_hours'));
+    if (!state.possible) {
+      const why = {
+        not_paid: 'This batch is not marked paid.',
+        payment_reference: 'A payment reference is recorded: the payment really happened. Settle any difference with an official Correction.',
+        marked_before_rule: 'This batch was marked paid before undo was possible. Settle any difference with an official Correction.',
+        window_passed: `Mark Paid can only be undone within ${state.window_hours} hours. Settle any difference with an official Correction.`,
+      }[state.reason];
+      throw AppError.conflict('UNDO_PAID_NOT_ALLOWED', why, state);
+    }
+    await conn.execute(
+      "UPDATE eq_payroll_batches SET status = 'Generated', paid_by_user_id = NULL, paid_at = NULL, paid_marked_at = NULL, paid_undo_count = paid_undo_count + 1 WHERE eq_batch_id = ?",
+      [id]);
+    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'undo_paid', oldValues: { status: 'Paid', paid_at: b.paid_at, paid_by_user_id: b.paid_by_user_id, paid_marked_at: b.paid_marked_at },
+      newValues: { status: 'Generated' }, reason, ...audit.ctx(req) });
+  });
+  res.json({ status: 'success', data: await batchDetail(pool, id), message: 'Payment mark removed. The batch is finalized and waiting for payment again.' });
+};
+
+/** Record the bank / cheque reference of a paid batch. Once recorded, Mark Paid can no longer be undone. */
+exports.setPaymentReference = async (req, res) => {
+  const id = parseId(req.params.id);
+  await assertMayFinalize(req);
+  const d = validate(req.body, { payment_reference: v.string({ required: true, max: 100 }), reason: v.string({ max: 500 }) });
+  await withTransaction(async (conn) => {
+    const b = await loadBatch(conn, id, true);
+    if (b.status !== 'Paid') throw AppError.conflict('BATCH_STATE', 'Only a paid batch has a payment reference.');
+    if (b.payment_reference && b.payment_reference !== d.payment_reference && (!d.reason || d.reason.trim().length < 5)) {
+      throw AppError.validation({ reason: 'say why the payment reference changes (at least 5 characters)' });
+    }
+    await conn.execute('UPDATE eq_payroll_batches SET payment_reference = ? WHERE eq_batch_id = ?', [d.payment_reference, id]);
+    await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'payment_reference', oldValues: { payment_reference: b.payment_reference },
+      newValues: { payment_reference: d.payment_reference }, reason: d.reason || null, ...audit.ctx(req) });
+  });
+  res.json({ status: 'success', data: await batchDetail(pool, id) });
+};
+
+/**
+ * Manual changes this batch pays, for the person who finalizes it: rows edited after approval, late entries, manual
+ * adjustments and correction settlements, standby hours decided, fuel issues and rate cards changed after creation,
+ * and the blockers accepted at generation.
+ */
+async function reviewSummaryOf(conn, batch) {
+  const id = batch.eq_batch_id;
+  const items = [];
+  const [edited] = await conn.query(
+    `SELECT a.eq_attendance_id, a.record_date, a.sheet_row_no, e.equipment_code, a.admin_edit_reason, a.admin_edit_at, u.full_name AS by_name
+     FROM eq_payroll_attendance_snapshot s JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id JOIN eq_equipment e ON e.equipment_id = a.equipment_id
+     LEFT JOIN users u ON u.user_id = a.admin_edit_by_user_id WHERE s.eq_batch_id = ? AND a.edited_after_approval = 1 ORDER BY a.record_date`, [id]);
+  for (const r of edited) items.push({ kind: 'edited_after_approval', ref: `${r.equipment_code} ${String(r.record_date).slice(0, 10)} row #${r.sheet_row_no}`, by: r.by_name, at: r.admin_edit_at, reason: r.admin_edit_reason });
+  const [late] = await conn.query(
+    `SELECT a.record_date, a.sheet_row_no, a.late_entry_days, a.late_entry_reason, e.equipment_code, u.full_name AS by_name
+     FROM eq_payroll_attendance_snapshot s JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id JOIN eq_equipment e ON e.equipment_id = a.equipment_id
+     LEFT JOIN users u ON u.user_id = a.recorded_by_user_id WHERE s.eq_batch_id = ? AND a.late_entry = 1 ORDER BY a.record_date`, [id]);
+  for (const r of late) items.push({ kind: 'late_entry', ref: `${r.equipment_code} ${String(r.record_date).slice(0, 10)} row #${r.sheet_row_no} (${r.late_entry_days} days late)`, by: r.by_name, reason: r.late_entry_reason });
+  const [credits] = await conn.query(
+    `SELECT a.record_date, e.equipment_code, a.standby_credit_minutes, a.standby_credit_note, a.standby_credit_at, u.full_name AS by_name
+     FROM eq_payroll_attendance_snapshot s JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id JOIN eq_equipment e ON e.equipment_id = a.equipment_id
+     LEFT JOIN users u ON u.user_id = a.standby_credit_by_user_id WHERE s.eq_batch_id = ? AND s.standby_credit_minutes IS NOT NULL ORDER BY a.record_date`, [id]);
+  for (const r of credits) items.push({ kind: 'standby_hours', ref: `${r.equipment_code} ${String(r.record_date).slice(0, 10)}: ${(Number(r.standby_credit_minutes) / 60).toFixed(2)} h`, by: r.by_name, at: r.standby_credit_at, reason: r.standby_credit_note });
+  const [adj] = await conn.query(
+    `SELECT ad.adjustment_id, ad.adjustment_type, ad.amount, ad.currency, ad.reason, ad.correction_id, ad.created_at, e.equipment_code, u.full_name AS by_name
+     FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_adjustments ad ON ad.adjustment_id = l.source_id
+     JOIN eq_equipment e ON e.equipment_id = ad.equipment_id LEFT JOIN users u ON u.user_id = ad.created_by_user_id
+     WHERE i.eq_batch_id = ? AND l.source_table = 'eq_adjustments' ORDER BY ad.adjustment_id`, [id]);
+  for (const r of adj) {
+    items.push({ kind: r.correction_id ? 'correction_settlement' : 'adjustment', ref: `${r.equipment_code} ${r.adjustment_type} ${Number(r.amount).toFixed(2)} ${r.currency}`,
+      by: r.by_name, at: r.created_at, reason: r.reason });
+  }
+  const [fuel] = await conn.query(
+    `SELECT DISTINCT f.fuel_issue_id, f.issue_date, e.equipment_code FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id
+     JOIN eq_fuel_issues f ON f.fuel_issue_id = l.source_id JOIN eq_equipment e ON e.equipment_id = f.equipment_id
+     WHERE i.eq_batch_id = ? AND l.source_table = 'eq_fuel_issues'
+       AND EXISTS (SELECT 1 FROM audit_logs x WHERE x.table_name = 'eq_fuel_issues' AND x.record_id = f.fuel_issue_id AND x.action_type = 'update')`, [id]);
+  for (const r of fuel) items.push({ kind: 'fuel_changed', ref: `${r.equipment_code} fuel issue #${r.fuel_issue_id} (${String(r.issue_date).slice(0, 10)}) changed after it was recorded` });
+  const [cards] = await conn.query(
+    `SELECT DISTINCT i.rate_card_id, e.equipment_code FROM eq_payroll_items i JOIN eq_equipment e ON e.equipment_id = i.equipment_id
+     WHERE i.eq_batch_id = ? AND i.rate_card_id IS NOT NULL
+       AND EXISTS (SELECT 1 FROM audit_logs x WHERE x.table_name = 'eq_rate_cards' AND x.record_id = i.rate_card_id AND x.action_type = 'update')`, [id]);
+  for (const r of cards) items.push({ kind: 'rate_card_changed', ref: `${r.equipment_code} rate card #${r.rate_card_id} was edited after creation (see its history)` });
+  if (batch.accept_blockers_reason) items.push({ kind: 'accepted_blockers', ref: batch.accept_blockers_reason });
+  return { eq_batch_id: id, items };
+}
+
+exports.reviewSummary = async (req, res) => {
+  const id = parseId(req.params.id);
+  const b = await loadBatch(pool, id);
+  res.json({ status: 'success', data: await reviewSummaryOf(pool, b) });
 };
 
 /** Voids a Generated batch (inside the caller's transaction). */

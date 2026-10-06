@@ -1,7 +1,9 @@
 // database/grants.js — table rights of the application's MySQL user.
 // The app user may read and write ordinary tables, but the audit trail and the official numbers are
 // APPEND-ONLY for it: SELECT + INSERT, never UPDATE / DELETE (an edit there needs the migration / admin user).
-const APPEND_ONLY = ['audit_logs', 'eq_invoices', 'eq_invoice_cancellations', 'eq_correction_events', 'eq_file_versions', 'login_history'];
+// The figures a batch was generated with are append-only too: a batch is voided or replaced, never rewritten (C12).
+const APPEND_ONLY = ['audit_logs', 'eq_invoices', 'eq_invoice_cancellations', 'eq_correction_events', 'eq_file_versions', 'login_history',
+  'eq_payroll_items', 'eq_payroll_lines', 'eq_payroll_attendance_snapshot'];
 
 function ident(name) {
   if (!/^[A-Za-z0-9_]+$/.test(name)) throw new Error(`Unsafe identifier: ${name}`);

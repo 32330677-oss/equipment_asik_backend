@@ -29,11 +29,11 @@ async function assertSheetAccess(user, sheet, conn = pool) {
 
 const SHEET_LIST_SQL = `
   SELECT ts.*, e.equipment_code, t.type_name, vd.vendor_name, s.site_code, s.site_name,
-    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id) AS rows_count,
-    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.paper_status = 'Matched') AS matched,
-    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.paper_status = 'Mismatch') AS mismatch,
-    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.paper_status = 'Pending') AS pending,
-    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.paper_status = 'Missing') AS missing,
+    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled') AS rows_count,
+    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled' AND a.paper_status = 'Matched') AS matched,
+    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled' AND a.paper_status = 'Mismatch') AS mismatch,
+    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled' AND a.paper_status = 'Pending') AS pending,
+    (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled' AND a.paper_status = 'Missing') AS missing,
     (SELECT MAX(version_no) FROM eq_timesheet_scans sc WHERE sc.timesheet_id = ts.timesheet_id) AS last_scan_version,
     (SELECT MAX(uploaded_at) FROM eq_timesheet_scans sc WHERE sc.timesheet_id = ts.timesheet_id) AS last_scan_at,
     (SELECT MAX(through_row_no) FROM eq_timesheet_scans sc WHERE sc.timesheet_id = ts.timesheet_id) AS scanned_through_row
@@ -77,7 +77,7 @@ async function sheetRows(conn, sheetId) {
   const [rows] = await conn.execute(
     `SELECT a.eq_attendance_id, a.sheet_row_no, a.record_date, a.shift_type, a.day_status, a.status, a.check_in_time, a.check_out_time,
        a.gross_minutes, a.break_minutes, a.breakdown_minutes, a.standby_minutes, a.working_minutes, a.meter_start, a.meter_end,
-       a.work_description, a.remarks, a.paper_status, a.operator_id, o.full_name AS operator_name,
+       a.work_description, a.remarks, a.paper_status, a.cancel_reason, a.operator_id, o.full_name AS operator_name,
        (SELECT SUM(f.liters) FROM eq_fuel_issues f WHERE f.equipment_id = a.equipment_id AND f.site_id = a.site_id AND f.issue_date = a.record_date AND f.is_cancelled = 0) AS fuel_liters
      FROM eq_attendance a LEFT JOIN eq_operators o ON o.operator_id = a.operator_id
      WHERE a.timesheet_id = ? ORDER BY a.sheet_row_no`, [sheetId]);
@@ -98,11 +98,13 @@ exports.get = async (req, res) => {
     `SELECT pc.* FROM eq_paper_checks pc JOIN eq_attendance a ON a.eq_attendance_id = pc.eq_attendance_id
      WHERE a.timesheet_id = ? AND pc.is_current = 1`, [id]);
   const byRow = Object.fromEntries(checks.map((c) => [c.eq_attendance_id, c]));
-  const present = new Set(rows.map((r) => r.sheet_row_no));
+  // a row deleted while Draft leaves a gap; a row CANCELLED later stays with its reason: both are cancelled on paper
+  const live = rows.filter((r) => r.status !== 'Cancelled');
+  const present = new Set(live.map((r) => r.sheet_row_no));
   const cancelled = [];
   for (let n = 1; n <= sheet.last_row_no; n += 1) if (!present.has(n)) cancelled.push(n);
   const { verify_token, ...out } = info;
-  res.json({ status: 'success', data: { ...out, rows: rows.map((r) => ({ ...r, current_check: byRow[r.eq_attendance_id] || null })), cancelled_rows: cancelled, scans } });
+  res.json({ status: 'success', data: { ...out, rows: rows.map((r) => ({ ...r, cancelled: r.status === 'Cancelled', current_check: byRow[r.eq_attendance_id] || null })), cancelled_rows: cancelled, scans } });
 };
 
 exports.print = async (req, res) => {
@@ -120,7 +122,7 @@ exports.print = async (req, res) => {
       `SELECT DISTINCT vc.contract_number FROM eq_rate_cards rc JOIN eq_vendor_contracts vc ON vc.vendor_contract_id = rc.vendor_contract_id
        WHERE rc.equipment_id = ? AND rc.effective_from <= ? AND (rc.effective_to IS NULL OR rc.effective_to >= ?)`,
       [sheet.equipment_id, `${sheet.period_month}-31`, `${sheet.period_month}-01`]);
-    const rows = await sheetRows(conn, id);
+    const rows = (await sheetRows(conn, id)).filter((r) => r.status !== 'Cancelled');
     const present = new Set(rows.map((r) => r.sheet_row_no));
     const all = [...rows];
     for (let n = 1; n <= sheet.last_row_no; n += 1) if (!present.has(n)) all.push({ sheet_row_no: n, cancelled: true });

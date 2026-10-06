@@ -64,21 +64,34 @@ async function loadFuel(conn, id) {
   return f;
 }
 
+/**
+ * Price, litres or receipt number of a fuel issue in an OPEN period. The first price needs no reason; changing the litres
+ * or a price already set does. A fuel issue of a closed (finalized) period is corrected through an official Correction.
+ */
 exports.updateFuel = async (req, res) => {
   const id = parseId(req.params.id);
   const d = validate(req.body, {
     price_per_liter: v.number({ min: 0, max: 100000, decimals: 3 }), liters: v.number({ min: 0.01, max: 100000, decimals: 2 }),
-    receipt_number: v.string({ max: 100 }),
+    receipt_number: v.string({ max: 100 }), reason: v.string({ max: 500 }),
   });
+  const reason = d.reason ? d.reason.trim() : ''; delete d.reason;
   const row = await withTransaction(async (conn) => {
     const before = await loadFuel(conn, id);
     if (before.is_cancelled) throw AppError.conflict('INVALID_STATE', 'This fuel issue is cancelled.');
     const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized payroll batch #${used.eq_batch_id}.`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized payroll batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
+    const machine = await C.loadMachine(conn, before.equipment_id);
+    // never billed but dated in a closed month: pricing it now must not reopen that month
+    await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: before.equipment_id, siteId: before.site_id, from: String(before.issue_date).slice(0, 10), what: 'This fuel issue date' });
+    const changesMoney = (d.liters !== undefined && Number(d.liters) !== Number(before.liters))
+      || (d.price_per_liter !== undefined && before.price_per_liter !== null && Number(d.price_per_liter) !== Number(before.price_per_liter));
+    if (changesMoney && reason.length < 5) throw AppError.validation({ reason: 'say why the litres or the price already set change (at least 5 characters)' });
     const keys = Object.keys(d);
     if (keys.length) await conn.execute(`UPDATE eq_fuel_issues SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE fuel_issue_id = ?`, [...keys.map((k) => d[k]), id]);
     const after = await loadFuel(conn, id);
-    await audit.log(conn, { table: 'eq_fuel_issues', id, action: 'update', oldValues: before, newValues: after, ...audit.ctx(req) });
+    const inBatch = await lock.sourceConsumed(conn, 'eq_fuel_issues', id);
+    await audit.log(conn, { table: 'eq_fuel_issues', id, action: before.price_per_liter === null && d.price_per_liter !== undefined && !changesMoney ? 'price' : 'update',
+      oldValues: before, newValues: after, reason: reason || null, payrollEffect: inBatch ? `stale:${inBatch.eq_batch_id}` : 'none', ...audit.ctx(req) });
     return after;
   });
   res.json({ status: 'success', data: row });
@@ -90,10 +103,13 @@ exports.cancelFuel = async (req, res) => {
   await withTransaction(async (conn) => {
     const before = await loadFuel(conn, id);
     if (before.is_cancelled) return;
-    const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id);
-    if (used) throw AppError.conflict('FUEL_IN_BATCH', `This fuel issue is used by payroll batch #${used.eq_batch_id}. Void that batch first.`);
+    // in a FINALIZED batch: official Correction. In a Generated batch: allowed, that batch turns stale (void and regenerate).
+    const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized payroll batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
+    const inBatch = await lock.sourceConsumed(conn, 'eq_fuel_issues', id);
     await conn.execute('UPDATE eq_fuel_issues SET is_cancelled = 1, cancel_reason = ? WHERE fuel_issue_id = ?', [reason, id]);
-    await audit.log(conn, { table: 'eq_fuel_issues', id, action: 'cancel', reason, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_fuel_issues', id, action: 'cancel', oldValues: { is_cancelled: 0 }, newValues: { is_cancelled: 1 }, reason,
+      payrollEffect: inBatch ? `stale:${inBatch.eq_batch_id}` : 'none', ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: { fuel_issue_id: id, is_cancelled: true } });
 };
@@ -149,9 +165,12 @@ exports.listAdjustments = async (req, res) => {
   if (req.query.vendor_id) f('e.vendor_id = ?', Number(req.query.vendor_id));
   if (req.query.status) f('a.status = ?', String(req.query.status));
   const [rows] = await pool.query(
-    `SELECT a.*, e.equipment_code, vd.vendor_name, s.site_code, u.full_name AS created_by
+    `SELECT a.*, e.equipment_code, vd.vendor_name, s.site_code, u.full_name AS created_by, ni.invoice_no AS correction_note_no,
+       (SELECT b.eq_batch_id FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
+         WHERE l.source_table = 'eq_adjustments' AND l.source_id = a.adjustment_id AND b.status IN ('Generated','Paid') ORDER BY b.eq_batch_id DESC LIMIT 1) AS in_batch_id
      FROM eq_adjustments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id
      LEFT JOIN sites s ON s.site_id = a.site_id JOIN users u ON u.user_id = a.created_by_user_id
+     LEFT JOIN eq_attendance_corrections cc ON cc.correction_id = a.correction_id LEFT JOIN eq_invoices ni ON ni.invoice_id = cc.note_invoice_id
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY a.adjustment_date DESC, a.adjustment_id DESC LIMIT 1000`, params);
   res.json({ status: 'success', data: rows });
 };
@@ -187,10 +206,18 @@ exports.cancelAdjustment = async (req, res) => {
     const [[a]] = await conn.execute('SELECT * FROM eq_adjustments WHERE adjustment_id = ? FOR UPDATE', [id]);
     if (!a) throw AppError.notFound('Adjustment');
     if (a.status === 'Cancelled') return;
-    const used = await lock.sourceConsumed(conn, 'eq_adjustments', id);
-    if (used) throw AppError.conflict('ADJUSTMENT_IN_BATCH', `This adjustment is used by payroll batch #${used.eq_batch_id}. Void that batch first.`);
+    // the settlement of an official correction is part of that correction (its debit / credit note is issued): never cancelled by hand
+    if (a.correction_id) {
+      throw AppError.conflict('CORRECTION_ADJUSTMENT_LOCKED',
+        `This adjustment settles correction #${a.correction_id} (official note issued). It cannot be cancelled; a new correction reverses it if needed.`,
+        { correction_id: a.correction_id });
+    }
+    const used = await lock.sourceConsumed(conn, 'eq_adjustments', id, true);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This adjustment is in finalized payroll batch #${used.eq_batch_id}. Reverse it with an official Correction.`);
+    const inBatch = await lock.sourceConsumed(conn, 'eq_adjustments', id);
     await conn.execute("UPDATE eq_adjustments SET status = 'Cancelled', cancelled_by_user_id = ?, cancelled_at = ? WHERE adjustment_id = ?", [req.user.user_id, businessNow(), id]);
-    await audit.log(conn, { table: 'eq_adjustments', id, action: 'cancel', reason, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_adjustments', id, action: 'cancel', oldValues: { status: 'Active' }, newValues: { status: 'Cancelled' }, reason,
+      payrollEffect: inBatch ? `stale:${inBatch.eq_batch_id}` : 'none', ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: { adjustment_id: id, status: 'Cancelled' } });
 };

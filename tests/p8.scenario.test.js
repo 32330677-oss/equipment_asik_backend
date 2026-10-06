@@ -14,7 +14,9 @@ async function work(key, m, date, inT, outT, { brk, down, meter, fuel } = {}) {
   const r = await ok(h.api().post('/api/equipment/attendance/check-in').set(S8()).send({ equipment_id: m.equipment_id, site_id: 8, check_in_time: `${date} ${inT}`, meter_start: meter && meter[0] }));
   if (brk) await ok(h.api().post(`/api/equipment/attendance/${r.eq_attendance_id}/downtime/start`).set(S8()).send({ downtime_type: 'Break', start_time: `${date} ${brk[0]}`, end_time: `${date} ${brk[1]}` }));
   if (down) await ok(h.api().post(`/api/equipment/attendance/${r.eq_attendance_id}/downtime/start`).set(S8()).send({ downtime_type: 'Breakdown', start_time: `${date} ${down[0]}`, end_time: `${date} ${down[1]}`, reason: 'Hydraulic leak' }));
-  await ok(h.api().post(`/api/equipment/attendance/${r.eq_attendance_id}/check-out`).set(S8()).send({ check_out_time: `${date} ${outT}`, meter_end: meter && meter[1], fuel_liters: fuel }));
+  await ok(h.api().post(`/api/equipment/attendance/${r.eq_attendance_id}/check-out`).set(S8()).send({ check_out_time: `${date} ${outT}`, meter_end: meter && meter[1] }));
+  // fuel issued to the machine is recorded as a fuel issue (no longer at check-out, decision of 6 Oct 2026)
+  if (fuel) await ok(h.api().post('/api/equipment/fuel-issues').set(S8()).send({ equipment_id: m.equipment_id, site_id: 8, issue_date: date, liters: fuel }));
   ids[key] = r.eq_attendance_id;
 }
 const day = async (key, m, date, status) => {
@@ -88,6 +90,6 @@ test('scenario: review, fuel, adjustments, preview numbers, finalize, invoices',
   assert.strictEqual(no.body.code, 'SCAN_MISSING');
   const sheets = await ok(h.api().get('/api/equipment/timesheets?month=2026-09').set(ACC()));
   for (const s of sheets) await ok(h.api().post(`/api/equipment/timesheets/${s.timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer(`signed ${s.sheet_code}`), 'scan.png'));
-  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()));
+  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
   assert.strictEqual(fin.invoices.filter((i) => i.kind === 'Machine').length, 3);
 });

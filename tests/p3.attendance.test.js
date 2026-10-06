@@ -50,9 +50,9 @@ test('full day: check-in, break, breakdown auto-closed at check-out, minutes', a
   assert.strictEqual(out.working_minutes, 360);
   assert.strictEqual(out.live_state, 'Finished');
   assert.ok(out.downtime.every((p) => p.end_time));
-  const fuel = await h.query('SELECT liters, price_per_liter FROM eq_fuel_issues WHERE equipment_id = ?', [F.exc.equipment_id]);
-  assert.strictEqual(Number(fuel[0].liters), 80);
-  assert.strictEqual(fuel[0].price_per_liter, null);
+  // decision of 6 Oct 2026: daily fuel is not recorded at check-out (approximate-fuel policy); litres sent are ignored, with a warning
+  const fuel = await h.query('SELECT liters FROM eq_fuel_issues WHERE equipment_id = ?', [F.exc.equipment_id]);
+  assert.strictEqual(fuel.length, 0);
 });
 
 test('BR-12/13: open session across dates/sites and overlap', async () => {
@@ -176,8 +176,9 @@ test('payroll lock blocks edits; correction is logged and payroll untouched', as
   assert.strictEqual(corr.request_status, 'Requested');
   const [still] = await h.query('SELECT check_out_time FROM eq_attendance WHERE eq_attendance_id = ?', [r.eq_attendance_id]);
   assert.notStrictEqual(still.check_out_time, '2026-10-05 17:45:00', 'nothing changes before approval');
+  // the person who asked for the correction never approves it (decision of 6 Oct 2026: another Admin or Accountant does)
   const early = await h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/approve`).set(A()).send({});
-  assert.strictEqual(early.body.code, 'INVALID_STATE');
+  assert.strictEqual(early.body.code, 'SAME_PERSON');
   // this row was never paid by a real batch: the accountant must give the amount
   const noAmount = await h.api().patch(`/api/equipment/admin/corrections/${corr.correction_id}/review`).set(ACCT()).send({ note: 'checked' });
   assert.strictEqual(noAmount.body.code, 'VALIDATION_ERROR');
@@ -203,7 +204,7 @@ test('fuel: supervisor records litres without price; accountant prices; adjustme
   const f = await ok(h.api().post('/api/equipment/fuel-issues').set(S8()).send({ equipment_id: F.exc.equipment_id, site_id: 8, issue_date: '2026-10-13', liters: 100, price_per_liter: 9 }));
   assert.strictEqual(f.price_per_liter, undefined);
   const list = await ok(h.api().get('/api/equipment/fuel-issues?unpriced=true').set(h.auth(h.T.accountant())));
-  assert.strictEqual(list.length, 2);
+  assert.strictEqual(list.length, 1); // no fuel issue is created at check-out any more
   const priced = await ok(h.api().patch(`/api/equipment/fuel-issues/${f.fuel_issue_id}`).set(h.auth(h.T.accountant())).send({ price_per_liter: 1.1 }));
   assert.strictEqual(Number(priced.price_per_liter), 1.1);
   const noCard = await h.api().post('/api/equipment/adjustments').set(A()).send({ equipment_id: F.exc.equipment_id, adjustment_date: '2026-01-01', adjustment_type: 'Bonus', amount: 10, reason: 'x' });

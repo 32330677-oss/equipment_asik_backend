@@ -384,10 +384,10 @@ Errors: `SITE_FORBIDDEN` 403, `MACHINE_NOT_ASSIGNED` 400, `FUTURE_DATE` 400, `PA
 
 ```json
 { "check_out_time": "2026-10-03 17:31", "meter_end": 5130.0,
-  "fuel_liters": 80, "work_description": "Excavation axis C3-C7" }
+  "work_description": "Excavation axis C3-C7" }
 ```
 
-Rules: row Draft/Rejected and open; `check_out_time > check_in_time`; max 24 h (else 400 `SESSION_TOO_LONG` — use correction for real multi-day cases); open downtime auto-closed at check-out (note "auto-closed at check-out"); `fuel_liters` > 0 creates an `eq_fuel_issues` row (price null until the Admin prices it — see 4.7); `recompute`; operator required (400 `OPERATOR_REQUIRED`).
+Rules: row Draft/Rejected and open; `check_out_time > check_in_time`; max 24 h (else 400 `SESSION_TOO_LONG` — use correction for real multi-day cases); open downtime auto-closed at check-out (note "auto-closed at check-out"); daily fuel is **not** recorded at check-out any more (policy 6 Oct 2026: fuel follows the approximate-fuel policy and the office's fuel issues). A `fuel_liters` sent by an old app is ignored and the response carries `warnings: ["FUEL_AT_CHECKOUT_NOT_RECORDED"]`; `recompute`; operator required (400 `OPERATOR_REQUIRED`).
 
 ### POST `/attendance/day-status`
 
@@ -413,7 +413,7 @@ Body `{site_id, shift_type, record_date}`. Blocks with 409 and a list when: open
 | POST | `/admin/attendance/:id/ack-anomaly` | A | `{note}` |
 | PATCH | `/admin/attendance/:id` | A | Edit any non-locked row (Submitted/Approved too); Approved → paper back to Pending (BR-28) |
 | POST | `/admin/attendance/:id/correction` | A | Finalized period: `{reason, changes:{...}}` → writes `eq_attendance_corrections` (`locked_batch_id`, `payroll_effect='AdjustmentRequired'`, `adjustment_status='Open'`) and applies the change; payroll untouched |
-| GET | `/admin/corrections?status=Open` | A, C | Open correction adjustments to settle (by creating an `eq_adjustments` row in the next period and resolving) |
+| GET | `/admin/corrections?request_status=Requested,Reviewed` | A, C | Official corrections (see 5.9b): each approved one is settled automatically by a DN/CN and a Correction adjustment |
 
 ## 5.7 Fuel and adjustments
 
@@ -480,6 +480,53 @@ Generate algorithm (transaction):
 7. Response: batch summary + warnings.
 
 `stale = true` on a non-finalized batch when any snapshot row was edited after `generated_at` (compare `eq_attendance.updated_at`) — UI shows "Recalculate" (void + generate).
+
+## 5.9b Correction policy (decisions of 6 Oct 2026)
+
+Principle: **not financially committed → normal correction path; finalized or paid → official Correction path.** A finalized
+period is never reopened and never paid by a new batch (no "recovery batch").
+
+| Method | Path | Roles | Purpose |
+|---|---|---|---|
+| POST | `/attendance/check-in` | A, S | adds `late_reason`, and `check_out_time` + `meter_end` to record a whole past session in one call. A row older than `eq_late_entry_days` (default 3) is saved and flagged `late_entry` (warning `LATE_ENTRY` in `warnings`, never a block) |
+| POST | `/attendance/day-status` | A, S | adds `late_reason` (same late-entry warning). Overwriting a session keeps the old values in the audit log |
+| PATCH | `/attendance/:id/downtime/:downtimeId` | A, S | correct a pause in place `{downtime_type?, start_time?, end_time?, reason?}` (Draft/Rejected rows) |
+| PATCH | `/attendance/:id/cancel` | A, S | supervisor cancels a Rejected row that was **never approved** `{reason ≥5}`; the row stays as `Cancelled` and frees its slot. A row approved once (`approved_by_user_id` or an `approve` audit entry) → 409 `APPROVED_BEFORE`: only the office voids it or corrects it. The row view carries `was_approved` |
+| POST | `/attendance/:id/change-requests` | A, S | the **current** supervisor asks the office for a change `{reason ≥5, changes:{...}}` (Approved rows, or days before their assignment) |
+| GET | `/attendance/change-requests` | A, S | own requests |
+| PATCH | `/attendance/change-requests/:id/withdraw` | A, S | requester only |
+| GET | `/attendance/site/:siteId` | A, C, S | adds `access: {can_edit, reason: moved_away / before_assignment / ..., late_after_days, days_old}`. Historical visibility is not editing permission |
+| GET | `/admin/attendance` | A, C | adds `late=only`; `Cancelled` hidden unless `status=Cancelled`; `pending_change_requests` per row; `meta.counts.late_entries` |
+| GET | `/admin/attendance/:id` | A, C | adds `change_requests`, `locked_by_status` (Finalized / Paid), `generated_batch_id`, history with `changed_fields` and `payroll_effect` |
+| PATCH | `/admin/attendance/:id` | A, C | office edit before the lock, several fields at once; reason ≥5 on an Approved row; paper status resets only when a paper field changes |
+| PATCH | `/admin/attendance/:id/cancel` | A, C | void a row before the lock `{reason ≥5}` (kept as Cancelled) |
+| GET | `/admin/change-requests?status=` | A, C | list |
+| PATCH | `/admin/change-requests/:id/approve` | A, C | applies the change (another person than the requester). Locked row → 409 `ROW_LOCKED_USE_CORRECTION` unless `convert_to_correction: true` |
+| PATCH | `/admin/change-requests/:id/reject` | A, C | `{note ≥3}` |
+| POST | `/admin/attendance/:id/correction` | A, C | official Correction, several fields (or `cancel_row: true` alone) `{reason ≥5, changes, amount_override?, override_reason?}` |
+| POST | `/admin/corrections/financial` | A, C | official Correction of money that is not attendance: `target_type` fuel_issue (with `fuel_changes`, amount computed) / rate_card / fuel_price / fuel_terms / adjustment / deployment / other (`amount`), `eq_item_id` of the finalized item |
+| PATCH | `/admin/corrections/:id/review` | A, C | the requester amends (stays Requested) or another person reviews (Reviewed) |
+| PATCH | `/admin/corrections/:id/approve` | A, C | by a person other than the author of the last version → applies the change, issues the debit / credit note and a Correction adjustment in the first open period |
+| PATCH | `/admin/corrections/:id/return`, `/cancel` | A, C | return (not the last author); cancel (requester, reviewer or Admin). `resolve` was removed |
+| PATCH | `/deployments/:id/start` | A, C | correct the first day `{assigned_date, reason ≥5}`; refused inside a closed period |
+| PATCH | `/payroll/batches/:id/finalize` | A, C† | `{acknowledge_changes: true}` required when the batch pays manual changes (409 `CHANGES_NOT_ACKNOWLEDGED` with the list) |
+| GET | `/payroll/batches/:id/review-summary` | A, C | manual changes the batch pays (edits after approval, late entries, standby hours, adjustments, correction settlements, fuel / rate card changes, accepted blockers) |
+| PATCH | `/payroll/batches/:id/mark-paid` | A, C† | adds `payment_reference?` |
+| PATCH | `/payroll/batches/:id/undo-paid` | A, C† | `{reason ≥5}`; only within `eq_paid_undo_hours` (default 168) and without payment reference (409 `UNDO_PAID_NOT_ALLOWED`) |
+| PATCH | `/payroll/batches/:id/payment-reference` | A, C† | record / change (reason when changing) |
+| POST | `/payroll/generate` | A, C | accepting blockers needs `accept_reason ≥5` (kept on the batch) |
+
+Final business decisions (6 Oct 2026, confirmed):
+- **Undo Mark Paid:** default window 168 h (`eq_paid_undo_hours`, control setting: a reason to change it), counted from `paid_marked_at`; only without payment reference, with a reason, for the users allowed by `payroll_finalize_admin_only`.
+- **No monetary threshold** on manual adjustments; no extra approval because of an amount.
+- **No extra separation of duties** in Generate / Finalize / Mark Paid (the same allowed person may do all three). The four-eyes rule applies only to official Corrections (the author of the latest version never approves it) and to supervisor change requests (the requester never applies their own request).
+- **Late entries:** `eq_late_entry_days` = 3, warning and flag only, never a block and never a payroll lock; the reason is always optional; no second threshold.
+- **Supervisor cancel:** only Rejected, never-approved rows.
+- **No legacy clean-up:** the database is empty; no script or migration rewrites old check-out fuel rows or old Open corrections.
+
+Other rules: blockers add `IN_CLOSED_PERIOD` (information only) and items of a closed period never block a new batch; fuel
+litres / a set price change need a reason; a correction settlement adjustment cannot be cancelled
+(`CORRECTION_ADJUSTMENT_LOCKED`); control settings, role changes and deactivations need a reason ≥5.
 
 ## 5.10 Live board and reports
 

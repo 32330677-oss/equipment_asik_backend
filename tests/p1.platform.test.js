@@ -80,7 +80,9 @@ test('LAST_ADMIN protection', async () => {
 
 test('deactivated user is refused immediately', async () => {
   const tk = h.T.accountant();
-  await h.api().patch('/api/users/2/status').set(A()).send({ status: 'Inactive' });
+  // deactivating an account needs a reason (it removes access)
+  assert.strictEqual((await h.api().patch('/api/users/2/status').set(A()).send({ status: 'Inactive' })).body.code, 'VALIDATION_ERROR');
+  await h.api().patch('/api/users/2/status').set(A()).send({ status: 'Inactive', reason: 'left the company' });
   assert.strictEqual((await h.api().get('/api/auth/me').set(h.auth(tk))).body.code, 'ACCOUNT_INACTIVE');
   await h.api().patch('/api/users/2/status').set(A()).send({ status: 'Active' });
 });

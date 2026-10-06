@@ -130,10 +130,10 @@ test('generate, rows never paid twice, export PDFs and Excel', async () => {
 });
 
 test('finalize locks; supersede creates v2; void rules; accountant finalize setting', async () => {
-  await ok(h.api().put('/api/settings/payroll_finalize_admin_only').set(A()).send({ value: 'true' }));
+  await ok(h.api().put('/api/settings/payroll_finalize_admin_only').set(A()).send({ value: 'true', reason: 'only the Admin closes payroll' }));
   const accFin = await h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(ACC());
   assert.strictEqual(accFin.body.code, 'FORBIDDEN_ROLE');
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()));
+  await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
   const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-03'", [F.exc.equipment_id]);
   const edit = await h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'x' });
   assert.strictEqual(edit.body.code, 'PAYROLL_PERIOD_FINALIZED');

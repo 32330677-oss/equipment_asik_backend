@@ -72,7 +72,7 @@ test('finalize needs the signed sheet uploaded by the accountant; then invoice n
   assert.strictEqual(accFin.status, 403); // Admin finalizes
   const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-10&equipment_id=${F.exc.equipment_id}`).set(ACC()));
   await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
-  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()));
+  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
   const nos = fin.invoices.map((i) => i.invoice_no).sort();
   assert.deepStrictEqual(nos, ['FD-2026-00001', 'MI-2026-00001', 'VI-2026-00001']);
   assert.strictEqual(fin.items[0].fuel_invoice_no, 'FD-2026-00001');

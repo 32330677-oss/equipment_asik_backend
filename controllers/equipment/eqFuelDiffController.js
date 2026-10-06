@@ -47,15 +47,29 @@ exports.createPrice = async (req, res) => {
   res.status(201).json({ status: 'success', data: row });
 };
 
+/** A draft (Generated, not finalized) batch of that currency with fuel-difference lines on or after this price. */
+async function priceInDraftBatch(conn, p) {
+  const [[r]] = await conn.execute(
+    `SELECT b.eq_batch_id FROM eq_payroll_batches b JOIN eq_payroll_items i ON i.eq_batch_id = b.eq_batch_id
+     JOIN eq_payroll_lines l ON l.eq_item_id = i.eq_item_id AND l.line_type = 'FuelPriceDifference'
+     WHERE b.currency = ? AND b.is_finalized = 0 AND b.status = 'Generated' AND b.end_date >= ? LIMIT 1`, [p.currency, p.effective_from]);
+  return r ? r.eq_batch_id : null;
+}
+
 exports.deletePrice = async (req, res) => {
   const id = parseId(req.params.id);
+  const { reason } = validate(req.body || {}, { reason: v.string({ max: 500 }) });
   await withTransaction(async (conn) => {
     const [[p]] = await conn.execute('SELECT * FROM eq_fuel_prices WHERE fuel_price_id = ? FOR UPDATE', [id]);
     if (!p) throw AppError.notFound('Fuel price');
     const used = await priceUsedBy(conn, p);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This price is used by finalized payroll batch #${used}; it cannot be deleted.`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This price is used by finalized payroll batch #${used}; it cannot be deleted. A wrong price already paid is fixed by an official Correction.`);
+    const draft = await priceInDraftBatch(conn, p);
+    if (draft && (!reason || reason.trim().length < 5)) {
+      throw AppError.validation({ reason: `draft payroll batch #${draft} uses fuel prices from this date: say why this price is deleted (at least 5 characters)` });
+    }
     await conn.execute('DELETE FROM eq_fuel_prices WHERE fuel_price_id = ?', [id]);
-    await audit.log(conn, { table: 'eq_fuel_prices', id, action: 'delete', oldValues: p, ...audit.ctx(req) });
+    await audit.log(conn, { table: 'eq_fuel_prices', id, action: 'delete', oldValues: p, reason: reason || null, payrollEffect: draft ? `stale:${draft}` : 'none', ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: { deleted: id } });
 };

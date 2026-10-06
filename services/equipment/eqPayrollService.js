@@ -5,6 +5,7 @@ const engine = require('./equipmentBillingEngine');
 const { addDays, daysInMonth, monthOf } = require('../../utils/businessDate');
 const { covers } = require('../../utils/ranges');
 const { parseJson } = require('./eqCommon');
+const lock = require('./eqLock');
 
 const toNum = (v) => (v === null || v === undefined ? null : Number(v));
 
@@ -231,7 +232,7 @@ async function applyShiftRules(conn, rows, cards, scope) {
   const gap = await settings.getInt('eq_shift_continuity_minutes');
   const [ctx] = await conn.query(
     `SELECT eq_attendance_id, equipment_id, record_date, shift_type, check_in_time, check_out_time, day_status, gross_minutes, break_minutes,
-       breakdown_minutes, standby_minutes FROM eq_attendance WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ? AND status <> 'Rejected'`,
+       breakdown_minutes, standby_minutes FROM eq_attendance WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ? AND status NOT IN ('Rejected','Cancelled')`,
     [ids, addDays(scope.start_date, -2), addDays(scope.end_date, 2)]);
   const rateOf = (r) => { const c = cardFor(cards, r.equipment_id, String(r.record_date).slice(0, 10)); return c ? engineRate(c) : null; };
   const allow = {}; const plans = {};
@@ -276,19 +277,26 @@ async function blockers(conn, scope) {
   const requirePaper = await settings.getBool('eq_payroll_requires_paper_match');
   const s = scopeSql(scope);
   const out = [];
-  const add = (code, message, items) => { if (items.length) out.push({ code, message, count: items.length, items: items.slice(0, 200) }); };
+  // records of a closed (finalized) period never block a new batch: no new batch pays them (IN_CLOSED_PERIOD says so)
+  const closed = await lock.finalizedBatchesOverlapping(conn, scope.start_date, scope.end_date, scope.exclude_batch_id);
+  const isOpenItem = (x) => !(closed.length && x._v !== undefined && lock.closedBy(closed, { vendorId: x._v, equipmentId: x._e, siteId: x._s ?? null, date: x._d }));
+  const strip = ({ _v, _e, _s, _d, ...x }) => x;
+  const add = (code, message, list, keepClosed = false) => {
+    const items = (keepClosed ? list : list.filter(isOpenItem)).map(strip);
+    if (items.length) out.push({ code, message, count: items.length, items: items.slice(0, 200) });
+  };
   const base = `FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id JOIN sites st ON st.site_id = ea.site_id
     WHERE ea.record_date BETWEEN ? AND ?${s.sql}`;
   const params = [scope.start_date, scope.end_date, ...s.params];
-  const cols = 'ea.eq_attendance_id, e.equipment_code, st.site_code, ea.record_date, ea.status, ea.paper_status, ea.day_status';
+  const cols = 'ea.eq_attendance_id, e.equipment_code, st.site_code, ea.record_date, ea.status, ea.paper_status, ea.day_status, e.vendor_id AS _v, ea.equipment_id AS _e, ea.site_id AS _s, ea.record_date AS _d';
   const notInActive = `NOT EXISTS (SELECT 1 FROM eq_payroll_attendance_snapshot ps JOIN eq_payroll_batches b ON b.eq_batch_id = ps.eq_batch_id
     WHERE ps.eq_attendance_id = ea.eq_attendance_id AND ${ACTIVE_BATCH}${scope.exclude_batch_id ? ' AND b.eq_batch_id <> ?' : ''})`;
   const exParams = scope.exclude_batch_id ? [scope.exclude_batch_id] : [];
-  const [notApproved] = await conn.query(`SELECT ${cols} ${base} AND ea.status <> 'Approved' ORDER BY ea.record_date`, params);
+  const [notApproved] = await conn.query(`SELECT ${cols} ${base} AND ea.status NOT IN ('Approved','Cancelled') ORDER BY ea.record_date`, params);
   add('NOT_APPROVED', 'Rows not approved yet (Draft, Submitted or Rejected).', notApproved);
-  const [open] = await conn.query(`SELECT ${cols} ${base} AND ea.day_status = 'Working' AND ea.check_in_time IS NOT NULL AND ea.check_out_time IS NULL`, params);
+  const [open] = await conn.query(`SELECT ${cols} ${base} AND ea.status <> 'Cancelled' AND ea.day_status = 'Working' AND ea.check_in_time IS NOT NULL AND ea.check_out_time IS NULL`, params);
   add('OPEN_SESSION', 'Sessions still open (no check-out).', open);
-  const [unack] = await conn.query(`SELECT ${cols}, ea.anomaly_code ${base} AND ea.anomaly_code IS NOT NULL AND ea.anomaly_ack_at IS NULL`, params);
+  const [unack] = await conn.query(`SELECT ${cols}, ea.anomaly_code ${base} AND ea.status <> 'Cancelled' AND ea.anomaly_code IS NOT NULL AND ea.anomaly_ack_at IS NULL`, params);
   add('UNACK_ANOMALY', 'Rows with an anomaly that was not acknowledged.', unack);
   if (requirePaper) {
     const [paper] = await conn.query(`SELECT ${cols} ${base} AND ea.status = 'Approved' AND ea.paper_status <> 'Matched' AND ${notInActive}`, [...params, ...exParams]);
@@ -298,9 +306,10 @@ async function blockers(conn, scope) {
     `SELECT ${cols}, b.eq_batch_id ${base.replace('WHERE', `JOIN eq_payroll_attendance_snapshot ps ON ps.eq_attendance_id = ea.eq_attendance_id
       JOIN eq_payroll_batches b ON b.eq_batch_id = ps.eq_batch_id AND ${ACTIVE_BATCH}${scope.exclude_batch_id ? ' AND b.eq_batch_id <> ?' : ''} WHERE`)}`,
     [...exParams, ...params]);
-  add('IN_OTHER_BATCH', 'Rows already paid in another active batch (they are skipped).', inOther);
+  add('IN_OTHER_BATCH', 'Rows already paid in another active batch (they are skipped).', inOther, true);
   // rate cards: for eligible rows and for Monthly deployments
-  const [approved] = await conn.query(`SELECT ea.eq_attendance_id, ea.equipment_id, e.equipment_code, st.site_code, ea.record_date, ea.day_status, ea.standby_minutes, ea.standby_credit_minutes ${base} AND ea.status = 'Approved'`, params);
+  const [approved] = await conn.query(`SELECT ea.eq_attendance_id, ea.equipment_id, e.equipment_code, st.site_code, ea.record_date, ea.day_status, ea.standby_minutes, ea.standby_credit_minutes,
+    e.vendor_id AS _v, ea.equipment_id AS _e, ea.site_id AS _s, ea.record_date AS _d ${base} AND ea.status = 'Approved'`, params);
   const ids = [...new Set(approved.map((r) => r.equipment_id))];
   const cards = await loadRateCards(conn, ids, scope.start_date, scope.end_date);
   add('NO_RATE_CARD', 'Rows on dates without a rate card.', approved.filter((r) => !cardFor(cards, r.equipment_id, r.record_date)));
@@ -322,7 +331,8 @@ async function blockers(conn, scope) {
   }
   const fs = scopeSql(scope, 'f');
   const [fuel] = await conn.query(
-    `SELECT f.fuel_issue_id, e.equipment_code, f.issue_date, f.liters FROM eq_fuel_issues f JOIN eq_equipment e ON e.equipment_id = f.equipment_id
+    `SELECT f.fuel_issue_id, e.equipment_code, f.issue_date, f.liters, e.vendor_id AS _v, f.equipment_id AS _e, f.site_id AS _s, f.issue_date AS _d
+     FROM eq_fuel_issues f JOIN eq_equipment e ON e.equipment_id = f.equipment_id
      WHERE f.issue_date BETWEEN ? AND ? AND f.is_cancelled = 0 AND f.price_per_liter IS NULL${fs.sql}`, [scope.start_date, scope.end_date, ...fs.params]);
   add('FUEL_UNPRICED', 'Fuel issues without a price per litre.', fuel);
   // fuel price difference: a machine with fuel terms needs a national price on every working day
@@ -337,16 +347,22 @@ async function blockers(conn, scope) {
     }
   }
   add('MONTHLY_MULTI_SITE', 'Monthly machines that also work at another site in this period: generate per vendor or per machine (not per site), so their hours due are counted once.',
-    await monthlyMultiSite(conn, scope));
+    await monthlyMultiSite(conn, scope), true);
+  // closed (finalized) months are never paid again: what still waits inside them goes through an official Correction
+  if (closed.length) {
+    const [cand] = await conn.query(`SELECT ${cols} ${base} AND ea.status <> 'Cancelled' AND ${notInActive}`, [...params, ...exParams]);
+    add('IN_CLOSED_PERIOD', 'Rows dated in a finalized (closed) period: they are never paid by a new batch. Use an official Correction for them.',
+      cand.filter((r) => !isOpenItem(r)), true);
+  }
   // signed monthly sheets: needed to FINALIZE (not to generate) — shown early as information
-  const [toPay] = await conn.query(`SELECT ea.eq_attendance_id ${base} AND ea.status = 'Approved' AND ${notInActive}`, [...params, ...exParams]);
-  add('SCAN_MISSING', 'Signed monthly sheets not uploaded yet (needed before finalizing).', await sheetsMissingScan(conn, toPay.map((r) => r.eq_attendance_id)));
+  const [toPay] = await conn.query(`SELECT ea.eq_attendance_id, e.vendor_id AS _v, ea.equipment_id AS _e, ea.site_id AS _s, ea.record_date AS _d ${base} AND ea.status = 'Approved' AND ${notInActive}`, [...params, ...exParams]);
+  add('SCAN_MISSING', 'Signed monthly sheets not uploaded yet (needed before finalizing).', await sheetsMissingScan(conn, toPay.filter(isOpenItem).map((r) => r.eq_attendance_id)), true);
   return out;
 }
 
 const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING', 'MONTHLY_MULTI_SITE', 'MONTHLY_ROW_NOT_DEPLOYED'];
 /** Shown with the blockers but never prevent generating. */
-const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING'];
+const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING', 'IN_CLOSED_PERIOD'];
 
 /**
  * Full calculation for a scope. Returns { currency_groups, items (with lines, rows), warnings, blockers }.
@@ -358,7 +374,7 @@ async function calculate(conn, scope) {
   const requirePaper = await settings.getBool('eq_payroll_requires_paper_match');
   const s = scopeSql(scope);
   const exParams = scope.exclude_batch_id ? [scope.exclude_batch_id] : [];
-  const [rows] = await conn.query(
+  let [rows] = await conn.query(
     `SELECT ea.*, e.vendor_id, e.equipment_code, o.full_name AS operator_name FROM eq_attendance ea
      JOIN eq_equipment e ON e.equipment_id = ea.equipment_id LEFT JOIN eq_operators o ON o.operator_id = ea.operator_id
      WHERE ea.record_date BETWEEN ? AND ? AND ea.status = 'Approved' ${requirePaper ? "AND ea.paper_status = 'Matched'" : ''}${s.sql}
@@ -375,20 +391,33 @@ async function calculate(conn, scope) {
      WHERE a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)${ds.sql}`,
     [scope.end_date, scope.start_date, ...ds.params]);
   const fs = scopeSql(scope, 'f');
-  const [fuel] = await conn.query(
+  let [fuel] = await conn.query(
     `SELECT f.*, e.vendor_id FROM eq_fuel_issues f JOIN eq_equipment e ON e.equipment_id = f.equipment_id
      WHERE f.issue_date BETWEEN ? AND ? AND f.is_cancelled = 0 AND f.price_per_liter IS NOT NULL${fs.sql}
        AND NOT EXISTS (SELECT 1 FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
          WHERE l.source_table = 'eq_fuel_issues' AND l.source_id = f.fuel_issue_id AND ${ACTIVE_BATCH}${scope.exclude_batch_id ? ' AND b.eq_batch_id <> ?' : ''})`,
     [scope.start_date, scope.end_date, ...fs.params, ...exParams]);
   const as = scopeSql({ ...scope, site_id: null }, 'ad');
-  const [adjs] = await conn.query(
+  let [adjs] = await conn.query(
     `SELECT ad.*, e.vendor_id FROM eq_adjustments ad JOIN eq_equipment e ON e.equipment_id = ad.equipment_id
      WHERE ad.adjustment_date BETWEEN ? AND ? AND ad.status = 'Active'${as.sql}${scope.site_id ? ' AND (ad.site_id IS NULL OR ad.site_id = ?)' : ''}
        AND NOT EXISTS (SELECT 1 FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
          WHERE l.source_table = 'eq_adjustments' AND l.source_id = ad.adjustment_id AND ${ACTIVE_BATCH}${scope.exclude_batch_id ? ' AND b.eq_batch_id <> ?' : ''})`,
     [scope.start_date, scope.end_date, ...as.params, ...(scope.site_id ? [scope.site_id] : []), ...exParams]);
 
+  // Decision of 6 Oct 2026: nothing that belongs to a closed (finalized) period is paid by a new batch — no late row,
+  // fuel, adjustment or monthly day. Those go through the official Correction (debit / credit note).
+  const closed = await lock.finalizedBatchesOverlapping(conn, scope.start_date, scope.end_date, scope.exclude_batch_id);
+  const isClosed = (vendorId, equipmentId, siteId, date) => Boolean(closed.length && lock.closedBy(closed, { vendorId, equipmentId, siteId, date }));
+  const skippedClosed = { rows: 0, fuel: 0, adjustments: 0 };
+  const keepOpen = (list, kind, dateOf, siteOf) => list.filter((x) => {
+    if (!isClosed(x.vendor_id, x.equipment_id, siteOf(x), dateOf(x))) return true;
+    skippedClosed[kind] += 1;
+    return false;
+  });
+  rows = keepOpen(rows, 'rows', (r) => r.record_date, (r) => r.site_id);
+  fuel = keepOpen(fuel, 'fuel', (f) => f.issue_date, (f) => f.site_id);
+  adjs = keepOpen(adjs, 'adjustments', (a) => a.adjustment_date, (a) => a.site_id || null);
   const equipmentIds = [...new Set([...rows, ...deps, ...fuel, ...adjs].map((r) => r.equipment_id))];
   const cards = await loadRateCards(conn, equipmentIds, scope.start_date, scope.end_date);
   const fuelTerms = await loadFuelTerms(conn, equipmentIds, scope.start_date, scope.end_date);
@@ -409,6 +438,9 @@ async function calculate(conn, scope) {
     return c.length ? c[0].site_id : null;
   };
   const warnings = [];
+  if (skippedClosed.rows || skippedClosed.fuel || skippedClosed.adjustments) {
+    warnings.push({ code: 'CLOSED_PERIOD_SKIPPED', ...skippedClosed, message: 'Records dated in a finalized period were not paid; use an official Correction for them.' });
+  }
   const groups = new Map();
   // A MONTHLY card is one contract per machine: one group whatever the site (hours due settled once per month);
   // it is billed on the site where the machine spent most deployed days, with the cost split by site.
@@ -467,7 +499,8 @@ async function calculate(conn, scope) {
     if (rate.billing_mode === 'Monthly') {
       const ranges = g.deployRanges || [];
       const holidays = new Set(g.rows.filter((r) => r.day_status === 'Holiday').map((r) => String(r.record_date)));
-      ctx = { months: monthsContext(scope.start_date, scope.end_date, ranges, g.card, null, offDay, holidays) };
+      const ownsDay = closed.length ? (day) => !isClosed(g.vendor_id, g.equipment_id, null, day) : null;
+      ctx = { months: monthsContext(scope.start_date, scope.end_date, ranges, g.card, ownsDay, offDay, holidays) };
       if (!ranges.length) ctx.months = [];
     }
     if (rate.billing_mode !== 'Monthly' && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;

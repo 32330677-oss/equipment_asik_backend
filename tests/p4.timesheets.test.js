@@ -97,7 +97,13 @@ test('close then reconcile; correction sets Pending again', async () => {
   assert.strictEqual(closed.status, 'Reconciled');
   const late = await h.api().post('/api/equipment/attendance/day-status').set(S8()).send({ equipment_id: F.exc.equipment_id, site_id: 8, record_date: '2026-10-09', day_status: 'Absent' });
   assert.strictEqual(late.body.code, 'TIMESHEET_CLOSED');
+  // a remark is not compared with the signed paper: the paper check stays (a remark used to drop the row from payroll)
   await ok(h.api().patch(`/api/equipment/admin/attendance/${ids[0]}`).set(A()).send({ remarks: 'admin note', reason: 'note from the office' }));
+  const [kept] = await h.query('SELECT paper_status, check_out_time FROM eq_attendance WHERE eq_attendance_id = ?', [ids[0]]);
+  assert.strictEqual(kept.paper_status, 'Matched');
+  // a time that is on the paper changes: the row must be checked against the paper again
+  const { addMinutes } = require('../utils/dateTime');
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${ids[0]}`).set(A()).send({ check_out_time: addMinutes(kept.check_out_time, -10).slice(0, 16), reason: 'sheet shows 10 minutes earlier' }));
   const [row] = await h.query('SELECT paper_status FROM eq_attendance WHERE eq_attendance_id = ?', [ids[0]]);
   assert.strictEqual(row.paper_status, 'Pending');
   const [s] = await h.query('SELECT status FROM eq_timesheets WHERE timesheet_id = ?', [sheet.timesheet_id]);
