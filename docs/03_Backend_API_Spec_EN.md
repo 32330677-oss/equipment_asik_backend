@@ -509,6 +509,8 @@ period is never reopened and never paid by a new batch (no "recovery batch").
 | PATCH | `/admin/corrections/:id/approve` | A, C | by a person other than the author of the last version → applies the change, issues the debit / credit note and a Correction adjustment in the first open period |
 | PATCH | `/admin/corrections/:id/return`, `/cancel` | A, C | return (not the last author); cancel (requester, reviewer or Admin). `resolve` was removed |
 | PATCH | `/deployments/:id/start` | A, C | correct the first day `{assigned_date, reason ≥5}`; refused inside a closed period |
+| PATCH | `/fuel-terms/:id/start` | A, C | correct the first day of fuel price difference terms `{effective_from, reason ≥5}`; refused when the days added or removed are in a finalized payroll of the machine, or overlap earlier terms (`FUEL_TERMS_OVERLAP`) |
+| PATCH | `/api/site-supervisors/:id/start` | A | correct the first day of a supervisor period `{from_date, reason ≥5}`; refused when the days involved are in a finalized payroll of the site, or another supervisor covers that site/shift (`SUPERVISOR_PERIOD_OVERLAP`) |
 | PATCH | `/payroll/batches/:id/finalize` | A, C† | `{acknowledge_changes: true}` required when the batch pays manual changes (409 `CHANGES_NOT_ACKNOWLEDGED` with the list) |
 | GET | `/payroll/batches/:id/review-summary` | A, C | manual changes the batch pays (edits after approval, late entries, standby hours, adjustments, correction settlements, fuel / rate card changes, accepted blockers) |
 | PATCH | `/payroll/batches/:id/mark-paid` | A, C† | adds `payment_reference?` |

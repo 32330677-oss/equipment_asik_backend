@@ -232,3 +232,38 @@ exports.replaceSupervisor = async (req, res) => {
   });
   res.status(201).json({ status: 'success', data: result });
 };
+
+/**
+ * Correct the first day of a supervisor period (e.g. entered from today while the supervisor started with the project).
+ * Reason required. Refused when the days that change fall inside a finalized payroll of the site, or when another
+ * supervisor covers this site/shift in the new range. Old values stay in the audit log.
+ */
+exports.changeSupervisorStart = async (req, res) => {
+  const id = parseId(req.params.id);
+  const d = validate(req.body, { from_date: v.date({ required: true }), reason: v.string({ required: true, min: 5, max: 500 }) });
+  const row = await withTransaction(async (conn) => {
+    const [[p]] = await conn.execute('SELECT * FROM site_supervisors WHERE site_supervisor_id = ? FOR UPDATE', [id]);
+    if (!p) throw AppError.notFound('Supervisor period');
+    const old = String(p.from_date).slice(0, 10);
+    if (d.from_date === old) throw AppError.validation({ from_date: 'is already the first day' });
+    if (p.to_date && d.from_date > String(p.to_date).slice(0, 10)) throw AppError.validation({ from_date: 'must be on or before the last day of the period' });
+    const from = d.from_date < old ? d.from_date : old;
+    const to = addDays(d.from_date < old ? old : d.from_date, -1);
+    await lock.assertSiteRangeOpen(conn, { siteId: p.site_id, from, to, what: 'Moving the start of this supervisor period changes days that' });
+    if (d.from_date < old) {
+      const [clash] = await conn.execute(
+        `SELECT site_supervisor_id, user_id, from_date, to_date FROM site_supervisors
+         WHERE site_id = ? AND shift_type = ? AND site_supervisor_id <> ? AND ${overlapsSql('', 'from_date', 'to_date')}`,
+        [p.site_id, p.shift_type, id, to, d.from_date]);
+      if (clash.length) {
+        throw AppError.conflict('SUPERVISOR_PERIOD_OVERLAP', 'Another supervisor is in charge of this site/shift in part of that range. End or correct that period first.', { conflicts: clash });
+      }
+    }
+    await conn.execute('UPDATE site_supervisors SET from_date = ? WHERE site_supervisor_id = ?', [d.from_date, id]);
+    await audit.log(conn, { table: 'site_supervisors', id, action: 'change_start', oldValues: { from_date: old }, newValues: { from_date: d.from_date },
+      reason: d.reason, ...audit.ctx(req) });
+    const [[out]] = await conn.execute('SELECT * FROM site_supervisors WHERE site_supervisor_id = ?', [id]);
+    return out;
+  });
+  res.json({ status: 'success', data: row });
+};

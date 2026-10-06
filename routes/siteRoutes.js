@@ -16,5 +16,6 @@ router.get('/sites/:id/supervisors', requireAuth, AC, c.listSupervisors);
 router.post('/sites/:id/supervisors', requireAuth, A, c.assignSupervisor);
 router.post('/sites/:id/supervisors/replace', requireAuth, A, c.replaceSupervisor);
 router.patch('/site-supervisors/:id/end', requireAuth, A, c.endSupervisor);
+router.patch('/site-supervisors/:id/start', requireAuth, A, c.changeSupervisorStart);
 
 module.exports = router;

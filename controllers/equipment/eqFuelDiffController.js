@@ -6,6 +6,7 @@ const { v, validate, parseId } = require('../../utils/validate');
 const audit = require('../../services/audit');
 const { addDays } = require('../../utils/businessDate');
 const C = require('../../services/equipment/eqCommon');
+const lock = require('../../services/equipment/eqLock');
 
 const PRICE = (o = {}) => v.number({ min: 0.001, max: 9999999, decimals: 3, ...o });
 
@@ -136,6 +137,41 @@ exports.endTerms = async (req, res) => {
     if (last && effective_to < last) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `The fuel difference is already finalized up to ${last}.`);
     await conn.execute('UPDATE eq_fuel_terms SET effective_to = ? WHERE fuel_terms_id = ?', [effective_to, id]);
     await audit.log(conn, { table: 'eq_fuel_terms', id, action: 'end', oldValues: { effective_to: t.effective_to }, newValues: { effective_to }, ...audit.ctx(req) });
+    const [[out]] = await conn.execute('SELECT * FROM eq_fuel_terms WHERE fuel_terms_id = ?', [id]);
+    return out;
+  });
+  res.json({ status: 'success', data: row });
+};
+
+/**
+ * Correct the first day of fuel terms entered with a wrong date (e.g. today instead of the day the machine joined).
+ * Reason required. Refused when the days added or removed fall inside a finalized payroll of the machine, or when the
+ * terms would overlap the previous terms of the machine. Old values stay in the audit log.
+ */
+exports.changeTermsStart = async (req, res) => {
+  const id = parseId(req.params.id);
+  const d = validate(req.body, { effective_from: v.date({ required: true }), reason: v.string({ required: true, min: 5, max: 500 }) });
+  const row = await withTransaction(async (conn) => {
+    const [[t]] = await conn.execute('SELECT * FROM eq_fuel_terms WHERE fuel_terms_id = ? FOR UPDATE', [id]);
+    if (!t) throw AppError.notFound('Fuel terms');
+    const old = String(t.effective_from).slice(0, 10);
+    if (d.effective_from === old) throw AppError.validation({ effective_from: 'is already the first day' });
+    if (t.effective_to && d.effective_from > String(t.effective_to).slice(0, 10)) throw AppError.validation({ effective_from: 'must be on or before the last day of these terms' });
+    // the days that change side (added or removed) must all be in an open period of this machine
+    const from = d.effective_from < old ? d.effective_from : old;
+    const to = addDays(d.effective_from < old ? old : d.effective_from, -1);
+    await lock.assertRangeOpen(conn, { equipmentId: t.equipment_id, from, to, what: 'Moving the start of these fuel terms changes days that' });
+    const [prev] = await conn.execute(
+      `SELECT fuel_terms_id, effective_from, effective_to FROM eq_fuel_terms
+       WHERE equipment_id = ? AND fuel_terms_id <> ? AND effective_from < ? AND (effective_to IS NULL OR effective_to >= ?)`,
+      [t.equipment_id, id, old, d.effective_from]);
+    if (prev.length) {
+      throw AppError.conflict('FUEL_TERMS_OVERLAP', `Earlier terms (#${prev[0].fuel_terms_id}, from ${String(prev[0].effective_from).slice(0, 10)}) still cover that date. `
+        + 'Stop them the day before first, or choose a later date.', { conflicts: prev });
+    }
+    await conn.execute('UPDATE eq_fuel_terms SET effective_from = ? WHERE fuel_terms_id = ?', [d.effective_from, id]);
+    await audit.log(conn, { table: 'eq_fuel_terms', id, action: 'change_start', oldValues: { effective_from: old }, newValues: { effective_from: d.effective_from },
+      reason: d.reason, relatedType: 'eq_equipment', relatedId: t.equipment_id, ...audit.ctx(req) });
     const [[out]] = await conn.execute('SELECT * FROM eq_fuel_terms WHERE fuel_terms_id = ?', [id]);
     return out;
   });

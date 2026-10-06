@@ -135,6 +135,7 @@ router.delete('/fuel-prices/:id', AC, fd.deletePrice);
 router.get('/machines/:id/fuel-terms', AC, fd.listTerms);
 router.post('/machines/:id/fuel-terms', AC, fd.createTerms);
 router.patch('/fuel-terms/:id/end', AC, fd.endTerms);
+router.patch('/fuel-terms/:id/start', AC, fd.changeTermsStart);
 
 // 5.8 paper timesheets
 router.get('/timesheets', ACS, ts.list);
