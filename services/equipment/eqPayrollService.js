@@ -6,6 +6,7 @@ const { addDays, daysInMonth, monthOf } = require('../../utils/businessDate');
 const { covers } = require('../../utils/ranges');
 const { parseJson } = require('./eqCommon');
 const lock = require('./eqLock');
+const dnr = require('./eqDnr');
 
 const toNum = (v) => (v === null || v === undefined ? null : Number(v));
 
@@ -404,12 +405,25 @@ async function calculate(conn, scope) {
        AND NOT EXISTS (SELECT 1 FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
          WHERE l.source_table = 'eq_adjustments' AND l.source_id = ad.adjustment_id AND ${ACTIVE_BATCH}${scope.exclude_batch_id ? ' AND b.eq_batch_id <> ?' : ''})`,
     [scope.start_date, scope.end_date, ...as.params, ...(scope.site_id ? [scope.site_id] : []), ...exParams]);
+  // DNR delivery notes (per-unit billing): not yet paid by an active batch. The note's own vendor decides the scope.
+  const dnw = []; const dnp = [];
+  if (scope.vendor_id) { dnw.push('dn.vendor_id = ?'); dnp.push(scope.vendor_id); }
+  if (scope.equipment_id) { dnw.push('dn.equipment_id = ?'); dnp.push(scope.equipment_id); }
+  if (scope.site_id) { dnw.push('dn.site_id = ?'); dnp.push(scope.site_id); }
+  let [dns] = await conn.query(
+    `SELECT dn.*, r.item_name, r.unit, vc.contract_number FROM eq_delivery_notes dn
+     JOIN eq_dnr_rates r ON r.dnr_rate_id = dn.dnr_rate_id JOIN eq_vendor_contracts vc ON vc.vendor_contract_id = r.vendor_contract_id
+     WHERE dn.note_date BETWEEN ? AND ? AND dn.status = 'Active'${dnw.length ? ` AND ${dnw.join(' AND ')}` : ''}
+       AND NOT EXISTS (SELECT 1 FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
+         WHERE l.source_table = 'eq_delivery_notes' AND l.source_id = dn.delivery_note_id AND ${ACTIVE_BATCH}${scope.exclude_batch_id ? ' AND b.eq_batch_id <> ?' : ''})
+     ORDER BY dn.equipment_id, dn.site_id, dn.note_date${scope.lock ? ' FOR UPDATE' : ''}`,
+    [scope.start_date, scope.end_date, ...dnp, ...exParams]);
 
   // Decision of 6 Oct 2026: nothing that belongs to a closed (finalized) period is paid by a new batch — no late row,
   // fuel, adjustment or monthly day. Those go through the official Correction (debit / credit note).
   const closed = await lock.finalizedBatchesOverlapping(conn, scope.start_date, scope.end_date, scope.exclude_batch_id);
   const isClosed = (vendorId, equipmentId, siteId, date) => Boolean(closed.length && lock.closedBy(closed, { vendorId, equipmentId, siteId, date }));
-  const skippedClosed = { rows: 0, fuel: 0, adjustments: 0 };
+  const skippedClosed = { rows: 0, fuel: 0, adjustments: 0, delivery_notes: 0 };
   const keepOpen = (list, kind, dateOf, siteOf) => list.filter((x) => {
     if (!isClosed(x.vendor_id, x.equipment_id, siteOf(x), dateOf(x))) return true;
     skippedClosed[kind] += 1;
@@ -418,7 +432,8 @@ async function calculate(conn, scope) {
   rows = keepOpen(rows, 'rows', (r) => r.record_date, (r) => r.site_id);
   fuel = keepOpen(fuel, 'fuel', (f) => f.issue_date, (f) => f.site_id);
   adjs = keepOpen(adjs, 'adjustments', (a) => a.adjustment_date, (a) => a.site_id || null);
-  const equipmentIds = [...new Set([...rows, ...deps, ...fuel, ...adjs].map((r) => r.equipment_id))];
+  dns = keepOpen(dns, 'delivery_notes', (n) => n.note_date, (n) => n.site_id);
+  const equipmentIds = [...new Set([...rows, ...deps, ...fuel, ...adjs, ...dns].map((r) => r.equipment_id))];
   const cards = await loadRateCards(conn, equipmentIds, scope.start_date, scope.end_date);
   const fuelTerms = await loadFuelTerms(conn, equipmentIds, scope.start_date, scope.end_date);
   const fuelPrices = fuelTerms.length ? await loadFuelPrices(conn) : [];
@@ -438,7 +453,7 @@ async function calculate(conn, scope) {
     return c.length ? c[0].site_id : null;
   };
   const warnings = [];
-  if (skippedClosed.rows || skippedClosed.fuel || skippedClosed.adjustments) {
+  if (skippedClosed.rows || skippedClosed.fuel || skippedClosed.adjustments || skippedClosed.delivery_notes) {
     warnings.push({ code: 'CLOSED_PERIOD_SKIPPED', ...skippedClosed, message: 'Records dated in a finalized period were not paid; use an official Correction for them.' });
   }
   const groups = new Map();
@@ -465,6 +480,24 @@ async function calculate(conn, scope) {
     if (!card) throw AppError.conflict('NO_RATE_CARD', `${r.equipment_code} has no rate card on ${r.record_date}.`);
     groupFor(r.equipment_id, r.site_id, card, r.vendor_id).rows.push(r);
   }
+  // DNR: one group per machine x site x currency, separate from any rate card of the same machine (both are paid)
+  const dnrRates = await dnr.ratesForMachines(conn, equipmentIds, scope.start_date, scope.end_date);
+  const dnrGroupFor = (equipmentId, siteId, vendorId, currency) => {
+    const key = `${equipmentId}|${siteId}|DNR|${currency}`;
+    if (!groups.has(key)) groups.set(key, { dnr: true, equipment_id: equipmentId, site_id: siteId, vendor_id: vendorId, currency, card: null, rows: [], fuel: [], adjustments: [], delivery_notes: [] });
+    return groups.get(key);
+  };
+  for (const n of dns) dnrGroupFor(n.equipment_id, n.site_id, n.vendor_id, n.currency).delivery_notes.push(n);
+  /** Fuel / adjustment of a machine WITHOUT a rate card on that date: it goes with the machine's DNR item (same site first). */
+  const dnrFallback = (equipmentId, siteId, vendorId, date, currency = null) => {
+    const mine = [...groups.values()].filter((g) => g.dnr && g.equipment_id === equipmentId && (!currency || g.currency === currency));
+    const same = mine.find((g) => siteId && g.site_id === siteId) || mine[0];
+    if (same) return same;
+    // no delivery note of this machine in the period: only a machine that HAS a DNR price on that date gets a DNR item
+    const priced = dnr.currencyOn(dnrRates, equipmentId, date);
+    if (!priced || !siteId) return null;
+    return dnrGroupFor(equipmentId, siteId, vendorId, currency || priced);
+  };
   // monthly bases from deployments
   for (const d of deps) {
     const monthlyCards = cards.filter((c) => c.equipment_id === d.equipment_id && c.billing_mode === 'Monthly');
@@ -476,7 +509,11 @@ async function calculate(conn, scope) {
   }
   for (const f of fuel) {
     const card = cardFor(cards, f.equipment_id, f.issue_date);
-    if (!card) throw AppError.conflict('NO_RATE_CARD', `Fuel issue #${f.fuel_issue_id} is on a date without a rate card.`);
+    if (!card) {
+      const dg = dnrFallback(f.equipment_id, f.site_id, f.vendor_id, f.issue_date);
+      if (dg) { dg.fuel.push(f); continue; }
+      throw AppError.conflict('NO_RATE_CARD', `Fuel issue #${f.fuel_issue_id} is on a date without a rate card or DNR price.`);
+    }
     groupFor(f.equipment_id, f.site_id, card, f.vendor_id).fuel.push(f);
   }
   for (const a of adjs) {
@@ -488,12 +525,20 @@ async function calculate(conn, scope) {
       siteId = candidates[0] ? candidates[0].site_id : (deps.find((d) => d.equipment_id === a.equipment_id) || {}).site_id;
     }
     if (!siteId) { warnings.push({ code: 'ADJUSTMENT_WITHOUT_SITE', adjustment_id: a.adjustment_id }); continue; }
-    if (!card) throw AppError.conflict('NO_RATE_CARD', `Adjustment #${a.adjustment_id} is on a date without a rate card.`);
+    if (!card) {
+      const dg = dnrFallback(a.equipment_id, siteId, a.vendor_id, a.adjustment_date, a.currency);
+      if (dg) { dg.adjustments.push(a); continue; }
+      throw AppError.conflict('NO_RATE_CARD', `Adjustment #${a.adjustment_id} is on a date without a rate card or DNR price.`);
+    }
     groupFor(a.equipment_id, siteId, card, a.vendor_id).adjustments.push(a);
   }
 
   const items = [];
   for (const g of groups.values()) {
+    if (g.dnr) {
+      if (g.delivery_notes.length || g.fuel.length || g.adjustments.length) items.push(dnr.billGroup(g));
+      continue;
+    }
     const rate = engineRate(g.card);
     let ctx = {};
     if (rate.billing_mode === 'Monthly') {
@@ -596,8 +641,8 @@ async function batchDrift(conn, batch) {
     return [...reasons, { code: e.code, message: e.message }];
   }
   const items = calc.items.filter((i) => i.currency === batch.currency);
-  const [stored] = await conn.query('SELECT eq_item_id, equipment_id, site_id, rate_card_id, net_amount FROM eq_payroll_items WHERE eq_batch_id = ?', [batch.eq_batch_id]);
-  const key = (x) => `${x.equipment_id}|${x.site_id}|${x.rate_card_id || 'none'}`;
+  const [stored] = await conn.query('SELECT eq_item_id, equipment_id, site_id, rate_card_id, billing_mode, net_amount FROM eq_payroll_items WHERE eq_batch_id = ?', [batch.eq_batch_id]);
+  const key = (x) => `${x.equipment_id}|${x.site_id}|${x.rate_card_id || 'none'}|${x.billing_mode === 'DNR' ? 'DNR' : ''}`;
   const was = new Map(stored.map((x) => [key(x), Math.round(Number(x.net_amount) * 100)]));
   const now = new Map(items.map((x) => [key(x), x.net_cents]));
   for (const [k, cents] of now) {

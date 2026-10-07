@@ -21,6 +21,7 @@ const pay = require('../controllers/equipment/eqPayrollController');
 const liveC = require('../controllers/equipment/eqLiveController');
 const AS = requireRole('Admin', 'Supervisor');
 const fd = require('../controllers/equipment/eqFuelDiffController');
+const dnr = require('../controllers/equipment/dnrController');
 
 router.use(requireAuth);
 
@@ -62,6 +63,19 @@ router.post('/machines/:id/rate-cards', AC, rate.create);
 router.put('/rate-cards/:id', AC, rate.update);
 router.post('/rate-cards/:id/revise', AC, rate.revise);
 router.post('/rate-cards/:id/close', AC, rate.close);
+
+// 5.3b DNR (Delivery Note Registry): per-unit prices of an existing vendor + delivery notes (Admin and Accountant)
+router.get('/dnr-rates', AC, dnr.listRates);
+router.post('/dnr-rates', AC, dnr.createRates);
+router.put('/dnr-rates/:id', AC, dnr.updateRate);
+router.patch('/dnr-rates/:id/close', AC, dnr.closeRate);
+router.patch('/dnr-rates/:id/cancel', AC, dnr.cancelRate);
+router.get('/machines/:id/dnr-rates', AC, dnr.listMachineRates);
+router.get('/delivery-notes', AC, dnr.listNotes);
+router.post('/delivery-notes', AC, dnr.createNote);
+router.get('/delivery-notes/:id', AC, dnr.getNote);
+router.patch('/delivery-notes/:id/cancel', AC, dnr.cancelNote);
+router.patch('/delivery-notes/:id', AC, dnr.updateNote);
 
 // 5.4 deployments
 router.get('/deployments', AC, dep.list);
@@ -167,6 +181,10 @@ router.patch('/payroll/batches/:id/payment-reference', AC, pay.setPaymentReferen
 router.get('/payroll/batches/:id/review-summary', AC, pay.reviewSummary);
 router.patch('/payroll/batches/:id/void', AC, pay.void);
 router.post('/payroll/batches/:id/supersede', AC, pay.supersede);
+router.post('/payroll/batches/:id/payments', AC, pay.recordPayment);
+router.get('/payroll/batches/:id/statement.pdf', AC, pay.accountStatementPdf);
+router.patch('/payroll/payments/:id/reverse', AC, pay.reversePayment);
+router.get('/payroll/payments/:id/voucher.pdf', AC, pay.voucherPdf);
 router.patch('/payroll/requests/:id/approve', A, pay.approveRequest);
 router.patch('/payroll/requests/:id/reject', A, pay.rejectRequest);
 router.get('/statements/machine/:id.pdf', AC, pay.provisionalMachine);

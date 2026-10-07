@@ -63,7 +63,9 @@ function machineSummarySql(where) {
       (SELECT GROUP_CONCAT(CONCAT(s3.site_code, IF(a3.shift_type = 'Night', ' (Night)', '')) ORDER BY a3.shift_type, s3.site_code SEPARATOR ', ')
          FROM eq_site_assignments a3 JOIN sites s3 ON s3.site_id = a3.site_id WHERE a3.equipment_id = e.equipment_id AND ${active('a3')}) AS deployments_today,
       a.eq_assignment_id, a.site_id, a.shift_type, a.assigned_date, a.unassigned_date, s.site_code, s.site_name,
-      rc.rate_card_id, rc.billing_mode, rc.hourly_rate, rc.daily_rate, rc.monthly_rate, vc.currency
+      rc.rate_card_id, rc.billing_mode, rc.hourly_rate, rc.daily_rate, rc.monthly_rate, vc.currency,
+      (SELECT COUNT(*) FROM eq_dnr_rates dr WHERE dr.status = 'Active' AND dr.vendor_id = e.vendor_id
+         AND (dr.equipment_id IS NULL OR dr.equipment_id = e.equipment_id) AND (dr.effective_to IS NULL OR dr.effective_to >= CURDATE())) AS dnr_rates
     FROM eq_equipment e
     JOIN eq_types t ON t.type_id = e.type_id
     JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id

@@ -10,7 +10,10 @@ const LINE_LABEL = {
   MinimumTopUp: 'Minimum guarantee top-up', MonthlyBase: 'Monthly base', AbsenceDeduction: 'Absence deduction',
   BreakdownDeduction: 'Breakdown deduction', Operator: 'Operator (not included in rate)', Fuel: 'Fuel issued by us', Adjustment: 'Adjustment',
   FuelPriceDifference: 'Fuel price difference (compensation)', HoursShortfall: 'Hours below the monthly hours due', SecondShift: 'Second shift the same day',
+  DeliveryNote: 'Delivery note (DNR)',
 };
+const UNIT_TEXT = { trip: 'trip', t: 'ton', m3: 'm3', km: 'km', pc: 'piece', load: 'load' };
+const METHOD_TEXT = { BankTransfer: 'Bank transfer', Cheque: 'Cheque', Cash: 'Cash', Other: 'Other' };
 
 const n = (v) => Number(v || 0);
 const cents = (v) => Math.round(n(v) * 100);
@@ -144,6 +147,10 @@ function lineDesc(l, rate) {
 
 function rateSummary(r) {
   if (!r) return '';
+  if (r.billing_mode === 'DNR') {
+    const items = (r.dnr_rates || []).map((x) => `${x.item_name} per ${UNIT_TEXT[x.unit] || x.unit}`);
+    return ['Per-unit billing (DNR): each delivery note = quantity x agreed unit price', ...items, 'fuel issued by us is deducted'].join(' | ');
+  }
   if (r.billing_mode === 'Monthly') {
     const parts = [`Monthly ${fmt.num(r.monthly_rate)}`, `${n(r.standard_hours_per_day)} h per working day`,
       'hourly price = monthly / working days of the month / hours per day',
@@ -284,6 +291,12 @@ function drawMachine(doc, ctx, b, items) {
     y = doc.y + 4;
     y = drawMonthlyCalc(doc, y, it, cur);
     y = drawSiteAllocation(doc, y, it, cur);
+    if (it.billing_mode === 'DNR') {
+      y = drawDeliveryNotes(doc, y, it, cur);
+      y = drawLines(doc, y + 2, [{ ...it, lines: it.lines.filter((l) => l.line_type !== 'DeliveryNote') }], cur, false);
+      y = totalsBox(doc, y + 4, { gross: it.gross_amount, deductions: it.deductions_amount, net: it.net_amount, currency: cur });
+      continue;
+    }
     const rows = it.rows.map((r) => ({
       date: fmt.dayDate(r.record_date), status: r.day_status, op: r.operator_name || '', in: fmt.time(r.check_in_time), out: fmt.time(r.check_out_time),
       work: fmt.hours(r.work_minutes), ot: n(r.overtime_minutes) ? fmt.hours(r.overtime_minutes) : '', sb: n(r.standby_minutes) ? fmt.hours(r.standby_minutes) : '',
@@ -321,13 +334,37 @@ function drawMachine(doc, ctx, b, items) {
   signatureRow(doc, y + 6, [['Prepared by', 'إعداد'], ['Reviewed by', 'تدقيق'], ['Approved by', 'اعتماد']]);
 }
 
+/** DNR item: one row per delivery note (from the frozen snapshot of the batch, or from the lines of a provisional statement). */
+function drawDeliveryNotes(doc, y, it, cur) {
+  const fromSnap = (it.rate && it.rate.delivery_notes) || null;
+  const notes = fromSnap || it.lines.filter((l) => l.line_type === 'DeliveryNote').map((l) => ({ dn_number: '', note_date: '', item_name: l.note, unit: l.unit, quantity: l.quantity, unit_price: l.unit_price, amount: l.amount }));
+  y = sectionTitle(doc, y, `Delivery notes (${notes.length})`, 'سجل إشعارات التسليم');
+  const rows = notes.map((dn) => ({
+    no: dn.dn_number, date: dn.note_date ? fmt.date(dn.note_date) : '', item: `${dn.item_name || ''}${dn.material ? ` (${dn.material})` : ''}`,
+    route: dn.from_location || dn.to_location ? `${dn.from_location || '?'} > ${dn.to_location || '?'}` : '',
+    qty: fmt.num(dn.quantity, 3).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)), unit: UNIT_TEXT[dn.unit] || dn.unit,
+    price: fmt.num(dn.unit_price, 3), amount: money(dn.amount, cur),
+  }));
+  const sum = notes.reduce((a, dn) => a + n(dn.amount), 0);
+  rows.push({ no: 'Total', amount: money(sum, cur), _bold: true, _fill: COLORS.soft });
+  return P.table(doc, {
+    y, rows, rowHeight: 15, headHeight: 24, fontSize: 7, onNewPage: () => doc.page.margins.top + 4,
+    columns: [
+      { key: 'no', en: 'DN no.', ar: 'رقم الإشعار', width: 58 }, { key: 'date', en: 'Date', ar: 'التاريخ', width: 52 },
+      { key: 'item', en: 'Item', ar: 'البند', width: 140, align: 'left' }, { key: 'route', en: 'From > to', ar: 'من الى', width: 92, align: 'left' },
+      { key: 'qty', en: 'Qty', ar: 'الكمية', width: 40 }, { key: 'unit', en: 'Unit', ar: 'الوحدة', width: 34 },
+      { key: 'price', en: 'Unit price', ar: 'سعر الوحدة', width: 56, align: 'right' }, { key: 'amount', en: `Amount (${cur})`, ar: 'المبلغ', width: 75, align: 'right', bold: true },
+    ],
+  }) + 6;
+}
+
 function drawLines(doc, y, items, cur, withMachine = true) {
   const rows = [];
   for (const it of items) {
     for (const l of it.lines) {
       rows.push({
         m: it.equipment_code, desc: lineDesc(l, it.rate), qty: fmt.num(l.quantity, l.unit === 'day' || l.unit === 'month' ? 3 : 2).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)),
-        unit: l.unit, price: fmt.num(l.unit_price, l.line_type === 'FuelPriceDifference' || l.line_type === 'Fuel' ? 3 : 2), amount: money(l.amount, cur),
+        unit: UNIT_TEXT[l.unit] || l.unit, price: fmt.num(l.unit_price, ['FuelPriceDifference', 'Fuel', 'DeliveryNote'].includes(l.line_type) ? 3 : 2), amount: money(l.amount, cur),
         _color: n(l.amount) < 0 ? COLORS.red : undefined,
       });
     }
@@ -362,10 +399,11 @@ function drawVendor(doc, ctx, b, items) {
   const fuelOf = (it) => it.lines.filter((l) => l.line_type === 'Fuel').reduce((a, l) => a + n(l.amount), 0);
   const adjOf = (it) => it.lines.filter((l) => l.line_type === 'Adjustment').reduce((a, l) => a + n(l.amount), 0);
   const special = ['Fuel', 'Adjustment', 'FuelPriceDifference'];
+  const dnrOf = (it) => it.lines.filter((l) => l.line_type === 'DeliveryNote').length;
   const otherDed = (it) => it.lines.filter((l) => !special.includes(l.line_type) && n(l.amount) < 0).reduce((a, l) => a + n(l.amount), 0);
   const earn = (it) => it.lines.filter((l) => !special.includes(l.line_type) && n(l.amount) > 0).reduce((a, l) => a + n(l.amount), 0);
   const rows = items.map((it) => ({
-    m: `${it.equipment_code} ${it.type_name}`, site: it.site_code, bill: it.billing_mode, days: it.worked_days, work: fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours),
+    m: `${it.equipment_code} ${it.type_name}`, site: it.site_code, bill: it.billing_mode === 'DNR' ? `DNR (${dnrOf(it)})` : it.billing_mode, days: it.worked_days, work: it.billing_mode === 'DNR' ? '-' : fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours),
     sb: fmt.num(it.standby_hours), bd: fmt.num(it.breakdown_hours), earn: money(earn(it), cur), fd: fuelDiffOf(it) ? money(fuelDiffOf(it), cur) : '-',
     fuel: fuelOf(it) ? money(fuelOf(it), cur) : '-', adj: adjOf(it) ? money(adjOf(it), cur) : '-', ded: otherDed(it) ? money(otherDed(it), cur) : '-', net: money(it.net_amount, cur),
   }));
@@ -646,6 +684,18 @@ async function batchXlsx(conn, detail) {
       r.getCell('a').numFmt = moneyFmt;
     }
   }
+  const dnRows = items.filter((i) => i.billing_mode === 'DNR').flatMap((i) => ((i.rate && i.rate.delivery_notes) || []).map((dn) => ({ ...dn, m: i.equipment_code, s: i.site_code, v: i.vendor_name })));
+  if (dnRows.length) {
+    const dw = wb.addWorksheet('Delivery notes');
+    head(dw, [{ header: 'Vendor', key: 'v', width: 24 }, { header: 'Machine', key: 'm', width: 12 }, { header: 'Site', key: 's', width: 8 }, { header: 'DN no.', key: 'no', width: 14 },
+      { header: 'Date', key: 'd', width: 12 }, { header: 'Item', key: 'it', width: 30 }, { header: 'Material', key: 'mat', width: 16 }, { header: 'From', key: 'f', width: 16 },
+      { header: 'To', key: 't', width: 16 }, { header: 'Qty', key: 'q', width: 9 }, { header: 'Unit', key: 'u', width: 7 }, { header: 'Unit price', key: 'p', width: 12 }, { header: 'Amount', key: 'a', width: 14 }]);
+    for (const dn of dnRows) {
+      const r = dw.addRow({ v: dn.v, m: dn.m, s: dn.s, no: dn.dn_number, d: dn.note_date, it: dn.item_name, mat: dn.material || '', f: dn.from_location || '', t: dn.to_location || '',
+        q: n(dn.quantity), u: UNIT_TEXT[dn.unit] || dn.unit, p: n(dn.unit_price), a: n(dn.amount) });
+      r.getCell('a').numFmt = moneyFmt;
+    }
+  }
   if ((detail.invoices || []).length) {
     const inv = wb.addWorksheet('Invoice numbers');
     head(inv, [{ header: 'Number', key: 'no', width: 18 }, { header: 'Kind', key: 'k', width: 12 }, { header: 'Vendor', key: 'v', width: 26 }, { header: 'Machine', key: 'm', width: 12 },
@@ -660,5 +710,118 @@ async function batchXlsx(conn, detail) {
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
+// --------------------------------------------------------------- D6 payment voucher (أمر صرف)
+async function voucherPdf(conn, p, user) {
+  const company = await settings.getString('company_name');
+  const printedAt = businessNow().slice(0, 16);
+  const doc = P.createDoc({ info: { Title: `Payment voucher ${p.voucher_no}` } });
+  const cur = p.currency;
+  const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
+  let y = P.header(doc, {
+    title: 'PAYMENT VOUCHER', titleAr: 'أمر صرف', subtitle: company,
+    right: (xr, top) => {
+      P.text(doc, 'No.', xr - 190, top, { size: 7, color: COLORS.muted, width: 120, align: 'right', lineBreak: false });
+      P.text(doc, p.voucher_no, xr - 66, top, { size: 9, bold: true, color: COLORS.navy, width: 66, align: 'right', lineBreak: false });
+      P.text(doc, `Batch #${p.eq_batch_id} | v${p.version_number}`, xr - 190, top + 22, { size: 7, width: 190, align: 'right', lineBreak: false });
+      P.text(doc, `Currency ${cur}`, xr - 190, top + 32, { size: 7, width: 190, align: 'right', lineBreak: false });
+    },
+  });
+  y = P.infoGrid(doc, [
+    { label: 'Pay to (vendor)', labelAr: 'يصرف إلى', value: `${p.vendor_name}${p.vendor_code ? ` (${p.vendor_code})` : ''}` },
+    { label: 'Payment date', labelAr: 'تاريخ الدفع', value: fmt.date(String(p.paid_on).slice(0, 10)) },
+    { label: 'For invoice', labelAr: 'عن الفاتورة', value: p.invoice_no || '-' },
+    { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(p.start_date)} - ${fmt.date(p.end_date)}` },
+    { label: 'Method', labelAr: 'طريقة الدفع', value: METHOD_TEXT[p.method] || p.method },
+    { label: 'Reference', labelAr: 'المرجع', value: p.reference || '-' },
+    { label: 'Tax number', labelAr: 'الرقم الضريبي', value: p.tax_number || '-' },
+    { label: 'Recorded by', labelAr: 'نظم بواسطة', value: `${p.created_by} ${String(p.created_at).slice(0, 16)}` },
+  ], y, 4);
+  y += 6;
+  const row = (en, ar, val, opts = {}) => {
+    const h = opts.big ? 26 : 20;
+    if (opts.fill) doc.rect(L, y, W, h).fill(opts.fill); else doc.rect(L, y, W, h).lineWidth(0.5).strokeColor(COLORS.grid).stroke();
+    P.text(doc, en, L + 8, y, { size: opts.big ? 10 : 8.5, bold: opts.big, color: opts.color, width: W * 0.4, height: h, valign: 'middle', lineBreak: false });
+    P.text(doc, ar, L + W * 0.38, y, { size: opts.big ? 10 : 8.5, color: opts.arColor || opts.color || COLORS.muted, width: W * 0.3, height: h, valign: 'middle', align: 'right', lineBreak: false });
+    P.text(doc, val, L + W * 0.7, y, { size: opts.big ? 11 : 9, bold: true, color: opts.color, width: W * 0.3 - 8, height: h, valign: 'middle', align: 'right', lineBreak: false });
+    y += h;
+  };
+  row('Balance before this payment', 'الرصيد قبل الدفعة', `${money(p.balance_before, cur)} ${cur}`);
+  row(`AMOUNT PAID (${cur})`, 'المبلغ المدفوع', money(p.amount, cur), { big: true, fill: COLORS.navy, color: COLORS.white, arColor: '#E9DDBE' });
+  row('Balance after this payment', 'الرصيد المتبقي بعد الدفعة', `${money(p.balance_after, cur)} ${cur}`, { color: n(p.balance_after) > 0 ? COLORS.red : COLORS.green });
+  y += 6;
+  P.text(doc, `Amount in words: ${amountInWords(n(p.amount), cur)}`, L, y, { size: 8.5, width: W });
+  y = doc.y + 6;
+  if (p.note) { P.text(doc, `Note: ${p.note}`, L, y, { size: 8, color: COLORS.muted, width: W }); y = doc.y + 4; }
+  if (p.source === 'MarkPaid') { P.text(doc, 'Remaining balance of the invoice paid in full (Mark paid).', L, y, { size: 7.5, color: COLORS.muted, width: W }); y = doc.y + 4; }
+  P.text(doc, 'The original invoice is not changed by this payment; the statement of account of the batch shows every payment and the balance.', L, y, { size: 7, color: COLORS.muted, width: W });
+  y = doc.y + 4;
+  if (p.status === 'Reversed') {
+    P.text(doc, `REVERSED on ${String(p.reversed_at).slice(0, 16)} by ${p.reversed_by || '-'}: ${p.reverse_reason || ''}`, L, y, { size: 8.5, bold: true, color: COLORS.red, width: W });
+    y = doc.y + 4;
+  }
+  signatureRow(doc, y + 14, [['Prepared by (Accountant)', 'إعداد: المحاسب'], ['Approved by', 'اعتماد'], ['Received by (vendor)', 'المستلم: الجهة المؤجرة']]);
+  if (p.status === 'Reversed') watermark(doc, 'REVERSED');
+  P.footers(doc, `${company} | Equipment Flow | printed ${printedAt} by ${user.full_name}`);
+  return { buffer: await P.toBuffer(doc), fileName: `${p.voucher_no}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
+}
+
+// --------------------------------------------------------------- D7 statement of account of one vendor on a batch
+const PAY_STATE_TEXT = { Unpaid: 'Not paid yet', PartiallyPaid: 'Partly paid', Paid: 'Paid in full', CarriedForward: 'Balance carried to a later batch', NothingDue: 'Nothing due' };
+
+async function accountStatementPdf(conn, { batch: b, vendor: x }, user) {
+  const company = await settings.getString('company_name');
+  const printedAt = businessNow().slice(0, 16);
+  const doc = P.createDoc({ info: { Title: `Statement of account ${x.invoice_no || ''}` } });
+  const cur = b.currency;
+  const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
+  let y = P.header(doc, {
+    title: 'STATEMENT OF ACCOUNT', titleAr: 'كشف حساب الفاتورة', subtitle: company,
+    right: (xr, top) => {
+      P.text(doc, 'Invoice', xr - 190, top, { size: 7, color: COLORS.muted, width: 120, align: 'right', lineBreak: false });
+      P.text(doc, x.invoice_no || '-', xr - 66, top, { size: 9, bold: true, color: COLORS.navy, width: 66, align: 'right', lineBreak: false });
+      P.text(doc, `Batch #${b.eq_batch_id} | v${b.version_number}`, xr - 190, top + 22, { size: 7, width: 190, align: 'right', lineBreak: false });
+      P.text(doc, `Currency ${cur}`, xr - 190, top + 32, { size: 7, width: 190, align: 'right', lineBreak: false });
+    },
+  });
+  y = P.infoGrid(doc, [
+    { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${x.vendor_name}${x.vendor_code ? ` (${x.vendor_code})` : ''}` },
+    { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
+    { label: 'Status', labelAr: 'الحالة', value: PAY_STATE_TEXT[x.payment_status] || x.payment_status },
+    { label: 'Printed', labelAr: 'تاريخ الطباعة', value: printedAt },
+  ], y, 4);
+  const rows = [{ d: fmt.date(String(b.finalized_at || '').slice(0, 10)), what: `Invoice ${x.invoice_no || ''} (this period)`, ref: '', debit: money(x.invoice_amount, cur), credit: '' }];
+  for (const c of x.carried_in_detail) {
+    rows.push({ d: '', what: `Unpaid balance brought from batch #${c.from_batch_id} (${fmt.date(c.start_date)} - ${fmt.date(c.end_date)})`, ref: c.invoice_no || '', debit: money(c.amount, cur), credit: '' });
+  }
+  for (const p of x.payments) {
+    rows.push({ d: fmt.date(p.paid_on), what: `Payment ${METHOD_TEXT[p.method] || p.method}${p.status === 'Reversed' ? ' - REVERSED' : ''}${p.note ? ` - ${p.note}` : ''}`, ref: `${p.voucher_no}${p.reference ? ` / ${p.reference}` : ''}`,
+      debit: '', credit: p.status === 'Reversed' ? `(${money(p.amount, cur)})` : money(p.amount, cur), _color: p.status === 'Reversed' ? COLORS.light : undefined });
+  }
+  for (const c of x.carried_out_detail) {
+    rows.push({ d: '', what: `Balance carried to batch #${c.to_batch_id} (${fmt.date(c.start_date)} - ${fmt.date(c.end_date)})`, ref: '', debit: '', credit: money(c.amount, cur), _color: COLORS.amber });
+  }
+  rows.push({ what: 'Totals', debit: money(x.total_due, cur), credit: money(n(x.paid) + n(x.carried_out), cur), _bold: true, _fill: COLORS.soft });
+  y = sectionTitle(doc, y, 'Movements', 'الحركات');
+  y = P.table(doc, {
+    y, rows, rowHeight: 16, headHeight: 24, fontSize: 7.4, onNewPage: () => doc.page.margins.top + 4,
+    columns: [
+      { key: 'd', en: 'Date', ar: 'التاريخ', width: 58 }, { key: 'what', en: 'Description', ar: 'البيان', width: 239, align: 'left' },
+      { key: 'ref', en: 'Voucher / ref.', ar: 'رقم السند', width: 100 }, { key: 'debit', en: 'Due', ar: 'مستحق', width: 75, align: 'right' },
+      { key: 'credit', en: 'Paid / moved', ar: 'مدفوع', width: 75, align: 'right' },
+    ],
+  }) + 10;
+  const bw = 290; const bx = L + W - bw;
+  doc.rect(bx, y, bw, 24).fill(n(x.balance) > 0 ? COLORS.navy : COLORS.green);
+  P.text(doc, `BALANCE STILL DUE (${cur})`, bx + 6, y, { size: 9.5, bold: true, color: COLORS.white, width: 160, height: 24, valign: 'middle', lineBreak: false });
+  P.text(doc, money(Math.max(0, n(x.balance)), cur), bx + 150, y, { size: 10, bold: true, color: COLORS.white, width: bw - 156, height: 24, valign: 'middle', align: 'right', lineBreak: false });
+  y += 30;
+  P.text(doc, amountInWords(Math.max(0, n(x.balance)), cur), L, y, { size: 7.5, color: COLORS.muted, width: W, align: 'right' });
+  y = doc.y + 6;
+  P.text(doc, 'This statement does not replace the invoice: the invoice keeps its number and amount; payments are separate vouchers.', L, y, { size: 7, color: COLORS.muted, width: W });
+  signatureRow(doc, doc.y + 12, [['Prepared by (Finance)', 'إعداد: الإدارة المالية'], ['Approved by', 'اعتماد'], ['Acknowledged by the lessor', 'إقرار الجهة المؤجرة']]);
+  P.footers(doc, `${company} | Equipment Flow | printed ${printedAt} by ${user.full_name}`);
+  return { buffer: await P.toBuffer(doc), fileName: `statement-${x.invoice_no || `batch-${b.eq_batch_id}-vendor-${x.vendor_id}`}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
+}
+
 // invoice register sheet + fuel difference days are added by batchXlsx below
-module.exports = { batchPdf, provisionalPdf, batchXlsx, amountInWords };
+module.exports = { batchPdf, provisionalPdf, batchXlsx, amountInWords, voucherPdf, accountStatementPdf };

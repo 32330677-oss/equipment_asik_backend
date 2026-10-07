@@ -1099,3 +1099,19 @@ Additive only (no data deleted or rewritten; rollback script in `database/migrat
 | `settings` | `eq_paid_undo_hours` = 168, `eq_late_entry_days` = 3 (`INSERT IGNORE`) |
 
 The stored generated column rebuilds `eq_attendance`: run it in a maintenance window after a backup.
+
+## 5.6 Migration 013 — DNR (delivery notes) and partial payments (7 Oct 2026)
+
+Additive only (rollback script in `database/migrations/rollback/013_dnr_and_partial_payments.down.sql`):
+
+| Table | Change |
+|---|---|
+| `eq_dnr_rates` | new: per-unit prices (unit `trip` / `t` / `m3` / `km` / `pc` / `load`) of an EXISTING vendor, under one of its contracts (currency), effective-dated; `equipment_id` NULL = every machine of the vendor. Independent of `eq_rate_cards`: a machine may have both. |
+| `eq_delivery_notes` | new: one row per paper delivery note (number unique per vendor among live notes, generated `live_slot`), machine, site, date, quantity; `unit_price` and `currency` copied from the DNR price when saved |
+| `eq_payroll_items` | `billing_mode` + `DNR` (one item per machine x site x currency, `rate_card_id` NULL, snapshot of the notes in `rate_snapshot.delivery_notes`) |
+| `eq_payroll_lines` | `line_type` + `DeliveryNote`; `unit` + `trip`, `t`, `m3`, `km`, `pc`, `load`; `source_table` + `eq_delivery_notes` (a note is paid once) |
+| `eq_invoice_counters` | kind + `PaymentVoucher` (`PV-YYYY-00001`) |
+| `eq_payments` | new: payments of a vendor invoice (partial or full), official voucher number, balance before / after frozen for printing, `source` Payment / MarkPaid, reversal kept (status `Reversed`) |
+| `eq_payment_carryovers` | new: unpaid balance of an older finalized batch moved into a newer batch ("Add previous balances"); `Released` when the newer batch is voided |
+
+Rules: the vendor invoice never changes; balance = invoice + carried in − payments − carried out; no payment above the balance; the batch becomes `Paid` by itself when every vendor balance is 0 and nothing was carried out; a batch with payments or a carried-out balance cannot be voided or replaced. Batches marked paid before 013 (status `Paid`, no payment row) are treated as fully paid.

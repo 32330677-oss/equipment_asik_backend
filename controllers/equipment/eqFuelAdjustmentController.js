@@ -10,6 +10,7 @@ const { assertCanActOnSite } = require('../../services/siteAccess');
 const C = require('../../services/equipment/eqCommon');
 const lock = require('../../services/equipment/eqLock');
 const FV = require('../../services/equipment/eqFileVersions');
+const DNR = require('../../services/equipment/eqDnr');
 
 const SUPERVISOR_FUEL_COLS = 'f.fuel_issue_id, f.equipment_id, f.site_id, f.issue_date, f.liters, f.receipt_number, f.is_cancelled, e.equipment_code, s.site_code';
 
@@ -187,11 +188,14 @@ exports.createAdjustment = async (req, res) => {
     if (d.site_id) await C.loadSite(conn, d.site_id);
     await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: d.equipment_id, siteId: d.site_id || null, from: d.adjustment_date, what: 'This adjustment date' });
     const card = await C.rateCardOn(conn, d.equipment_id, d.adjustment_date);
-    if (!card) throw AppError.conflict('NO_RATE_CARD', 'The machine has no rate card on that date; the currency is unknown.');
+    // a machine paid only per delivery note (DNR) has no rate card: the currency is the one of its DNR price
+    const dnrPrice = card ? null : (await DNR.ratesForMachines(conn, [d.equipment_id], d.adjustment_date, d.adjustment_date))[0];
+    if (!card && !dnrPrice) throw AppError.conflict('NO_RATE_CARD', 'The machine has no rate card or DNR price on that date; the currency is unknown.');
+    if (!card && !d.site_id) throw AppError.validation({ site_id: 'is required for a machine paid per delivery note (DNR)' });
     const [r] = await conn.execute(
       `INSERT INTO eq_adjustments (equipment_id, site_id, adjustment_date, adjustment_type, amount, currency, reason, created_by_user_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [d.equipment_id, d.site_id || null, d.adjustment_date, d.adjustment_type, d.amount, card.currency, d.reason, req.user.user_id]);
+      [d.equipment_id, d.site_id || null, d.adjustment_date, d.adjustment_type, d.amount, card ? card.currency : dnrPrice.currency, d.reason, req.user.user_id]);
     const [[out]] = await conn.execute('SELECT * FROM eq_adjustments WHERE adjustment_id = ?', [r.insertId]);
     await audit.log(conn, { table: 'eq_adjustments', id: r.insertId, action: 'create', newValues: out, ...audit.ctx(req) });
     return out;
