@@ -44,13 +44,36 @@ async function rateCardLocked(conn, rateCardId) {
   return rows[0] ? rows[0].eq_batch_id : null;
 }
 
-/** Last record date billed by an active batch for a rate card (for close rules). */
-async function rateCardLastBilledDate(conn, rateCardId) {
+/**
+ * Last date billed with a rate card by an active batch (draft or finalized), for the close / "change from a date" rules.
+ * Returns { date, eq_batch_id, state: 'draft' | 'finalized' | 'paid' } of the batch that bills the latest day, or null.
+ *  - Hourly / Daily: the last attendance row of the batch (a day without a row is not billed).
+ *  - Monthly: the whole batch period inside the card (end of the batch, or end of the card if earlier), because a
+ *    monthly machine is billed on every deployed day of the period, even days without a row (hours due).
+ * On a tie the finalized batch is reported first (it cannot be voided freely).
+ */
+async function rateCardBilledUpTo(conn, rateCardId) {
   const [rows] = await conn.execute(
-    `SELECT MAX(s.record_date) AS d FROM eq_payroll_attendance_snapshot s
-     JOIN eq_payroll_items i ON i.eq_item_id = s.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = s.eq_batch_id
-     WHERE i.rate_card_id = ? AND b.status IN ('Generated','Paid')`, [rateCardId]);
-  return rows[0] && rows[0].d ? rows[0].d : null;
+    `SELECT x.d, x.eq_batch_id, x.status, x.is_finalized FROM (
+       SELECT MAX(s.record_date) AS d, b.eq_batch_id, b.status, b.is_finalized FROM eq_payroll_attendance_snapshot s
+       JOIN eq_payroll_items i ON i.eq_item_id = s.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = s.eq_batch_id
+       WHERE i.rate_card_id = ? AND b.status IN ('Generated','Paid')
+       GROUP BY b.eq_batch_id, b.status, b.is_finalized
+       UNION ALL
+       SELECT LEAST(b.end_date, COALESCE(rc.effective_to, b.end_date)) AS d, b.eq_batch_id, b.status, b.is_finalized FROM eq_payroll_items i
+       JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id JOIN eq_rate_cards rc ON rc.rate_card_id = i.rate_card_id
+       WHERE i.rate_card_id = ? AND i.billing_mode = 'Monthly' AND b.status IN ('Generated','Paid')
+     ) x WHERE x.d IS NOT NULL ORDER BY x.d DESC, x.is_finalized DESC LIMIT 1`, [rateCardId, rateCardId]);
+  const r = rows[0];
+  if (!r) return null;
+  const state = r.status === 'Paid' ? 'paid' : Number(r.is_finalized) ? 'finalized' : 'draft';
+  return { date: String(r.d).slice(0, 10), eq_batch_id: r.eq_batch_id, state };
+}
+
+/** Last date billed with a rate card by an active batch (see rateCardBilledUpTo), or null. */
+async function rateCardLastBilledDate(conn, rateCardId) {
+  const b = await rateCardBilledUpTo(conn, rateCardId);
+  return b ? b.date : null;
 }
 
 /** Deployment covering (machine, date), any site. */
@@ -80,5 +103,5 @@ function parseJson(v) {
 
 module.exports = {
   loadVendor, loadContract, loadMachine, loadOperator, loadRateCard, loadSite, loadDeployment,
-  nextCode, rateCardOn, rateCardLocked, rateCardLastBilledDate, deploymentOn, assertMachineDeployed, parseJson,
+  nextCode, rateCardOn, rateCardLocked, rateCardLastBilledDate, rateCardBilledUpTo, deploymentOn, assertMachineDeployed, parseJson,
 };

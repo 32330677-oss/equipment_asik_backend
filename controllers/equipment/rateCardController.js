@@ -123,6 +123,18 @@ async function rateCardInGeneratedBatch(conn, rateCardId) {
   return rows[0] ? rows[0].eq_batch_id : null;
 }
 
+/**
+ * 409 when a close / "change from a date" would move days already billed with the card. The message says which batch
+ * bills them and what to do: a DRAFT batch can be voided (then generated again); a finalized one needs a Correction.
+ */
+function billedConflict(billed, hint) {
+  const { date, eq_batch_id: batchId, state } = billed;
+  const msg = state === 'draft'
+    ? `Draft payroll batch #${batchId} (not finalized, not paid) already bills this card up to ${date}. ${hint}, or void that draft batch first, change the card, then generate it again.`
+    : `${state === 'paid' ? 'Paid' : 'Finalized'} payroll batch #${batchId} bills this card up to ${date}. ${hint}. A price that was wrong on those days is fixed by an official Correction.`;
+  return AppError.conflict('RATE_CARD_LOCKED', msg, { eq_batch_id: batchId, billed_up_to: date, batch_state: state });
+}
+
 exports.update = async (req, res) => {
   const id = parseId(req.params.id);
   const d = validate(req.body, { ...FIELDS, reason: v.string({ max: 500 }) });
@@ -154,8 +166,8 @@ exports.close = async (req, res) => {
     const before = await C.loadRateCard(conn, id, true);
     if (effective_to < before.effective_from) throw AppError.validation({ effective_to: 'must be on or after effective_from' });
     if (before.effective_to && effective_to > before.effective_to) throw AppError.validation({ effective_to: 'can only shorten the card' });
-    const lastBilled = await C.rateCardLastBilledDate(conn, id);
-    if (lastBilled && effective_to < lastBilled) throw AppError.conflict('RATE_CARD_LOCKED', `Rows up to ${lastBilled} were already paid with this card.`);
+    const billed = await C.rateCardBilledUpTo(conn, id);
+    if (billed && effective_to < billed.date) throw billedConflict(billed, `Close it on ${billed.date} or later`);
     await conn.execute('UPDATE eq_rate_cards SET effective_to = ? WHERE rate_card_id = ?', [effective_to, id]);
     await audit.log(conn, { table: 'eq_rate_cards', id, action: 'close', oldValues: { effective_to: before.effective_to }, newValues: { effective_to }, ...audit.ctx(req) });
     return C.loadRateCard(conn, id);
@@ -211,9 +223,9 @@ exports.revise = async (req, res) => {
     const before = await C.loadRateCard(conn, id, true);
     if (d.effective_from <= before.effective_from) throw AppError.validation({ effective_from: `must be after the start of the current card (${before.effective_from})` });
     if (before.effective_to && d.effective_from > before.effective_to) throw AppError.validation({ effective_from: 'the current card already ended before that date' });
-    const lastBilled = await C.rateCardLastBilledDate(conn, id);
+    const billed = await C.rateCardBilledUpTo(conn, id);
     const closeOn = addDays(d.effective_from, -1);
-    if (lastBilled && closeOn < lastBilled) throw AppError.conflict('RATE_CARD_LOCKED', `Rows up to ${lastBilled} were already paid with this card. Choose a date after it.`);
+    if (billed && closeOn < billed.date) throw billedConflict(billed, `Choose a start date after ${billed.date}`);
     const { rate_card_id: _a, created_at: _b, updated_at: _c, created_by_user_id: _d, equipment_id: equipmentId, ...old } = before;
     const card = checkCard({ ...old, overtime_enabled: Boolean(before.overtime_enabled), operator_included: Boolean(before.operator_included), ...d, effective_to: before.effective_to });
     await conn.execute('UPDATE eq_rate_cards SET effective_to = ? WHERE rate_card_id = ?', [closeOn, id]);

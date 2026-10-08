@@ -273,6 +273,46 @@ async function monthlyMultiSite(conn, scope) {
   return rows;
 }
 
+/**
+ * Monthly machines: deployed WORKING days of the scope (weekly day off excluded, inside a Monthly rate card) that have
+ * no attendance row at all (any site, any status except Cancelled). Such a day counts in the hours due with 0 hours
+ * done, so it is deducted as missing hours: usually right (the machine did not work), but also what happens when the
+ * supervisor forgot the row. Information only: shown before generating, never blocks.
+ */
+async function monthlyDaysWithoutRows(conn, scope) {
+  const ds = scopeSql(scope, 'a');
+  const [deps] = await conn.query(
+    `SELECT a.equipment_id, a.site_id, a.assigned_date, a.unassigned_date, e.equipment_code, e.vendor_id, st.site_code FROM eq_site_assignments a
+     JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN sites st ON st.site_id = a.site_id
+     WHERE a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)${ds.sql}
+     ORDER BY a.equipment_id, a.assigned_date`,
+    [scope.end_date, scope.start_date, ...ds.params]);
+  if (!deps.length) return [];
+  const ids = [...new Set(deps.map((d) => d.equipment_id))];
+  const monthlyCards = (await loadRateCards(conn, ids, scope.start_date, scope.end_date)).filter((c) => c.billing_mode === 'Monthly');
+  if (!monthlyCards.length) return [];
+  const monthlyIds = [...new Set(monthlyCards.map((c) => c.equipment_id))];
+  const [rows] = await conn.query(
+    `SELECT DISTINCT equipment_id, record_date FROM eq_attendance
+     WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ? AND status <> 'Cancelled'`, [monthlyIds, scope.start_date, scope.end_date]);
+  const recorded = new Set(rows.map((r) => `${r.equipment_id}|${String(r.record_date).slice(0, 10)}`));
+  const offDay = await settings.getInt('eq_weekly_off_day');
+  const out = []; const seen = new Set();
+  for (const d of deps) {
+    if (!monthlyIds.includes(d.equipment_id)) continue;
+    const from = String(d.assigned_date).slice(0, 10) > scope.start_date ? String(d.assigned_date).slice(0, 10) : scope.start_date;
+    const to = d.unassigned_date && String(d.unassigned_date).slice(0, 10) < scope.end_date ? String(d.unassigned_date).slice(0, 10) : scope.end_date;
+    for (let day = from; day <= to; day = addDays(day, 1)) {
+      const key = `${d.equipment_id}|${day}`;
+      if (seen.has(key) || recorded.has(key) || weekday(day) === offDay) continue;
+      if (!monthlyCards.some((c) => c.equipment_id === d.equipment_id && covers(c.effective_from, c.effective_to, day))) continue;
+      seen.add(key);
+      out.push({ equipment_code: d.equipment_code, site_code: d.site_code, record_date: day, _v: d.vendor_id, _e: d.equipment_id, _s: d.site_id, _d: day });
+    }
+  }
+  return out.sort((a, b) => a.equipment_code.localeCompare(b.equipment_code) || a.record_date.localeCompare(b.record_date));
+}
+
 /** Everything that prevents rows of the scope from being paid. */
 async function blockers(conn, scope) {
   const requirePaper = await settings.getBool('eq_payroll_requires_paper_match');
@@ -330,6 +370,8 @@ async function blockers(conn, scope) {
       monthlyRows.filter((r) => !dps.some((d) => d.equipment_id === r.equipment_id && covers(d.assigned_date, d.unassigned_date, String(r.record_date).slice(0, 10))))
         .map(({ standby_credit_minutes: _x, standby_minutes: _y, ...r }) => r));
   }
+  add('MONTHLY_DAYS_WITHOUT_ROWS', 'Monthly machines deployed on working days that have no attendance row: the hours due of those days are deducted as missing hours.',
+    await monthlyDaysWithoutRows(conn, scope));
   const fs = scopeSql(scope, 'f');
   const [fuel] = await conn.query(
     `SELECT f.fuel_issue_id, e.equipment_code, f.issue_date, f.liters, e.vendor_id AS _v, f.equipment_id AS _e, f.site_id AS _s, f.issue_date AS _d
@@ -363,7 +405,7 @@ async function blockers(conn, scope) {
 
 const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING', 'MONTHLY_MULTI_SITE', 'MONTHLY_ROW_NOT_DEPLOYED'];
 /** Shown with the blockers but never prevent generating. */
-const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING', 'IN_CLOSED_PERIOD'];
+const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING', 'IN_CLOSED_PERIOD', 'MONTHLY_DAYS_WITHOUT_ROWS'];
 
 /**
  * Full calculation for a scope. Returns { currency_groups, items (with lines, rows), warnings, blockers }.

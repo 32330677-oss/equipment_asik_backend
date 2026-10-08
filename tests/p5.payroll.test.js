@@ -95,7 +95,9 @@ let batch;
 test('preview reproduces examples A, B (incl. operator) and C (monthly on hours due)', async () => {
   await matchAllPaper();
   const b = await ok(h.api().get('/api/equipment/payroll/blockers?start_date=2026-10-01&end_date=2026-10-31').set(ACC()));
-  assert.deepStrictEqual(b.filter((x) => !['IN_OTHER_BATCH', 'SCAN_MISSING'].includes(x.code)), []);
+  assert.deepStrictEqual(b.filter((x) => !['IN_OTHER_BATCH', 'SCAN_MISSING', 'MONTHLY_DAYS_WITHOUT_ROWS'].includes(x.code)), []);
+  // example C: the crane has no row on Oct 31 (a working day): shown before generating, deducted as missing hours
+  assert.deepStrictEqual(b.find((x) => x.code === 'MONTHLY_DAYS_WITHOUT_ROWS').items.map((i) => i.record_date), ['2026-10-31']);
   const p = await ok(h.api().post('/api/equipment/payroll/preview').set(ACC()).send(SCOPE));
   const net = (code) => p.items.filter((i) => i.equipment_code === code).reduce((a, i) => a + Number(i.net), 0);
   assert.strictEqual(net('EQ-0001'), 1460);
