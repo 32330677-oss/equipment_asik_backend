@@ -36,7 +36,7 @@ exports.liveSite = async (req, res) => {
   const [[site]] = await pool.execute('SELECT site_id, site_code, site_name, has_night_shift, day_shift_start, night_shift_start FROM sites WHERE site_id = ?', [siteId]);
   if (!site) throw AppError.notFound('Site');
   const problems = data.machines.filter((m) => m.live_state === 'Breakdown' || m.late || m.forgotten_checkout || m.anomaly_code)
-    .map((m) => ({ equipment_code: m.equipment_code, live_state: m.live_state, late: m.late, forgotten_checkout: m.forgotten_checkout, anomaly_code: m.anomaly_code }));
+    .map((m) => ({ equipment_code: m.equipment_code, machine_label: m.machine_label || null, live_state: m.live_state, late: m.late, forgotten_checkout: m.forgotten_checkout, anomaly_code: m.anomaly_code }));
   res.json({ status: 'success', data: { site, ...data, problems } });
 };
 
@@ -62,7 +62,7 @@ exports.dailyPdf = async (req, res) => {
     { label: 'Not arrived / absent', labelAr: 'غائبة أو لم تصل', value: String(count('NotArrived') + count('Absent')) },
   ], y, 4);
   const rows = machines.map((m) => ({
-    m: `${m.equipment_code} ${m.type_name}`, v: m.vendor_name, st: m.live_state, op: m.operator_name || '', in: fmt.time(m.check_in_time), out: fmt.time(m.check_out_time),
+    m: `${m.equipment_code} ${m.machine_label || m.type_name}`, v: m.vendor_name, st: m.live_state, op: m.operator_name || '', in: fmt.time(m.check_in_time), out: fmt.time(m.check_out_time),
     dt: m.downtime.map((d) => `${d.downtime_type} ${fmt.time(d.start_time)}-${fmt.time(d.end_time) || '...'}`).join(', '),
     w: (m.work_minutes_today / 60).toFixed(2), r: m.remarks || '', _color: m.live_state === 'Breakdown' ? COLORS.red : undefined,
   }));
@@ -95,7 +95,7 @@ async function utilizationData(q) {
   if (q.vendor_id) { where.push('e.vendor_id = ?'); params.push(q.vendor_id); }
   if (q.site_id) { where.push('a.site_id = ?'); params.push(q.site_id); }
   const [deps] = await pool.query(
-    `SELECT a.equipment_id, a.site_id, a.assigned_date, a.unassigned_date, e.equipment_code, e.vendor_id, vd.vendor_name, t.type_name
+    `SELECT a.equipment_id, a.site_id, a.assigned_date, a.unassigned_date, e.equipment_code, e.machine_label, e.vendor_id, vd.vendor_name, t.type_name
      FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id
      JOIN eq_types t ON t.type_id = e.type_id
      WHERE a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)
@@ -120,7 +120,7 @@ async function utilizationData(q) {
     const sb = rs.reduce((a, r) => a + Number(r.standby_minutes || 0) + fullDay(r, 'Standby'), 0);
     const capacity = deployedDays * s * 60;
     out.push({
-      equipment_id: id, equipment_code: ds[0].equipment_code, type_name: ds[0].type_name, vendor_id: ds[0].vendor_id, vendor_name: ds[0].vendor_name,
+      equipment_id: id, equipment_code: ds[0].equipment_code, machine_label: ds[0].machine_label || null, type_name: ds[0].type_name, vendor_id: ds[0].vendor_id, vendor_name: ds[0].vendor_name,
       deployed_days: deployedDays, recorded_days: rs.length, worked_days: rs.filter((r) => r.day_status === 'Working' && Number(r.working_minutes) > 0).length,
       work_hours: +(work / 60).toFixed(2), standby_hours: +(sb / 60).toFixed(2), breakdown_hours: +(bd / 60).toFixed(2),
       utilization_pct: capacity ? +((work / capacity) * 100).toFixed(1) : 0, availability_pct: capacity ? +((1 - bd / capacity) * 100).toFixed(1) : 0,
@@ -140,7 +140,7 @@ exports.utilization = async (req, res) => {
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Utilization');
     ws.columns = [
-      { header: 'Vendor', key: 'vendor_name', width: 26 }, { header: 'Machine', key: 'equipment_code', width: 12 }, { header: 'Type', key: 'type_name', width: 16 },
+      { header: 'Vendor', key: 'vendor_name', width: 26 }, { header: 'Machine', key: 'equipment_code', width: 12 }, { header: 'Type', key: 'type_name', width: 16 }, { header: 'Machine no.', key: 'machine_label', width: 18 },
       { header: 'Deployed days', key: 'deployed_days', width: 10 }, { header: 'Worked days', key: 'worked_days', width: 10 }, { header: 'Work h', key: 'work_hours', width: 10 },
       { header: 'Standby h', key: 'standby_hours', width: 10 }, { header: 'Breakdown h', key: 'breakdown_hours', width: 11 },
       { header: 'Utilization %', key: 'utilization_pct', width: 12 }, { header: 'Availability %', key: 'availability_pct', width: 12 },
@@ -157,7 +157,7 @@ exports.utilization = async (req, res) => {
   const y = P.header(doc, { title: 'EQUIPMENT UTILIZATION', titleAr: 'نسبة استخدام الآليات', subtitle: `${fmt.date(q.from)} - ${fmt.date(q.to)}` });
   P.table(doc, {
     y, rowHeight: 16, headHeight: 24, onNewPage: () => doc.page.margins.top + 4,
-    rows: data.map((r) => ({ ...r, m: `${r.equipment_code} ${r.type_name}`, u: `${r.utilization_pct}%`, a: `${r.availability_pct}%`, _color: r.utilization_pct < 50 ? COLORS.red : undefined })),
+    rows: data.map((r) => ({ ...r, m: `${r.equipment_code} ${r.machine_label || r.type_name}`, u: `${r.utilization_pct}%`, a: `${r.availability_pct}%`, _color: r.utilization_pct < 50 ? COLORS.red : undefined })),
     columns: [
       { key: 'vendor_name', en: 'Vendor', ar: 'الجهة المؤجرة', width: 150, align: 'left' }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 130, align: 'left' },
       { key: 'deployed_days', en: 'Deployed days', ar: 'أيام التخصيص', width: 60 }, { key: 'worked_days', en: 'Worked days', ar: 'أيام العمل', width: 60 },

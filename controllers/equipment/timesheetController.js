@@ -28,7 +28,7 @@ async function assertSheetAccess(user, sheet, conn = pool) {
 }
 
 const SHEET_LIST_SQL = `
-  SELECT ts.*, e.equipment_code, t.type_name, vd.vendor_name, s.site_code, s.site_name,
+  SELECT ts.*, e.equipment_code, e.machine_label, t.type_name, vd.vendor_name, s.site_code, s.site_name,
     (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled') AS rows_count,
     (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled' AND a.paper_status = 'Matched') AS matched,
     (SELECT COUNT(*) FROM eq_attendance a WHERE a.timesheet_id = ts.timesheet_id AND a.status <> 'Cancelled' AND a.paper_status = 'Mismatch') AS mismatch,

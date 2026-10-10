@@ -29,7 +29,7 @@ async function renderTimesheet(data) {
     y = P.infoGrid(doc, [
       { label: 'Month', labelAr: 'الشهر', value: monthName(data.sheet.period_month) },
       { label: 'Site / shift', labelAr: 'الموقع والوردية', value: `${data.site.site_code} - ${data.site.site_name} | ${data.shifts}` },
-      { label: 'Machine code', labelAr: 'رمز الآلية', value: data.machine.equipment_code },
+      { label: 'Machine', labelAr: 'الآلية', value: `${data.machine.equipment_code}${data.machine.machine_label ? ` | ${data.machine.machine_label}` : ''}` },
       { label: 'Type', labelAr: 'النوع', value: [data.machine.type_name, data.machine.make, data.machine.model].filter(Boolean).join(' | ') },
       { label: 'Plate / serial', labelAr: 'رقم اللوحة والهيكل', value: [data.machine.plate_number, data.machine.serial_number].filter(Boolean).join(' | ') || '-' },
       { label: 'Vendor', labelAr: 'الجهة المؤجرة', value: data.vendor.vendor_name },

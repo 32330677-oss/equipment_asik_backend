@@ -105,7 +105,7 @@ async function rowView(conn, id) {
   let operatorName = null;
   if (row.operator_id) { const [[op]] = await conn.execute('SELECT full_name FROM eq_operators WHERE operator_id = ?', [row.operator_id]); operatorName = op ? op.full_name : null; }
   return {
-    eq_attendance_id: row.eq_attendance_id, equipment_id: row.equipment_id, equipment_code: row.equipment_code, type_name: row.type_name,
+    eq_attendance_id: row.eq_attendance_id, equipment_id: row.equipment_id, equipment_code: row.equipment_code, machine_label: row.machine_label || null, type_name: row.type_name,
     vendor_id: row.vendor_id, site_id: row.site_id, site_code: row.site_code, site_name: row.site_name, shift_type: row.shift_type, record_date: row.record_date, day_status: row.day_status, status: row.status,
     operator_id: row.operator_id, operator_name: operatorName, check_in_time: row.check_in_time, check_out_time: row.check_out_time,
     meter_start: row.meter_start, meter_end: row.meter_end, gross_minutes: row.gross_minutes, break_minutes: row.break_minutes,
@@ -151,7 +151,7 @@ exports.siteDay = async (req, res) => {
   const denial = await editDenial(req.user, siteId, shift, date);
   const site = await C.loadSite(pool, siteId);
   const [machines] = await pool.execute(
-    `SELECT e.equipment_id, e.equipment_code, e.plate_number, e.make, e.model, t.type_name, t.type_name_ar, t.meter_unit,
+    `SELECT e.equipment_id, e.equipment_code, e.machine_label, e.type_seq, e.plate_number, e.make, e.model, t.type_name, t.type_name_ar, t.meter_unit,
             v.vendor_id, v.vendor_name, a.eq_assignment_id, a.default_operator_id, o.full_name AS default_operator_name
      FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id AND e.status = 'Active'
      JOIN eq_types t ON t.type_id = e.type_id JOIN eq_vendors v ON v.vendor_id = e.vendor_id

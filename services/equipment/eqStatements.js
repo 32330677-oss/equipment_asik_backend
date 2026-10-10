@@ -240,14 +240,14 @@ async function modelFromBatch(conn, detail) {
 /** Same model from a provisional calculation (no batch). */
 async function modelFromCalc(conn, { kind, scope, items }) {
   const eqIds = [...new Set(items.map((i) => i.equipment_id))];
-  const [eqs] = await conn.query('SELECT e.equipment_id, e.equipment_code, e.plate_number, t.type_name FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)', [eqIds]);
+  const [eqs] = await conn.query('SELECT e.equipment_id, e.equipment_code, e.machine_label, e.plate_number, t.type_name FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)', [eqIds]);
   const [vds] = await conn.query('SELECT vendor_id, vendor_name, vendor_code FROM eq_vendors WHERE vendor_id IN (?)', [[...new Set(items.map((i) => i.vendor_id))]]);
   const [sts] = await conn.query('SELECT site_id, site_code, site_name FROM sites WHERE site_id IN (?)', [[...new Set(items.map((i) => i.site_id))]]);
   const by = (arr, k) => Object.fromEntries(arr.map((x) => [x[k], x]));
   const E = by(eqs, 'equipment_id'); const V = by(vds, 'vendor_id'); const S = by(sts, 'site_id');
   const h = (m) => (n(m) / 60).toFixed(2);
   const out = items.map((i) => ({
-    equipment_id: i.equipment_id, equipment_code: E[i.equipment_id].equipment_code, type_name: E[i.equipment_id].type_name,
+    equipment_id: i.equipment_id, equipment_code: E[i.equipment_id].equipment_code, machine_label: E[i.equipment_id].machine_label || null, type_name: E[i.equipment_id].type_name,
     vendor_id: i.vendor_id, vendor_name: V[i.vendor_id].vendor_name, vendor_code: V[i.vendor_id].vendor_code,
     site_id: i.site_id, site_code: S[i.site_id].site_code, site_name: S[i.site_id].site_name, billing_mode: i.billing_mode,
     rate: i.rate_snapshot, fuel_diff: i.fuel_diff || null, monthly_calc: i.monthly_calc || null, site_allocation: i.site_allocation || null, plate_number: E[i.equipment_id].plate_number, days_recorded: i.days_recorded, worked_days: i.worked_days,
@@ -265,6 +265,11 @@ async function modelFromCalc(conn, { kind, scope, items }) {
   return { batch, items: await withSiteCodes(conn, out) };
 }
 
+// 016: the machine's fixed number inside its vendor + type ("Excavator #3"), shown next to its code everywhere
+const mlabel = (it) => it.machine_label || it.type_name || '';
+/** Short form for narrow detail columns: "EQ-0012 #3" (the full label is in the machine summary / header). */
+const mshort = (it) => { const k = /#\d+$/.exec(it.machine_label || ''); return k ? `${it.equipment_code} ${k[0]}` : it.equipment_code; };
+
 // --------------------------------------------------------------- D2 machine invoice / statement
 const fuelDiffOf = (it) => it.lines.filter((l) => l.line_type === 'FuelPriceDifference').reduce((a, l) => a + n(l.amount), 0);
 
@@ -280,7 +285,7 @@ function drawMachine(doc, ctx, b, items) {
     right: numberBlock(doc, b, final ? numbers : null, cur),
   });
   y = P.infoGrid(doc, [
-    { label: 'Machine', labelAr: 'الآلية', value: `${first.equipment_code} | ${first.type_name}${first.plate_number ? ` | ${first.plate_number}` : ''}` },
+    { label: 'Machine', labelAr: 'الآلية', value: `${first.equipment_code} | ${mlabel(first)}${first.plate_number ? ` | ${first.plate_number}` : ''}` },
     { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${first.vendor_name}${first.vendor_code ? ` (${first.vendor_code})` : ''}` },
     { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
     { label: 'Contract', labelAr: 'رقم العقد', value: (first.rate && first.rate.contract_number) || first.contract_number || '-' },
@@ -363,7 +368,7 @@ function drawLines(doc, y, items, cur, withMachine = true) {
   for (const it of items) {
     for (const l of it.lines) {
       rows.push({
-        m: it.equipment_code, desc: lineDesc(l, it.rate), qty: fmt.num(l.quantity, l.unit === 'day' || l.unit === 'month' ? 3 : 2).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)),
+        m: mshort(it), desc: lineDesc(l, it.rate), qty: fmt.num(l.quantity, l.unit === 'day' || l.unit === 'month' ? 3 : 2).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)),
         unit: UNIT_TEXT[l.unit] || l.unit, price: fmt.num(l.unit_price, ['FuelPriceDifference', 'Fuel', 'DeliveryNote'].includes(l.line_type) ? 3 : 2), amount: money(l.amount, cur),
         _color: n(l.amount) < 0 ? COLORS.red : undefined,
       });
@@ -403,7 +408,7 @@ function drawVendor(doc, ctx, b, items) {
   const otherDed = (it) => it.lines.filter((l) => !special.includes(l.line_type) && n(l.amount) < 0).reduce((a, l) => a + n(l.amount), 0);
   const earn = (it) => it.lines.filter((l) => !special.includes(l.line_type) && n(l.amount) > 0).reduce((a, l) => a + n(l.amount), 0);
   const rows = items.map((it) => ({
-    m: `${it.equipment_code} ${it.type_name}`, site: it.site_code, bill: it.billing_mode === 'DNR' ? `DNR (${dnrOf(it)})` : it.billing_mode, days: it.worked_days, work: it.billing_mode === 'DNR' ? '-' : fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours),
+    m: `${it.equipment_code}\n${mlabel(it)}`, site: it.site_code, bill: it.billing_mode === 'DNR' ? `DNR (${dnrOf(it)})` : it.billing_mode, days: it.worked_days, work: it.billing_mode === 'DNR' ? '-' : fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours),
     sb: fmt.num(it.standby_hours), bd: fmt.num(it.breakdown_hours), earn: money(earn(it), cur), fd: fuelDiffOf(it) ? money(fuelDiffOf(it), cur) : '-',
     fuel: fuelOf(it) ? money(fuelOf(it), cur) : '-', adj: adjOf(it) ? money(adjOf(it), cur) : '-', ded: otherDed(it) ? money(otherDed(it), cur) : '-', net: money(it.net_amount, cur),
   }));
@@ -412,7 +417,7 @@ function drawVendor(doc, ctx, b, items) {
   y = P.table(doc, {
     y, rows, rowHeight: 16, headHeight: 26, fontSize: 6.8,
     columns: [
-      { key: 'm', en: 'Machine', ar: 'الآلية', width: 66, align: 'left' }, { key: 'site', en: 'Site', ar: 'الموقع', width: 30 },
+      { key: 'm', en: 'Machine', ar: 'الآلية', width: 66, align: 'left', wrap: true }, { key: 'site', en: 'Site', ar: 'الموقع', width: 30 },
       { key: 'bill', en: 'Billing', ar: 'الأساس', width: 34 }, { key: 'days', en: 'Days', ar: 'الأيام', width: 28 },
       { key: 'work', en: 'Work h', ar: 'العمل', width: 34 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 28 },
       { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 34 }, { key: 'bd', en: 'Brkdn h', ar: 'أعطال', width: 30 },
@@ -433,11 +438,11 @@ function drawVendor(doc, ctx, b, items) {
         { key: 'l', en: 'Litres', ar: 'الليترات', width: 80 }, { key: 'note', en: 'Basis', ar: 'الأساس', width: 170, align: 'left' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 97, align: 'right' }],
       rows: fdItems.map((it) => {
         const ls = it.lines.filter((l) => l.line_type === 'FuelPriceDifference');
-        return { m: it.equipment_code, no: it.fuel_invoice_no || (final ? '-' : 'draft'), l: fmt.num(ls.reduce((a, l) => a + n(l.quantity), 0)),
+        return { m: mshort(it), no: it.fuel_invoice_no || (final ? '-' : 'draft'), l: fmt.num(ls.reduce((a, l) => a + n(l.quantity), 0)),
           note: 'Working hours x L/h x (national - base price)', amount: money(fuelDiffOf(it), cur) };
       }) }) + 4;
   }
-  const fuelLines = items.flatMap((it) => it.lines.filter((l) => l.line_type === 'Fuel').map((l) => ({ ...l, m: it.equipment_code, site: it.site_code })));
+  const fuelLines = items.flatMap((it) => it.lines.filter((l) => l.line_type === 'Fuel').map((l) => ({ ...l, m: mshort(it), site: it.site_code })));
   if (fuelLines.length) {
     y = sectionTitle(doc, y + 4, `${sec++}. Fuel supplied by the company`, 'المحروقات المسلمة من الشركة');
     y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
@@ -445,7 +450,7 @@ function drawVendor(doc, ctx, b, items) {
         { key: 'qty', en: 'Litres', ar: 'الليترات', width: 60 }, { key: 'price', en: 'Price/L', ar: 'سعر الليتر', width: 70, align: 'right' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 147, align: 'right' }],
       rows: fuelLines.map((l) => ({ m: l.m, site: l.site, note: l.note || '', qty: fmt.num(l.quantity), price: fmt.num(l.unit_price, 3), amount: money(l.amount, cur), _color: COLORS.red })) }) + 4;
   }
-  const adjLines = items.flatMap((it) => it.lines.filter((l) => l.line_type === 'Adjustment').map((l) => ({ ...l, m: it.equipment_code })));
+  const adjLines = items.flatMap((it) => it.lines.filter((l) => l.line_type === 'Adjustment').map((l) => ({ ...l, m: mshort(it) })));
   if (adjLines.length) {
     y = sectionTitle(doc, y + 4, `${sec++}. Additions and deductions`, 'الإضافات والحسومات');
     y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
@@ -470,7 +475,7 @@ function drawFuelDiff(doc, ctx, b, it) {
   });
   const terms = fd.terms || [];
   y = P.infoGrid(doc, [
-    { label: 'Machine', labelAr: 'الآلية', value: `${it.equipment_code} | ${it.type_name}` },
+    { label: 'Machine', labelAr: 'الآلية', value: `${it.equipment_code} | ${mlabel(it)}` },
     { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: it.vendor_name },
     { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
     { label: 'Attached to invoice', labelAr: 'ملحق بالفاتورة', value: it.invoice_no || (final ? '-' : 'draft') },
@@ -528,7 +533,7 @@ function drawSummary(doc, ctx, b, items) {
     const its = items.filter((i) => i.vendor_id === vid);
     rows.push({ v: `${its[0].vendor_name}${its[0].vendor_invoice_no ? `  [${its[0].vendor_invoice_no}]` : ''}`, _bold: true, _fill: COLORS.band });
     for (const it of its) {
-      rows.push({ m: `${it.equipment_code} ${it.type_name}`, inv: it.invoice_no || '', site: it.site_code, bill: it.billing_mode, days: it.worked_days, work: fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours), sb: fmt.num(it.standby_hours), fd: fuelDiffOf(it) ? money(fuelDiffOf(it), cur) : '', gross: money(it.gross_amount, cur), ded: money(it.deductions_amount, cur), net: money(it.net_amount, cur) });
+      rows.push({ m: `${it.equipment_code} ${mlabel(it)}`, inv: it.invoice_no || '', site: it.site_code, bill: it.billing_mode, days: it.worked_days, work: fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours), sb: fmt.num(it.standby_hours), fd: fuelDiffOf(it) ? money(fuelDiffOf(it), cur) : '', gross: money(it.gross_amount, cur), ded: money(it.deductions_amount, cur), net: money(it.net_amount, cur) });
     }
     const s = (k) => its.reduce((a, i) => a + n(i[k]), 0);
     rows.push({ m: 'Lessor subtotal', work: fmt.num(s('work_hours')), fd: money(its.reduce((a, i) => a + fuelDiffOf(i), 0), cur), gross: money(s('gross_amount'), cur), ded: money(s('deductions_amount'), cur), net: money(s('net_amount'), cur), _bold: true, _fill: COLORS.soft });
@@ -631,7 +636,7 @@ async function batchXlsx(conn, detail) {
 
   const m = wb.addWorksheet('Machines');
   head(m, [
-    { header: 'Vendor', key: 'vendor', width: 26 }, { header: 'Machine', key: 'code', width: 12 }, { header: 'Type', key: 'type', width: 16 },
+    { header: 'Vendor', key: 'vendor', width: 26 }, { header: 'Machine', key: 'code', width: 12 }, { header: 'Type / no.', key: 'type', width: 18 },
     { header: 'Site', key: 'site', width: 8 }, { header: 'Billing', key: 'mode', width: 10 }, { header: 'Rows', key: 'rows', width: 7 },
     { header: 'Worked days', key: 'days', width: 9 }, { header: 'Work h', key: 'work', width: 9 }, { header: 'OT h', key: 'ot', width: 8 },
     { header: 'Standby h', key: 'sb', width: 9 }, { header: 'Breakdown h', key: 'bd', width: 10 }, { header: 'Top-up h', key: 'tu', width: 9 },
@@ -639,7 +644,7 @@ async function batchXlsx(conn, detail) {
     { header: 'Invoice no.', key: 'inv', width: 16 }, { header: 'Fuel diff. no.', key: 'finv', width: 16 },
   ]);
   for (const i of items) {
-    const r = m.addRow({ vendor: i.vendor_name, code: i.equipment_code, type: i.type_name, site: i.site_code, mode: i.billing_mode, rows: i.days_recorded, days: i.worked_days,
+    const r = m.addRow({ vendor: i.vendor_name, code: i.equipment_code, type: mlabel(i), site: i.site_code, mode: i.billing_mode, rows: i.days_recorded, days: i.worked_days,
       work: n(i.work_hours), ot: n(i.overtime_hours), sb: n(i.standby_hours), bd: n(i.breakdown_hours), tu: n(i.topup_hours), fd: fuelDiffOf(i), gross: n(i.gross_amount), ded: n(i.deductions_amount), net: n(i.net_amount),
       inv: i.invoice_no || '', finv: i.fuel_invoice_no || '' });
     ['fd', 'gross', 'ded', 'net'].forEach((k) => { r.getCell(k).numFmt = moneyFmt; });
@@ -652,7 +657,7 @@ async function batchXlsx(conn, detail) {
   head(l, [{ header: 'Machine', key: 'm', width: 12 }, { header: 'Site', key: 's', width: 8 }, { header: 'Line', key: 't', width: 22 }, { header: 'Description', key: 'd', width: 50 },
     { header: 'Qty', key: 'q', width: 10 }, { header: 'Unit', key: 'u', width: 7 }, { header: 'Unit price', key: 'p', width: 12 }, { header: 'Amount', key: 'a', width: 14 }]);
   for (const i of items) for (const ln of i.lines) {
-    const r = l.addRow({ m: i.equipment_code, s: i.site_code, t: ln.line_type, d: lineDesc(ln, i.rate), q: n(ln.quantity), u: ln.unit, p: n(ln.unit_price), a: n(ln.amount) });
+    const r = l.addRow({ m: mshort(i), s: i.site_code, t: ln.line_type, d: lineDesc(ln, i.rate), q: n(ln.quantity), u: ln.unit, p: n(ln.unit_price), a: n(ln.amount) });
     r.getCell('a').numFmt = moneyFmt;
   }
 
@@ -663,14 +668,14 @@ async function batchXlsx(conn, detail) {
     { header: 'Top-up h', key: 'tu', width: 8 }, { header: 'Meter start', key: 'ms', width: 11 }, { header: 'Meter end', key: 'me', width: 11 }, { header: 'Sheet row', key: 'r', width: 8 }, { header: 'Paper', key: 'p', width: 9 }]);
   const h = (x) => Math.round(n(x) / 60 * 100) / 100;
   for (const i of items) for (const r of i.rows) {
-    rw.addRow({ m: i.equipment_code, s: i.site_code, d: r.record_date, st: r.day_status, o: r.operator_name, i: r.check_in_time, x: r.check_out_time, w: h(r.work_minutes), ot: h(r.overtime_minutes),
+    rw.addRow({ m: mshort(i), s: i.site_code, d: r.record_date, st: r.day_status, o: r.operator_name, i: r.check_in_time, x: r.check_out_time, w: h(r.work_minutes), ot: h(r.overtime_minutes),
       sb: h(r.standby_minutes), bd: h(r.breakdown_minutes), br: h(r.break_minutes), tu: h(r.topup_minutes), ms: r.meter_start === null ? null : n(r.meter_start), me: r.meter_end === null ? null : n(r.meter_end), r: r.sheet_row_no, p: r.paper_status });
   }
 
   const fa = wb.addWorksheet('Fuel & Adjustments');
   head(fa, [{ header: 'Machine', key: 'm', width: 12 }, { header: 'Kind', key: 'k', width: 12 }, { header: 'Details', key: 'd', width: 50 }, { header: 'Qty', key: 'q', width: 10 }, { header: 'Unit price', key: 'p', width: 12 }, { header: 'Amount', key: 'a', width: 14 }]);
   for (const i of items) for (const ln of i.lines.filter((x) => x.line_type === 'Fuel' || x.line_type === 'Adjustment' || x.line_type === 'FuelPriceDifference')) {
-    const r = fa.addRow({ m: i.equipment_code, k: ln.line_type, d: ln.note, q: n(ln.quantity), p: n(ln.unit_price), a: n(ln.amount) });
+    const r = fa.addRow({ m: mshort(i), k: ln.line_type, d: ln.note, q: n(ln.quantity), p: n(ln.unit_price), a: n(ln.amount) });
     r.getCell('a').numFmt = moneyFmt;
   }
   const fdDays = items.flatMap((i) => ((i.fuel_diff && i.fuel_diff.days) || []).map((d) => ({ ...d, m: i.equipment_code, s: i.site_code, no: i.fuel_invoice_no })));
@@ -701,7 +706,7 @@ async function batchXlsx(conn, detail) {
     head(inv, [{ header: 'Number', key: 'no', width: 18 }, { header: 'Kind', key: 'k', width: 12 }, { header: 'Vendor', key: 'v', width: 26 }, { header: 'Machine', key: 'm', width: 12 },
       { header: 'Amount', key: 'a', width: 14 }, { header: 'Currency', key: 'c', width: 9 }, { header: 'Issued', key: 'i', width: 18 }]);
     const vname = Object.fromEntries(items.map((i) => [i.vendor_id, i.vendor_name]));
-    const mcode = Object.fromEntries(items.map((i) => [i.equipment_id, i.equipment_code]));
+    const mcode = Object.fromEntries(items.map((i) => [i.equipment_id, mshort(i)]));
     for (const x of detail.invoices) {
       const r = inv.addRow({ no: x.invoice_no, k: `${{ Vendor: 'Vendor invoice', Machine: 'Machine invoice', FuelDiff: 'Fuel difference', DebitNote: 'Debit note', CreditNote: 'Credit note' }[x.kind] || x.kind}${x.cancelled ? ' (cancelled)' : ''}`, v: vname[x.vendor_id], m: x.equipment_id ? mcode[x.equipment_id] : '', a: n(x.amount), c: x.currency, i: x.issued_at });
       r.getCell('a').numFmt = moneyFmt;

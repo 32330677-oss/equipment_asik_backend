@@ -8,7 +8,7 @@ const MAX_SESSION_MINUTES = 24 * 60;
 
 async function loadRow(conn, id, lock = false) {
   const [rows] = await conn.execute(
-    `SELECT ea.*, e.vendor_id, e.equipment_code, t.meter_unit, t.type_name, st.site_code, st.site_name FROM eq_attendance ea
+    `SELECT ea.*, e.vendor_id, e.equipment_code, e.machine_label, t.meter_unit, t.type_name, st.site_code, st.site_name FROM eq_attendance ea
      JOIN eq_equipment e ON e.equipment_id = ea.equipment_id JOIN eq_types t ON t.type_id = e.type_id
      JOIN sites st ON st.site_id = ea.site_id
      WHERE ea.eq_attendance_id = ?${lock ? ' FOR UPDATE' : ''}`, [id]);

@@ -40,7 +40,7 @@ exports.list = async (req, res) => {
     JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id JOIN sites s ON s.site_id = ea.site_id LEFT JOIN eq_operators o ON o.operator_id = ea.operator_id`;
   const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${from} ${w}`, params);
   const [rows] = await pool.query(
-    `SELECT ea.*, e.equipment_code, t.type_name, vd.vendor_name, s.site_code, s.site_name, o.full_name AS operator_name,
+    `SELECT ea.*, e.equipment_code, e.machine_label, t.type_name, vd.vendor_name, s.site_code, s.site_name, o.full_name AS operator_name,
        (SELECT COUNT(*) FROM eq_attendance_change_requests cr WHERE cr.eq_attendance_id = ea.eq_attendance_id AND cr.status = 'Pending') AS pending_change_requests
      ${from} ${w} ORDER BY ea.record_date DESC, s.site_code, e.equipment_code LIMIT ? OFFSET ?`, [...params, pageSize, offset]);
   const [[counts]] = await pool.query(
@@ -262,7 +262,7 @@ exports.createChangeRequest = async (req, res) => {
 async function changeRequestView(conn, id) {
   const [[r]] = await conn.execute(
     `SELECT cr.*, u.full_name AS requested_by, d.full_name AS decided_by, ea.record_date, ea.sheet_row_no, ea.status AS row_status, ea.site_id, ea.shift_type,
-       e.equipment_code, s.site_code FROM eq_attendance_change_requests cr
+       e.equipment_code, e.machine_label, s.site_code FROM eq_attendance_change_requests cr
      JOIN eq_attendance ea ON ea.eq_attendance_id = cr.eq_attendance_id JOIN eq_equipment e ON e.equipment_id = ea.equipment_id
      JOIN sites s ON s.site_id = ea.site_id JOIN users u ON u.user_id = cr.requested_by_user_id LEFT JOIN users d ON d.user_id = cr.decided_by_user_id
      WHERE cr.change_request_id = ?`, [id]);

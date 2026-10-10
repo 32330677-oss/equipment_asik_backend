@@ -64,8 +64,8 @@ exports.get = async (req, res) => {
   const vendor = await C.loadVendor(pool, id);
   const [contracts] = await pool.execute('SELECT * FROM eq_vendor_contracts WHERE vendor_id = ? ORDER BY start_date DESC', [id]);
   const [machines] = await pool.execute(
-    `SELECT e.equipment_id, e.equipment_code, e.plate_number, e.status, t.type_name FROM eq_equipment e
-     JOIN eq_types t ON t.type_id = e.type_id WHERE e.vendor_id = ? ORDER BY e.equipment_code`, [id]);
+    `SELECT e.equipment_id, e.equipment_code, e.machine_label, e.type_seq, e.plate_number, e.status, t.type_name FROM eq_equipment e
+     JOIN eq_types t ON t.type_id = e.type_id WHERE e.vendor_id = ? ORDER BY t.type_name, e.type_seq, e.equipment_code`, [id]);
   const [operators] = await pool.execute('SELECT * FROM eq_operators WHERE vendor_id = ? ORDER BY full_name', [id]);
   res.json({ status: 'success', data: { ...vendor, contracts, machines, operators } });
 };

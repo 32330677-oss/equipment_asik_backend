@@ -28,7 +28,7 @@ async function live(opts = {}) {
   const prev = addDays(date, -1);
   const [[deps], [rows], [downs], [cards]] = await Promise.all([
     pool.query(
-      `SELECT a.equipment_id, a.site_id, a.shift_type, e.equipment_code, e.plate_number, e.vendor_id, vd.vendor_name, t.type_name, t.type_name_ar,
+      `SELECT a.equipment_id, a.site_id, a.shift_type, e.equipment_code, e.machine_label, e.plate_number, e.vendor_id, vd.vendor_name, t.type_name, t.type_name_ar,
               s.site_code, s.site_name, s.day_shift_start, s.night_shift_start, o.full_name AS default_operator_name
        FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id AND e.status = 'Active'
        JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id JOIN eq_types t ON t.type_id = e.type_id JOIN sites s ON s.site_id = a.site_id
@@ -94,7 +94,7 @@ async function live(opts = {}) {
       cost[c.currency] = Math.round(((cost[c.currency] || 0) + estimate) * 100) / 100;
     }
     return {
-      equipment_id: d.equipment_id, equipment_code: d.equipment_code, plate_number: d.plate_number, type_name: d.type_name, type_name_ar: d.type_name_ar,
+      equipment_id: d.equipment_id, equipment_code: d.equipment_code, machine_label: d.machine_label || null, plate_number: d.plate_number, type_name: d.type_name, type_name_ar: d.type_name_ar,
       vendor_id: d.vendor_id, vendor_name: d.vendor_name, site_id: d.site_id, site_code: d.site_code, site_name: d.site_name, shift_type: d.shift_type,
       operator_name: (row && row.operator_name) || d.default_operator_name || null, live_state: state, since,
       elapsed_minutes: since ? Math.max(0, Math.floor((nowMs - wallMs(since)) / 60000)) : null,

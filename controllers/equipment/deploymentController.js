@@ -53,7 +53,7 @@ exports.list = async (req, res) => {
   if (req.query.active_on) { where.push(activeOnSql('a', 'assigned_date', 'unassigned_date')); params.push(String(req.query.active_on), String(req.query.active_on)); }
   const w = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const [rows] = await pool.query(
-    `SELECT a.*, e.equipment_code, t.type_name, s.site_code, s.site_name, vd.vendor_name, o.full_name AS default_operator_name
+    `SELECT a.*, e.equipment_code, e.machine_label, t.type_name, s.site_code, s.site_name, vd.vendor_name, o.full_name AS default_operator_name
      FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN eq_types t ON t.type_id = e.type_id
      JOIN sites s ON s.site_id = a.site_id JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id
      LEFT JOIN eq_operators o ON o.operator_id = a.default_operator_id ${w}

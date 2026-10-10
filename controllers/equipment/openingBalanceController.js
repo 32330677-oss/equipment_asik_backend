@@ -16,7 +16,7 @@ const FIELDS = {
   description: v.string({ max: 255 }), reference: v.string({ max: 100 }), note: v.string({ max: 500 }),
 };
 
-const SELECT = `SELECT ob.*, vd.vendor_name, vd.vendor_code, e.equipment_code, u.full_name AS created_by, cu.full_name AS cancelled_by,
+const SELECT = `SELECT ob.*, vd.vendor_name, vd.vendor_code, e.equipment_code, e.machine_label, u.full_name AS created_by, cu.full_name AS cancelled_by,
     c.carryover_id, c.to_batch_id, b.status AS to_batch_status, b.is_finalized AS to_batch_finalized, b.start_date AS to_start_date, b.end_date AS to_end_date
   FROM eq_opening_balances ob JOIN eq_vendors vd ON vd.vendor_id = ob.vendor_id LEFT JOIN eq_equipment e ON e.equipment_id = ob.equipment_id
   JOIN users u ON u.user_id = ob.created_by_user_id LEFT JOIN users cu ON cu.user_id = ob.cancelled_by_user_id
@@ -32,7 +32,7 @@ function view(r) {
   else if (r.carryover_id) state = 'Carried';
   return {
     opening_balance_id: r.opening_balance_id, vendor_id: r.vendor_id, vendor_name: r.vendor_name, vendor_code: r.vendor_code,
-    equipment_id: r.equipment_id, equipment_code: r.equipment_code || null, currency: r.currency, amount: Number(r.amount).toFixed(2),
+    equipment_id: r.equipment_id, equipment_code: r.equipment_code || null, machine_label: r.machine_label || null, currency: r.currency, amount: Number(r.amount).toFixed(2),
     as_of_date: day(r.as_of_date), period_from: day(r.period_from), period_to: day(r.period_to),
     description: r.description, reference: r.reference, note: r.note, status: r.status, state,
     carried_to_batch_id: r.to_batch_id || null,

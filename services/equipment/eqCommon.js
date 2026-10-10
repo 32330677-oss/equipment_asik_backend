@@ -76,6 +76,27 @@ async function rateCardLastBilledDate(conn, rateCardId) {
   return b ? b.date : null;
 }
 
+/**
+ * 016: gives a machine the next FIXED number inside its vendor + type ("Excavator #3"). Called when a machine is created
+ * and when its vendor or type changes. A number is never reused: the next one is the highest so far + 1.
+ */
+async function assignTypeSeq(conn, equipmentId) {
+  const [[m]] = await conn.execute(
+    'SELECT e.equipment_id, e.vendor_id, e.type_id, t.type_name FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id = ? FOR UPDATE', [equipmentId]);
+  if (!m) return null;
+  const [[x]] = await conn.execute(
+    'SELECT COALESCE(MAX(type_seq), 0) + 1 AS n FROM eq_equipment WHERE vendor_id = ? AND type_id = ? AND equipment_id <> ? FOR UPDATE', [m.vendor_id, m.type_id, equipmentId]);
+  const n = Number(x.n);
+  await conn.execute('UPDATE eq_equipment SET type_seq = ?, machine_label = ? WHERE equipment_id = ?', [n, `${m.type_name} #${n}`, equipmentId]);
+  return n;
+}
+
+/** 016: a renamed type renames the labels of its machines (the numbers stay). */
+async function refreshTypeLabels(conn, typeId) {
+  await conn.execute(
+    "UPDATE eq_equipment e JOIN eq_types t ON t.type_id = e.type_id SET e.machine_label = CONCAT(t.type_name, ' #', e.type_seq) WHERE e.type_id = ? AND e.type_seq IS NOT NULL", [typeId]);
+}
+
 /** Deployment covering (machine, date), any site. */
 async function deploymentOn(conn, equipmentId, date) {
   const [rows] = await conn.execute(
@@ -102,6 +123,7 @@ function parseJson(v) {
 }
 
 module.exports = {
+  assignTypeSeq, refreshTypeLabels,
   loadVendor, loadContract, loadMachine, loadOperator, loadRateCard, loadSite, loadDeployment,
   nextCode, rateCardOn, rateCardLocked, rateCardLastBilledDate, rateCardBilledUpTo, deploymentOn, assertMachineDeployed, parseJson,
 };

@@ -16,7 +16,7 @@ const QTY = (o = {}) => v.number({ min: 0.001, max: 9999999, decimals: 3, ...o }
 const day = (d) => (d ? String(d).slice(0, 10) : null);
 
 // ------------------------------------------------------------------ DNR prices
-const RATE_COLS = `r.*, vc.currency, vc.contract_number, vd.vendor_name, vd.vendor_code, e.equipment_code,
+const RATE_COLS = `r.*, vc.currency, vc.contract_number, vd.vendor_name, vd.vendor_code, e.equipment_code, e.machine_label,
   (SELECT COUNT(*) FROM eq_delivery_notes dn WHERE dn.dnr_rate_id = r.dnr_rate_id AND dn.status = 'Active') AS notes_count,
   (SELECT MAX(dn.note_date) FROM eq_delivery_notes dn WHERE dn.dnr_rate_id = r.dnr_rate_id AND dn.status = 'Active') AS last_note_date`;
 const RATE_FROM = `FROM eq_dnr_rates r JOIN eq_vendor_contracts vc ON vc.vendor_contract_id = r.vendor_contract_id
@@ -188,7 +188,7 @@ exports.cancelRate = async (req, res) => {
 const NOTE_FROM = `FROM eq_delivery_notes dn JOIN eq_equipment e ON e.equipment_id = dn.equipment_id JOIN eq_types t ON t.type_id = e.type_id
   JOIN eq_vendors vd ON vd.vendor_id = dn.vendor_id JOIN sites s ON s.site_id = dn.site_id JOIN eq_dnr_rates r ON r.dnr_rate_id = dn.dnr_rate_id
   LEFT JOIN users u ON u.user_id = dn.created_by_user_id`;
-const NOTE_COLS = `dn.*, e.equipment_code, t.type_name, vd.vendor_name, s.site_code, s.site_name, r.item_name, r.unit, u.full_name AS created_by,
+const NOTE_COLS = `dn.*, e.equipment_code, e.machine_label, t.type_name, vd.vendor_name, s.site_code, s.site_name, r.item_name, r.unit, u.full_name AS created_by,
   (SELECT b.eq_batch_id FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
     WHERE l.source_table = 'eq_delivery_notes' AND l.source_id = dn.delivery_note_id AND b.status IN ('Generated','Paid') ORDER BY b.eq_batch_id DESC LIMIT 1) AS in_batch_id,
   (SELECT IF(b.status = 'Paid', 'Paid', IF(b.is_finalized = 1, 'Finalized', 'Draft')) FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id

@@ -37,6 +37,7 @@ exports.updateType = async (req, res) => {
     if (!before) throw AppError.notFound('Type');
     const keys = Object.keys(d);
     if (keys.length) await conn.execute(`UPDATE eq_types SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE type_id = ?`, [...keys.map((k) => (k === 'is_active' ? (d[k] ? 1 : 0) : d[k])), id]);
+    if (d.type_name !== undefined && d.type_name !== before.type_name) await C.refreshTypeLabels(conn, id);
     const [[after]] = await conn.execute('SELECT * FROM eq_types WHERE type_id = ?', [id]);
     await audit.log(conn, { table: 'eq_types', id, action: 'update', oldValues: before, newValues: after, ...audit.ctx(req) });
     return after;
@@ -113,6 +114,7 @@ exports.createMachine = async (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [code, d.vendor_id, d.type_id, d.make || null, d.model || null, d.plate_number || null, d.serial_number || null,
         d.manufacture_year || null, d.capacity || null, d.notes || null, req.user.user_id]);
+    await C.assignTypeSeq(conn, r.insertId); // "Excavator #3": next number of this vendor + type
     const created = await C.loadMachine(conn, r.insertId);
     await audit.log(conn, { table: 'eq_equipment', id: r.insertId, action: 'create', newValues: created, ...audit.ctx(req) });
     return created;
@@ -155,7 +157,12 @@ exports.updateMachine = async (req, res) => {
       await C.loadVendor(conn, d.vendor_id);
     }
     const keys = Object.keys(d);
+    const regroup = (d.vendor_id && d.vendor_id !== before.vendor_id) || (d.type_id && d.type_id !== before.type_id);
+    // the old number must not collide with a machine of the new vendor / type (unique per vendor + type)
+    if (regroup) await conn.execute('UPDATE eq_equipment SET type_seq = NULL WHERE equipment_id = ?', [id]);
     if (keys.length) await conn.execute(`UPDATE eq_equipment SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE equipment_id = ?`, [...keys.map((k) => d[k]), id]);
+    // another vendor or type: the machine takes the next number there (its old number is not reused)
+    if (regroup) await C.assignTypeSeq(conn, id);
     const after = await C.loadMachine(conn, id);
     await audit.log(conn, { table: 'eq_equipment', id, action: 'update', oldValues: before, newValues: after, ...audit.ctx(req) });
     return after;

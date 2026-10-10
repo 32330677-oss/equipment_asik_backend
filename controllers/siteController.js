@@ -78,7 +78,7 @@ exports.get = async (req, res) => {
     `SELECT ss.*, u.full_name, u.username FROM site_supervisors ss JOIN users u ON u.user_id = ss.user_id
      WHERE ss.site_id = ? AND ${activeOnSql('ss', 'from_date', 'to_date')} ORDER BY ss.shift_type`, [id, today, today]);
   const [machines] = await pool.execute(
-    `SELECT a.eq_assignment_id, a.shift_type, a.assigned_date, a.unassigned_date, e.equipment_id, e.equipment_code, t.type_name, v.vendor_name
+    `SELECT a.eq_assignment_id, a.shift_type, a.assigned_date, a.unassigned_date, e.equipment_id, e.equipment_code, e.machine_label, t.type_name, v.vendor_name
      FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id
      JOIN eq_types t ON t.type_id = e.type_id JOIN eq_vendors v ON v.vendor_id = e.vendor_id
      WHERE a.site_id = ? AND ${activeOnSql('a', 'assigned_date', 'unassigned_date')} ORDER BY e.equipment_code`, [id, today, today]);

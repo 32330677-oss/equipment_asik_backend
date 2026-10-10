@@ -12,7 +12,7 @@ const lock = require('../../services/equipment/eqLock');
 const FV = require('../../services/equipment/eqFileVersions');
 const DNR = require('../../services/equipment/eqDnr');
 
-const SUPERVISOR_FUEL_COLS = 'f.fuel_issue_id, f.equipment_id, f.site_id, f.issue_date, f.liters, f.receipt_number, f.is_cancelled, e.equipment_code, s.site_code';
+const SUPERVISOR_FUEL_COLS = 'f.fuel_issue_id, f.equipment_id, f.site_id, f.issue_date, f.liters, f.receipt_number, f.is_cancelled, e.equipment_code, e.machine_label, s.site_code';
 
 exports.listFuel = async (req, res) => {
   const where = []; const params = [];
@@ -24,7 +24,7 @@ exports.listFuel = async (req, res) => {
   if (req.query.vendor_id) f('e.vendor_id = ?', Number(req.query.vendor_id));
   if (req.query.unpriced === 'true') where.push('f.price_per_liter IS NULL AND f.is_cancelled = 0');
   const [rows] = await pool.query(
-    `SELECT f.*, e.equipment_code, s.site_code, vd.vendor_name, u.full_name AS issued_by
+    `SELECT f.*, e.equipment_code, e.machine_label, s.site_code, vd.vendor_name, u.full_name AS issued_by
      FROM eq_fuel_issues f JOIN eq_equipment e ON e.equipment_id = f.equipment_id JOIN sites s ON s.site_id = f.site_id
      JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id JOIN users u ON u.user_id = f.issued_by_user_id
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY f.issue_date DESC, f.fuel_issue_id DESC LIMIT 1000`, params);
@@ -52,7 +52,7 @@ exports.createFuel = async (req, res) => {
       [d.equipment_id, d.site_id, d.issue_date, d.liters, d.price_per_liter ?? null, d.receipt_number || null, req.user.user_id]);
     await audit.log(conn, { table: 'eq_fuel_issues', id: r.insertId, action: 'create', newValues: d, ...audit.ctx(req) });
     const [[out]] = await conn.query(
-      `SELECT ${req.user.role === 'Supervisor' ? SUPERVISOR_FUEL_COLS : 'f.*, e.equipment_code, s.site_code'} FROM eq_fuel_issues f
+      `SELECT ${req.user.role === 'Supervisor' ? SUPERVISOR_FUEL_COLS : 'f.*, e.equipment_code, e.machine_label, s.site_code'} FROM eq_fuel_issues f
        JOIN eq_equipment e ON e.equipment_id = f.equipment_id JOIN sites s ON s.site_id = f.site_id WHERE f.fuel_issue_id = ?`, [r.insertId]);
     return out;
   });
@@ -166,7 +166,7 @@ exports.listAdjustments = async (req, res) => {
   if (req.query.vendor_id) f('e.vendor_id = ?', Number(req.query.vendor_id));
   if (req.query.status) f('a.status = ?', String(req.query.status));
   const [rows] = await pool.query(
-    `SELECT a.*, e.equipment_code, vd.vendor_name, s.site_code, u.full_name AS created_by, ni.invoice_no AS correction_note_no,
+    `SELECT a.*, e.equipment_code, e.machine_label, vd.vendor_name, s.site_code, u.full_name AS created_by, ni.invoice_no AS correction_note_no,
        (SELECT b.eq_batch_id FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
          WHERE l.source_table = 'eq_adjustments' AND l.source_id = a.adjustment_id AND b.status IN ('Generated','Paid') ORDER BY b.eq_batch_id DESC LIMIT 1) AS in_batch_id
      FROM eq_adjustments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id

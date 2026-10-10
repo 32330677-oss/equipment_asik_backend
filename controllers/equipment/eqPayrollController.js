@@ -38,7 +38,7 @@ async function namesFor(conn, items) {
   const eq = [...new Set(items.map((i) => i.equipment_id))];
   const names = { eq: {}, site: {}, vendor: {} };
   if (!eq.length) return names;
-  const [e] = await conn.query('SELECT e.equipment_id, e.equipment_code, t.type_name FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)', [eq]);
+  const [e] = await conn.query('SELECT e.equipment_id, e.equipment_code, e.machine_label, t.type_name FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)', [eq]);
   for (const r of e) names.eq[r.equipment_id] = r;
   const [s] = await conn.query('SELECT site_id, site_code, site_name FROM sites WHERE site_id IN (?)', [[...new Set(items.flatMap((i) => [i.site_id, ...(i.site_allocation || []).map((a) => a.site_id)]))]]);
   for (const r of s) names.site[r.site_id] = r;
@@ -49,7 +49,7 @@ async function namesFor(conn, items) {
 
 function itemView(it, names) {
   return {
-    equipment_id: it.equipment_id, equipment_code: names.eq[it.equipment_id]?.equipment_code, type_name: names.eq[it.equipment_id]?.type_name,
+    equipment_id: it.equipment_id, equipment_code: names.eq[it.equipment_id]?.equipment_code, machine_label: names.eq[it.equipment_id]?.machine_label || null, type_name: names.eq[it.equipment_id]?.type_name,
     vendor_id: it.vendor_id, vendor_name: names.vendor[it.vendor_id]?.vendor_name, site_id: it.site_id, site_code: names.site[it.site_id]?.site_code,
     currency: it.currency, billing_mode: it.billing_mode, rate_card_id: it.rate_card_id,
     days_recorded: it.days_recorded, worked_days: it.worked_days, work_hours: hoursOf(it.work_minutes), overtime_hours: hoursOf(it.overtime_minutes),
@@ -96,14 +96,14 @@ exports.blockers = async (req, res) => {
 async function labelsFor(conn, items) {
   const eq = [...new Set(items.map((i) => i.equipment_id))];
   const [e] = await conn.query(
-    `SELECT e.equipment_id, e.equipment_code, e.plate_number, e.make, e.model, t.type_name, t.type_name_ar, vd.vendor_id, vd.vendor_name, vd.vendor_code, vd.tax_number, vd.vendor_type, vd.national_id
+    `SELECT e.equipment_id, e.equipment_code, e.machine_label, e.plate_number, e.make, e.model, t.type_name, t.type_name_ar, vd.vendor_id, vd.vendor_name, vd.vendor_code, vd.tax_number, vd.vendor_type, vd.national_id
      FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id WHERE e.equipment_id IN (?)`, [eq]);
   const [st] = await conn.query('SELECT site_id, site_code, site_name, project_name FROM sites WHERE site_id IN (?)', [[...new Set(items.map((i) => i.site_id))]]);
   const E = Object.fromEntries(e.map((x) => [x.equipment_id, x])); const S = Object.fromEntries(st.map((x) => [x.site_id, x]));
   return (it) => {
     const m = E[it.equipment_id] || {}; const si = S[it.site_id] || {};
     return {
-      equipment_code: m.equipment_code, plate_number: m.plate_number, type_name: m.type_name, type_name_ar: m.type_name_ar, make: m.make, model: m.model,
+      equipment_code: m.equipment_code, machine_label: m.machine_label || null, plate_number: m.plate_number, type_name: m.type_name, type_name_ar: m.type_name_ar, make: m.make, model: m.model,
       vendor_name: m.vendor_name, vendor_code: m.vendor_code, vendor_tax_number: m.tax_number, vendor_type: m.vendor_type, vendor_national_id: m.national_id, site_code: si.site_code, site_name: si.site_name,
       project_name: si.project_name, contract_number: it.rate_snapshot && it.rate_snapshot.contract_number,
     };
@@ -248,7 +248,7 @@ async function assertNoCorrections(conn, batchId) {
 async function batchDetail(conn, id) {
   const batch = await loadBatch(conn, id);
   const [items] = await conn.execute(
-    `SELECT i.*, e.equipment_code, t.type_name, vd.vendor_name, vd.vendor_code, s.site_code, s.site_name
+    `SELECT i.*, e.equipment_code, e.machine_label, t.type_name, vd.vendor_name, vd.vendor_code, s.site_code, s.site_name
      FROM eq_payroll_items i JOIN eq_equipment e ON e.equipment_id = i.equipment_id JOIN eq_types t ON t.type_id = e.type_id
      JOIN eq_vendors vd ON vd.vendor_id = i.vendor_id JOIN sites s ON s.site_id = i.site_id
      WHERE i.eq_batch_id = ? ORDER BY vd.vendor_name, e.equipment_code, s.site_code`, [id]);
@@ -357,7 +357,7 @@ exports.rows = async (req, res) => {
   const params = [id]; let extra = '';
   if (req.query.equipment_id) { extra = ' AND i.equipment_id = ?'; params.push(Number(req.query.equipment_id)); }
   const [rows] = await pool.query(
-    `SELECT s.*, i.equipment_id, e.equipment_code, i.site_id FROM eq_payroll_attendance_snapshot s JOIN eq_payroll_items i ON i.eq_item_id = s.eq_item_id
+    `SELECT s.*, i.equipment_id, e.equipment_code, e.machine_label, i.site_id FROM eq_payroll_attendance_snapshot s JOIN eq_payroll_items i ON i.eq_item_id = s.eq_item_id
      JOIN eq_equipment e ON e.equipment_id = i.equipment_id WHERE s.eq_batch_id = ?${extra} ORDER BY e.equipment_code, s.record_date`, params);
   res.json({ status: 'success', data: rows });
 };
