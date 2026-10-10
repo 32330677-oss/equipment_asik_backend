@@ -254,7 +254,7 @@ async function modelFromCalc(conn, { kind, scope, items }) {
     work_hours: h(i.work_minutes), overtime_hours: h(i.overtime_minutes), standby_hours: h(i.standby_minutes), breakdown_hours: h(i.breakdown_minutes), topup_hours: h(i.topup_minutes),
     gross_amount: i.gross_cents / 100, deductions_amount: i.deductions_cents / 100, net_amount: i.net_cents / 100,
     lines: i.lines.map((l) => ({ line_type: l.line_type, quantity: l.quantity, unit: l.unit, unit_price: l.unit_price_exact ?? l.unit_price_cents / 100, amount: l.amount_cents / 100, note: l.note || null, source_table: l.source_table, source_id: l.source_id })),
-    rows: i.per_row.map((p) => ({ record_date: p.row.record_date, day_status: p.row.day_status, check_in_time: p.row.check_in_time, check_out_time: p.row.check_out_time, operator_name: p.row.operator_name, work_minutes: p.work, overtime_minutes: p.ot, standby_minutes: p.standby, breakdown_minutes: p.breakdown, topup_minutes: p.topup, meter_start: p.row.meter_start, meter_end: p.row.meter_end, sheet_row_no: p.row.sheet_row_no, paper_status: p.row.paper_status })),
+    rows: i.per_row.map((p) => ({ record_date: p.row.record_date, day_status: p.row.day_status, check_in_time: p.row.check_in_time, check_out_time: p.row.check_out_time, operator_name: p.row.operator_name, not_approved: p.row.status !== undefined && p.row.status !== 'Approved', work_minutes: p.work, overtime_minutes: p.ot, standby_minutes: p.standby, breakdown_minutes: p.breakdown, topup_minutes: p.topup, meter_start: p.row.meter_start, meter_end: p.row.meter_end, sheet_row_no: p.row.sheet_row_no, paper_status: p.row.paper_status })),
   }));
   const sum = (k) => out.reduce((a, i) => a + n(i[k]), 0);
   const batch = {
@@ -303,7 +303,7 @@ function drawMachine(doc, ctx, b, items) {
       continue;
     }
     const rows = it.rows.map((r) => ({
-      date: fmt.dayDate(r.record_date), status: r.day_status, op: r.operator_name || '', in: fmt.time(r.check_in_time), out: fmt.time(r.check_out_time),
+      date: fmt.dayDate(r.record_date), status: `${r.day_status}${r.not_approved ? ' *' : ''}`, op: r.operator_name || '', in: fmt.time(r.check_in_time), out: fmt.time(r.check_out_time),
       work: fmt.hours(r.work_minutes), ot: n(r.overtime_minutes) ? fmt.hours(r.overtime_minutes) : '', sb: n(r.standby_minutes) ? fmt.hours(r.standby_minutes) : '',
       bd: n(r.breakdown_minutes) ? fmt.hours(r.breakdown_minutes) : '', tu: n(r.topup_minutes) ? fmt.hours(r.topup_minutes) : '',
       meter: r.meter_start !== null && r.meter_end !== null && r.meter_start !== undefined ? fmt.num(n(r.meter_end) - n(r.meter_start), 1) : '',
@@ -398,7 +398,7 @@ function drawVendor(doc, ctx, b, items) {
     { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${v.vendor_name}${v.vendor_type === 'Individual' && v.vendor_national_id ? ` | ID ${v.vendor_national_id}` : ''}` },
     { label: 'Contract(s)', labelAr: 'العقود', value: [...new Set(items.map((i) => (i.rate && i.rate.contract_number) || i.contract_number).filter(Boolean))].join(', ') || '-' },
     { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
-    { label: 'Issued', labelAr: 'تاريخ الإصدار', value: final && b.finalized_at ? fmt.date(String(b.finalized_at).slice(0, 10)) : `${ctx.printedAt} (draft)` },
+    { label: 'Issued', labelAr: 'تاريخ الإصدار', value: final && b.finalized_at ? fmt.date(String(b.finalized_at).slice(0, 10)) : (b.unapproved_rows ? `${b.unapproved_rows} day(s) NOT APPROVED yet` : `${ctx.printedAt} (draft)`) },
   ], y, 4);
   y = sectionTitle(doc, y, '1. Machines summary', 'ملخص الآليات');
   const fuelOf = (it) => it.lines.filter((l) => l.line_type === 'Fuel').reduce((a, l) => a + n(l.amount), 0);
@@ -581,10 +581,12 @@ async function render(conn, model, opts, user) {
     drawSummary(doc, ctx, b, items);
     fileName = `equipment-payroll-summary-${tag}.pdf`;
   }
-  if (b.provisional) watermark(doc, 'PROVISIONAL - NOT AN INVOICE');
+  if (b.provisional && b.unapproved_rows) watermark(doc, 'PROVISIONAL - INCLUDES DAYS NOT APPROVED');
+  else if (b.provisional) watermark(doc, 'PROVISIONAL - NOT AN INVOICE');
   else if (b.status === 'Voided' || b.status === 'Superseded') watermark(doc, b.status.toUpperCase());
   else if (!b.is_finalized) watermark(doc, 'DRAFT - NOT FINAL');
-  P.footers(doc, `${ctx.company} | Equipment Flow | printed ${ctx.printedAt} by ${ctx.printedBy}`);
+  const unapprovedNote = b.provisional && b.unapproved_rows ? ` | * ${b.unapproved_rows} day(s) not approved yet` : '';
+  P.footers(doc, `${ctx.company} | Equipment Flow | printed ${ctx.printedAt} by ${ctx.printedBy}${unapprovedNote}`);
   return { buffer: await P.toBuffer(doc), fileName: fileName.replace(/[^A-Za-z0-9._-]/g, '_') };
 }
 
@@ -599,6 +601,7 @@ async function batchPdf(conn, detail, opts, user) {
 
 async function provisionalPdf(conn, calc, user) {
   const model = await modelFromCalc(conn, calc);
+  model.batch.unapproved_rows = calc.unapproved || 0;
   return render(conn, model, { view: calc.kind === 'machine' ? 'machine' : 'vendor' }, user);
 }
 

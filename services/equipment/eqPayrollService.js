@@ -407,6 +407,7 @@ const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MA
 /** Shown with the blockers but never prevent generating. */
 const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING', 'IN_CLOSED_PERIOD', 'MONTHLY_DAYS_WITHOUT_ROWS'];
 
+/* include_submitted (provisional statements ONLY, never preview / generate): Submitted rows not approved yet are counted too. */
 /**
  * Full calculation for a scope. Returns { currency_groups, items (with lines, rows), warnings, blockers }.
  * Nothing is written.
@@ -420,7 +421,7 @@ async function calculate(conn, scope) {
   let [rows] = await conn.query(
     `SELECT ea.*, e.vendor_id, e.equipment_code, o.full_name AS operator_name FROM eq_attendance ea
      JOIN eq_equipment e ON e.equipment_id = ea.equipment_id LEFT JOIN eq_operators o ON o.operator_id = ea.operator_id
-     WHERE ea.record_date BETWEEN ? AND ? AND ea.status = 'Approved' ${requirePaper ? "AND ea.paper_status = 'Matched'" : ''}${s.sql}
+     WHERE ea.record_date BETWEEN ? AND ? AND ${scope.include_submitted ? "ea.status IN ('Approved','Submitted')" : "ea.status = 'Approved'"} ${requirePaper ? "AND ea.paper_status = 'Matched'" : ''}${s.sql}
        AND NOT EXISTS (SELECT 1 FROM eq_payroll_attendance_snapshot ps JOIN eq_payroll_batches b ON b.eq_batch_id = ps.eq_batch_id
          WHERE ps.eq_attendance_id = ea.eq_attendance_id AND ${ACTIVE_BATCH}${scope.exclude_batch_id ? ' AND b.eq_batch_id <> ?' : ''})
      ORDER BY ea.equipment_id, ea.site_id, ea.record_date${scope.lock ? ' FOR UPDATE' : ''}`,

@@ -820,12 +820,30 @@ exports.exportXlsx = async (req, res) => {
 /** Provisional statement (no batch): machine or vendor, any period. */
 async function provisional(req, res, kind) {
   const id = parseId(req.params.id);
-  const q = validate(req.query, { from: v.date({ required: true }), to: v.date({ required: true }), currency: v.currency() });
-  const scope = { start_date: q.from, end_date: q.to, [kind === 'machine' ? 'equipment_id' : 'vendor_id']: id };
+  const q = validate(req.query, {
+    from: v.date({ required: true }), to: v.date({ required: true }), currency: v.currency(),
+    // to see the amounts before the office approves: Submitted days are counted too, and marked on the PDF
+    include_unapproved: v.bool({ default: false }),
+  });
+  const scope = { start_date: q.from, end_date: q.to, [kind === 'machine' ? 'equipment_id' : 'vendor_id']: id, include_submitted: q.include_unapproved };
   const { items } = await P.calculate(pool, scope);
   const chosen = pickCurrency(items, q.currency);
-  if (!chosen.length) throw AppError.conflict('NOTHING_TO_PAY', 'Nothing payable in this period.');
-  const { buffer, fileName } = await statements.provisionalPdf(pool, { kind, scope, items: chosen }, req.user);
+  if (!chosen.length) {
+    // say why: usually the days are recorded but not approved yet
+    const where = kind === 'machine' ? 'e.equipment_id = ?' : 'e.vendor_id = ?';
+    const [[w]] = await pool.query(
+      `SELECT SUM(ea.status = 'Submitted') AS submitted, SUM(ea.status IN ('Draft','Rejected')) AS drafts, MIN(ea.record_date) AS first_day, MAX(ea.record_date) AS last_day
+       FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id WHERE ${where} AND ea.record_date BETWEEN ? AND ? AND ea.status IN ('Draft','Submitted','Rejected')`,
+      [id, q.from, q.to]);
+    const sub = Number(w.submitted || 0); const dr = Number(w.drafts || 0);
+    if (!q.include_unapproved && sub > 0) {
+      throw AppError.conflict('NOTHING_APPROVED', `Nothing approved yet in this period: ${sub} day(s) are waiting for the office's approval (${String(w.first_day).slice(0, 10)} to ${String(w.last_day).slice(0, 10)}). Approve them in Attendance review, or open the statement again with "Include days not approved yet".`, { submitted: sub, drafts: dr });
+    }
+    if (dr > 0) throw AppError.conflict('NOTHING_SUBMITTED', `Nothing to count yet: ${dr} day(s) are still Draft (not submitted by the supervisor).`, { drafts: dr });
+    throw AppError.conflict('NOTHING_TO_PAY', 'Nothing payable in this period (no recorded day, or already in a payroll batch).');
+  }
+  const unapproved = q.include_unapproved ? chosen.reduce((a, it) => a + (it.per_row || []).filter((p) => p.row && p.row.status !== 'Approved').length, 0) : 0;
+  const { buffer, fileName } = await statements.provisionalPdf(pool, { kind, scope, items: chosen, unapproved }, req.user);
   res.set('Content-Type', 'application/pdf');
   res.set('Content-Disposition', `inline; filename="${fileName}"`);
   res.send(buffer);
