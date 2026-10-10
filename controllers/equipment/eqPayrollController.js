@@ -96,7 +96,7 @@ exports.blockers = async (req, res) => {
 async function labelsFor(conn, items) {
   const eq = [...new Set(items.map((i) => i.equipment_id))];
   const [e] = await conn.query(
-    `SELECT e.equipment_id, e.equipment_code, e.plate_number, e.make, e.model, t.type_name, t.type_name_ar, vd.vendor_id, vd.vendor_name, vd.vendor_code, vd.tax_number
+    `SELECT e.equipment_id, e.equipment_code, e.plate_number, e.make, e.model, t.type_name, t.type_name_ar, vd.vendor_id, vd.vendor_name, vd.vendor_code, vd.tax_number, vd.vendor_type, vd.national_id
      FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id WHERE e.equipment_id IN (?)`, [eq]);
   const [st] = await conn.query('SELECT site_id, site_code, site_name, project_name FROM sites WHERE site_id IN (?)', [[...new Set(items.map((i) => i.site_id))]]);
   const E = Object.fromEntries(e.map((x) => [x.equipment_id, x])); const S = Object.fromEntries(st.map((x) => [x.site_id, x]));
@@ -104,7 +104,7 @@ async function labelsFor(conn, items) {
     const m = E[it.equipment_id] || {}; const si = S[it.site_id] || {};
     return {
       equipment_code: m.equipment_code, plate_number: m.plate_number, type_name: m.type_name, type_name_ar: m.type_name_ar, make: m.make, model: m.model,
-      vendor_name: m.vendor_name, vendor_code: m.vendor_code, vendor_tax_number: m.tax_number, site_code: si.site_code, site_name: si.site_name,
+      vendor_name: m.vendor_name, vendor_code: m.vendor_code, vendor_tax_number: m.tax_number, vendor_type: m.vendor_type, vendor_national_id: m.national_id, site_code: si.site_code, site_name: si.site_name,
       project_name: si.project_name, contract_number: it.rate_snapshot && it.rate_snapshot.contract_number,
     };
   };
@@ -518,7 +518,7 @@ exports.reversePayment = async (req, res) => {
 exports.voucherPdf = async (req, res) => {
   const pid = parseId(req.params.id);
   const [[p]] = await pool.execute(
-    `SELECT p.*, u.full_name AS created_by, r.full_name AS reversed_by, vd.vendor_name, vd.vendor_code, vd.tax_number, b.start_date, b.end_date, b.version_number, i.invoice_no
+    `SELECT p.*, u.full_name AS created_by, r.full_name AS reversed_by, vd.vendor_name, vd.vendor_code, vd.tax_number, vd.vendor_type, vd.national_id, b.start_date, b.end_date, b.version_number, i.invoice_no
      FROM eq_payments p JOIN users u ON u.user_id = p.created_by_user_id LEFT JOIN users r ON r.user_id = p.reversed_by_user_id
      JOIN eq_vendors vd ON vd.vendor_id = p.vendor_id JOIN eq_payroll_batches b ON b.eq_batch_id = p.eq_batch_id
      LEFT JOIN eq_invoices i ON i.invoice_id = p.invoice_id WHERE p.payment_id = ?`, [pid]);

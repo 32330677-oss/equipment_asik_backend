@@ -1,4 +1,4 @@
-// Vendors (companies renting machines to us) and their rental contracts.
+// Vendors (companies or individuals renting machines to us) and their rental contracts.
 const { pool, withTransaction } = require('../../config/db');
 const AppError = require('../../utils/AppError');
 const { v, validate, parseId } = require('../../utils/validate');
@@ -12,11 +12,14 @@ const FV = require('../../services/equipment/eqFileVersions');
 
 const VENDOR_FIELDS = {
   vendor_name: v.string({ max: 255 }),
+  // 015: a person with one machine and no company is an Individual (national ID instead of tax number)
+  vendor_type: v.enumOf(['Company', 'Individual']),
   contact_person: v.string({ max: 255 }),
   phone_number: v.string({ max: 50 }),
   email: v.string({ max: 255, pattern: /^[^@\s]+@[^@\s]+\.[^@\s]+$/, patternMessage: 'must be a valid email' }),
   address: v.string({ max: 500 }),
   tax_number: v.string({ max: 100 }),
+  national_id: v.string({ max: 100 }),
   notes: v.string({ max: 5000 }),
 };
 
@@ -45,10 +48,10 @@ exports.create = async (req, res) => {
   const vendor = await withTransaction(async (conn) => {
     const code = await C.nextCode(conn, 'eq_vendors', 'vendor_code', 'VND-', 3);
     const [r] = await conn.execute(
-      `INSERT INTO eq_vendors (vendor_code, vendor_name, contact_person, phone_number, email, address, tax_number, notes, created_by_user_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [code, data.vendor_name, data.contact_person || null, data.phone_number || null, data.email || null,
-        data.address || null, data.tax_number || null, data.notes || null, req.user.user_id]);
+      `INSERT INTO eq_vendors (vendor_code, vendor_name, vendor_type, contact_person, phone_number, email, address, tax_number, national_id, notes, created_by_user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [code, data.vendor_name, data.vendor_type || 'Company', data.contact_person || null, data.phone_number || null, data.email || null,
+        data.address || null, data.tax_number || null, data.national_id || null, data.notes || null, req.user.user_id]);
     const created = await C.loadVendor(conn, r.insertId);
     await audit.log(conn, { table: 'eq_vendors', id: r.insertId, action: 'create', newValues: created, ...audit.ctx(req) });
     return created;

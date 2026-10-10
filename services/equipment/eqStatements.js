@@ -390,7 +390,7 @@ function drawVendor(doc, ctx, b, items) {
     right: numberBlock(doc, b, final ? v.vendor_invoice_no : null, cur),
   });
   y = P.infoGrid(doc, [
-    { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: v.vendor_name },
+    { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${v.vendor_name}${v.vendor_type === 'Individual' && v.vendor_national_id ? ` | ID ${v.vendor_national_id}` : ''}` },
     { label: 'Contract(s)', labelAr: 'العقود', value: [...new Set(items.map((i) => (i.rate && i.rate.contract_number) || i.contract_number).filter(Boolean))].join(', ') || '-' },
     { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
     { label: 'Issued', labelAr: 'تاريخ الإصدار', value: final && b.finalized_at ? fmt.date(String(b.finalized_at).slice(0, 10)) : `${ctx.printedAt} (draft)` },
@@ -733,7 +733,10 @@ async function voucherPdf(conn, p, user) {
     { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(p.start_date)} - ${fmt.date(p.end_date)}` },
     { label: 'Method', labelAr: 'طريقة الدفع', value: METHOD_TEXT[p.method] || p.method },
     { label: 'Reference', labelAr: 'المرجع', value: p.reference || '-' },
-    { label: 'Tax number', labelAr: 'الرقم الضريبي', value: p.tax_number || '-' },
+    // an individual (no company) is identified by the ID card, a company by its tax number
+    p.vendor_type === 'Individual'
+      ? { label: 'National ID', labelAr: 'رقم الهوية', value: p.national_id || '-' }
+      : { label: 'Tax number', labelAr: 'الرقم الضريبي', value: p.tax_number || '-' },
     { label: 'Recorded by', labelAr: 'نظم بواسطة', value: `${p.created_by} ${String(p.created_at).slice(0, 16)}` },
   ], y, 4);
   y += 6;
