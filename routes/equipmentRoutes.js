@@ -19,6 +19,7 @@ const fuel = require('../controllers/equipment/eqFuelAdjustmentController');
 const ts = require('../controllers/equipment/timesheetController');
 const pay = require('../controllers/equipment/eqPayrollController');
 const liveC = require('../controllers/equipment/eqLiveController');
+const clientRep = require('../controllers/equipment/clientReportController');
 const AS = requireRole('Admin', 'Supervisor');
 const fd = require('../controllers/equipment/eqFuelDiffController');
 const dnr = require('../controllers/equipment/dnrController');
@@ -200,6 +201,7 @@ router.get('/statements/vendor/:id.pdf', AC, pay.provisionalVendor);
 router.get('/live', ACS, liveC.live);
 router.get('/live/sites/:siteId', ACS, liveC.liveSite);
 router.get('/reports/daily.pdf', ACS, liveC.dailyPdf);
+router.get('/reports/client-daily.pdf', ACS, clientRep.clientDailyPdf);
 router.get('/reports/utilization', AC, liveC.utilization);
 
 module.exports = router;
