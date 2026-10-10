@@ -1,7 +1,8 @@
 // services/equipment/eqAttendanceService.js — minutes recomputation, anomalies, session rules.
 const AppError = require('../../utils/AppError');
 const settings = require('../settings');
-const { diffMinutes, wallMs } = require('../../utils/dateTime');
+const { diffMinutes, wallMs, datePart, timePart } = require('../../utils/dateTime');
+const { addDays } = require('../../utils/businessDate');
 
 const MAX_SESSION_MINUTES = 24 * 60;
 
@@ -148,6 +149,29 @@ function assertPeriodsValid(periods, checkIn, checkOut) {
   if (open > 1) throw AppError.conflict('DOWNTIME_ALREADY_OPEN', 'Only one downtime period can be open at a time.');
 }
 
+/**
+ * A night shift belongs to the evening it starts: from 12:00 of its date to 11:59 of the next day.
+ * A check-in at 00:30 is still the night of the day before (the paper sheet and the board say so).
+ */
+const NIGHT_DAY_CHANGE = '12:00';
+
+/** The business date of a session from its check-in and shift. */
+function shiftDateOf(checkIn, shift) {
+  const date = datePart(checkIn);
+  return shift === 'Night' && timePart(checkIn) < NIGHT_DAY_CHANGE ? addDays(date, -1) : date;
+}
+
+/** The check-in must fall on the shift of [recordDate] (Day: that date; Night: 12:00 of it to 11:59 of the next day). */
+function assertOnShiftDate(checkIn, shift, recordDate, field = 'check_in_time') {
+  const rd = String(recordDate).slice(0, 10);
+  if (shiftDateOf(checkIn, shift) === rd) return;
+  throw AppError.validation({
+    [field]: shift === 'Night'
+      ? `must be within the night shift of ${rd} (${rd} ${NIGHT_DAY_CHANGE} to ${addDays(rd, 1)} 11:59)`
+      : `must be on ${rd}`,
+  });
+}
+
 /** live_state of a day row (see document 01 §10). */
 function liveState(row, openDowntime) {
   if (!row) return 'NotArrived';
@@ -167,5 +191,5 @@ function liveState(row, openDowntime) {
 
 module.exports = {
   loadRow, loadDowntime, recompute, evaluateAnomalies, assertNoOpenSession, assertNoTimeOverlap,
-  assertSessionLength, assertPeriodsValid, liveState, MAX_SESSION_MINUTES,
+  assertSessionLength, assertPeriodsValid, liveState, MAX_SESSION_MINUTES, shiftDateOf, assertOnShiftDate,
 };

@@ -7,7 +7,6 @@ const { pool } = require('../../config/db');
 const AppError = require('../../utils/AppError');
 const { v, validate } = require('../../utils/validate');
 const { businessToday, businessNow, addDays } = require('../../utils/businessDate');
-const { datePart } = require('../../utils/dateTime');
 const engine = require('./equipmentBillingEngine');
 const P = require('./eqPayrollService');
 const S = require('./eqAttendanceService');
@@ -75,7 +74,7 @@ async function applyChanges(conn, rowId, changes, userId, opts = {}) {
   const fields = ['check_in_time', 'check_out_time', 'operator_id', 'meter_start', 'meter_end', 'work_description', 'remarks'];
   const next = { ...row };
   for (const k of fields) if (changes[k] !== undefined) next[k] = changes[k];
-  if (next.check_in_time && datePart(next.check_in_time) !== String(row.record_date).slice(0, 10)) throw AppError.validation({ check_in_time: `must stay on ${row.record_date}` });
+  if (next.check_in_time) S.assertOnShiftDate(next.check_in_time, row.shift_type, row.record_date);
   const stillOpen = opts.allowOpen && wasOpen && status === 'Working' && next.check_in_time && !next.check_out_time && changes.check_out_time === undefined;
   if (status === 'Working' && (!next.check_in_time || (!next.check_out_time && !stillOpen))) throw AppError.validation({ check_out_time: 'a Working day needs a check-in and a check-out' });
   if (['Absent', 'Holiday'].includes(status) && (next.check_in_time || next.check_out_time)) throw AppError.validation({ check_in_time: `${status} rows have no times` });

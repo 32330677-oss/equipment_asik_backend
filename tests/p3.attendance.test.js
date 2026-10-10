@@ -81,6 +81,24 @@ test('night shift crossing midnight is stored on the check-in date', async () =>
   assert.strictEqual(tooLong.body.code, 'SESSION_TOO_LONG');
 });
 
+test('a night shift that starts after midnight belongs to the evening before; the board date is checked', async () => {
+  const m = await ok(h.api().post('/api/equipment/machines').set(A()).send({ vendor_id: F.vendor.vendor_id, type_id: 6, plate_number: 'N-2' }));
+  await ok(h.api().post('/api/equipment/deployments').set(A()).send({ equipment_id: m.equipment_id, site_id: 9, shift_type: 'Night', assigned_date: '2026-10-01', default_operator_id: F.op1.operator_id }));
+  // no record_date (older app): 00:30 on a night shift is the night of the day before
+  const late = await ok(h.api().post('/api/equipment/attendance/check-in').set(S9()).send({ equipment_id: m.equipment_id, site_id: 9, shift_type: 'Night', check_in_time: '2026-10-12 00:30', check_out_time: '2026-10-12 05:00' }));
+  assert.strictEqual(late.record_date, '2026-10-11');
+  // with the board's date: accepted inside the night window, refused outside it
+  const wrong = await h.api().post('/api/equipment/attendance/check-in').set(S9()).send({ equipment_id: m.equipment_id, site_id: 9, shift_type: 'Night', record_date: '2026-10-13', check_in_time: '2026-10-14 15:00', check_out_time: '2026-10-14 20:00' });
+  assert.strictEqual(wrong.body.code, 'VALIDATION_ERROR');
+  const r = await ok(h.api().post('/api/equipment/attendance/check-in').set(S9()).send({ equipment_id: m.equipment_id, site_id: 9, shift_type: 'Night', record_date: '2026-10-13', check_in_time: '2026-10-14 01:00', check_out_time: '2026-10-14 06:00' }));
+  assert.strictEqual(r.record_date, '2026-10-13');
+  // editing keeps the session on its night: 23:30 of the 13th is fine, 13:00 of the 14th is not
+  const edited = await ok(h.api().patch(`/api/equipment/attendance/${r.eq_attendance_id}`).set(S9()).send({ check_in_time: '2026-10-13 23:30' }));
+  assert.strictEqual(edited.check_in_time.slice(0, 16), '2026-10-13 23:30');
+  const moved = await h.api().patch(`/api/equipment/attendance/${r.eq_attendance_id}`).set(S9()).send({ check_in_time: '2026-10-14 13:00', check_out_time: '2026-10-14 14:00' });
+  assert.strictEqual(moved.body.code, 'VALIDATION_ERROR');
+});
+
 test('anomalies: meter_backwards, meter_mismatch, long_session; an expired licence is NOT an anomaly', async () => {
   const r = await ok(checkIn(S8(), { equipment_id: F.exc.equipment_id, check_in_time: '2026-10-07 07:00', meter_start: 5000 }));
   assert.strictEqual(r.anomaly_code, 'meter_backwards');

@@ -4,7 +4,7 @@ const AppError = require('../../utils/AppError');
 const { v, validate, parseId } = require('../../utils/validate');
 const audit = require('../../services/audit');
 const { businessToday, businessNow, addDays, monthOf, daysBetweenInclusive } = require('../../utils/businessDate');
-const { datePart, addMinutes, wallMs, diffMinutes } = require('../../utils/dateTime');
+const { addMinutes, wallMs, diffMinutes } = require('../../utils/dateTime');
 const { assertCanActOnSite, assertCanViewSite, editDenial, supervisorSitesOn } = require('../../services/siteAccess');
 const settings = require('../../services/settings');
 const C = require('../../services/equipment/eqCommon');
@@ -215,9 +215,13 @@ exports.checkIn = async (req, res) => {
     meter_start: v.number({ min: 0, max: 99999999, decimals: 1 }), remarks: v.string({ max: 2000 }), late_reason: v.string({ max: 1000 }),
     // a past day can be recorded in one go (check-in AND check-out), even when the machine has later sessions
     check_out_time: v.datetime(), meter_end: v.number({ min: 0, max: 99999999, decimals: 1 }),
+    // the day of the board; without it (older apps) it follows from the check-in and the shift
+    record_date: v.date(),
   });
   const lateReason = d.late_reason; delete d.late_reason;
-  const recordDate = datePart(d.check_in_time);
+  // a night shift that starts after midnight still belongs to the evening before
+  const recordDate = d.record_date || S.shiftDateOf(d.check_in_time, d.shift_type); delete d.record_date;
+  S.assertOnShiftDate(d.check_in_time, d.shift_type, recordDate);
   assertNotFutureDate(recordDate);
   assertNotFutureTime(d.check_in_time, 'check_in_time');
   if (d.check_out_time) {
@@ -423,7 +427,7 @@ exports.dayStatus = async (req, res) => {
   if (hasTimes) {
     if (!['Standby', 'Breakdown'].includes(d.day_status)) throw AppError.validation({ check_in_time: `${d.day_status} rows have no times` });
     if (!d.check_in_time || !d.check_out_time) throw AppError.validation({ check_out_time: 'give both times or none' });
-    if (datePart(d.check_in_time) !== d.record_date) throw AppError.validation({ check_in_time: 'must be on record_date' });
+    S.assertOnShiftDate(d.check_in_time, d.shift_type, d.record_date);
     S.assertSessionLength(d.check_in_time, d.check_out_time);
     assertNotFutureTime(d.check_out_time, 'check_out_time');
   }
@@ -482,7 +486,7 @@ async function applyEdit(conn, row, d) {
     }
     if (Boolean(next.check_in_time) !== Boolean(next.check_out_time)) throw AppError.validation({ check_out_time: 'give both times or none' });
   }
-  if (next.check_in_time && datePart(next.check_in_time) !== row.record_date) throw AppError.validation({ check_in_time: `must stay on ${row.record_date}` });
+  if (next.check_in_time) S.assertOnShiftDate(next.check_in_time, row.shift_type, row.record_date);
   if (d.check_in_time) assertNotFutureTime(d.check_in_time, 'check_in_time');
   if (d.check_out_time) assertNotFutureTime(d.check_out_time, 'check_out_time');
   if (next.check_out_time && !next.check_in_time) throw AppError.validation({ check_in_time: 'is required with a check-out' });
