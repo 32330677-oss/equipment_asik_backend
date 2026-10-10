@@ -97,6 +97,17 @@ function header(doc, { title, titleAr, subtitle, right }) {
   return y + 6;
 }
 
+/** Largest font size between [min] and [max] at which [str] fits on one line of [width] (the font of text()). */
+function fitSize(doc, str, width, max, min, bold = false) {
+  const s = str === null || str === undefined ? '' : String(str);
+  const ar = isArabic(s) && doc.hasArabic;
+  const out = ar ? prepArabic(s) : latinSafe(s);
+  doc.font(ar ? 'Arabic' : (bold ? 'Helvetica-Bold' : 'Helvetica'));
+  let size = max;
+  while (size > min && doc.fontSize(size).widthOfString(out, ar ? { features: ['rtla'] } : undefined) > width) size -= 0.25;
+  return size;
+}
+
 /** Info grid: cells [{label, labelAr, value}] in `cols` columns. Returns y below. */
 function infoGrid(doc, cells, y, cols = 4) {
   const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
@@ -106,7 +117,8 @@ function infoGrid(doc, cells, y, cols = 4) {
     doc.rect(x, yy, cw, ch).lineWidth(0.5).strokeColor(COLORS.grid).stroke();
     text(doc, c.label, x + 4, yy + 3, { size: 6.5, color: COLORS.muted, width: cw / 2, lineBreak: false });
     if (c.labelAr) text(doc, c.labelAr, x + cw / 2, yy + 1, { size: 6.5, color: COLORS.muted, width: cw / 2 - 4, align: 'right', lineBreak: false });
-    text(doc, c.value, x + 4, yy + 12, { size: 8.5, bold: true, width: cw - 8, lineBreak: false });
+    // a long value (site or vendor name...) stays on ONE line inside its box: smaller font first, then cut with "..."
+    text(doc, c.value, x + 4, yy + 12, { size: fitSize(doc, c.value, cw - 8, 8.5, 6.5, true), bold: true, width: cw - 8, height: ch - 12, lineBreak: false });
   });
   return y + Math.ceil(cells.length / cols) * ch + 6;
 }
