@@ -481,6 +481,17 @@ Generate algorithm (transaction):
 
 `stale = true` on a non-finalized batch when any snapshot row was edited after `generated_at` (compare `eq_attendance.updated_at`) — UI shows "Recalculate" (void + generate).
 
+### Opening balances (014)
+
+| Method | Path | Roles | Purpose |
+|---|---|---|---|
+| GET | `/opening-balances?vendor_id=&status=` | A, C | List with `state` = `Open` / `Carried` (with `carried_to_batch_id`) / `Cancelled` |
+| POST | `/vendors/:id/opening-balances` | A, C | `{amount, as_of_date, description, currency?, equipment_id?, period_from?, period_to?, reference?, note?}` — currency defaults to the vendor's only contract currency |
+| PUT | `/opening-balances/:id` | A, C | Change while `Open` (409 `OPENING_BALANCE_CARRIED` once carried) |
+| PATCH | `/opening-balances/:id/cancel` | A, C | `{reason}` (≥ 5 chars), while `Open` |
+
+`POST /payroll/preview` lists open opening balances in `carry_forward` (`kind: "opening"`, `opening_balance_id`, `description`); `generate` with `carry_forward: true` carries them with the batch balances.
+
 ## 5.9b Correction policy (decisions of 6 Oct 2026)
 
 Principle: **not financially committed → normal correction path; finalized or paid → official Correction path.** A finalized

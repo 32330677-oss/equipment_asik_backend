@@ -8,6 +8,8 @@
 // * "Add previous balances" on New payroll moves the unpaid balance of an older finalized batch into the new one
 //   (eq_payment_carryovers). The old batch is then closed as "carried forward" (balance 0, no more payments there);
 //   voiding the new batch releases the carry and the old balance is open again.
+// * An OPENING BALANCE (eq_opening_balances, money owed from before the system) is carried the same way: the carry row has
+//   opening_balance_id instead of from_batch_id, and the statement of account prints it on its own line.
 // * The batch status follows the money: 'Paid' when every vendor balance is 0 (or below) and nothing was carried out;
 //   back to 'Generated' (finalized, waiting for payment) when a payment is reversed.
 // * Batches marked paid before payments existed (status 'Paid', no payment row) are kept as fully paid (legacy).
@@ -40,9 +42,13 @@ async function balances(conn, batch) {
     `SELECT i.vendor_id, vd.vendor_name, vd.vendor_code, SUM(i.net_amount) AS net FROM eq_payroll_items i JOIN eq_vendors vd ON vd.vendor_id = i.vendor_id
      WHERE i.eq_batch_id = ? GROUP BY i.vendor_id, vd.vendor_name, vd.vendor_code`, [id]);
   const [cin] = await conn.execute(
-    `SELECT c.*, b.start_date, b.end_date, b.version_number,
-       (SELECT x.invoice_no FROM eq_invoices x WHERE x.eq_batch_id = c.from_batch_id AND x.kind = 'Vendor' AND x.vendor_id = c.vendor_id ORDER BY x.invoice_id DESC LIMIT 1) AS invoice_no
-     FROM eq_payment_carryovers c JOIN eq_payroll_batches b ON b.eq_batch_id = c.from_batch_id WHERE c.to_batch_id = ? AND c.status = 'Active' ORDER BY c.carryover_id`, [id]);
+    `SELECT c.*, COALESCE(b.start_date, ob.period_from) AS start_date, COALESCE(b.end_date, ob.period_to) AS end_date, b.version_number,
+       ob.as_of_date, ob.description AS ob_description, ob.reference AS ob_reference, e.equipment_code AS ob_equipment_code,
+       COALESCE((SELECT x.invoice_no FROM eq_invoices x WHERE x.eq_batch_id = c.from_batch_id AND x.kind = 'Vendor' AND x.vendor_id = c.vendor_id ORDER BY x.invoice_id DESC LIMIT 1),
+         ob.reference) AS invoice_no
+     FROM eq_payment_carryovers c LEFT JOIN eq_payroll_batches b ON b.eq_batch_id = c.from_batch_id
+     LEFT JOIN eq_opening_balances ob ON ob.opening_balance_id = c.opening_balance_id LEFT JOIN eq_equipment e ON e.equipment_id = ob.equipment_id
+     WHERE c.to_batch_id = ? AND c.status = 'Active' ORDER BY c.carryover_id`, [id]);
   const [cout] = await conn.execute(
     `SELECT c.*, b.start_date, b.end_date, b.status AS to_status, b.is_finalized AS to_finalized
      FROM eq_payment_carryovers c JOIN eq_payroll_batches b ON b.eq_batch_id = c.to_batch_id WHERE c.from_batch_id = ? AND c.status = 'Active' ORDER BY c.carryover_id`, [id]);
@@ -66,7 +72,9 @@ async function balances(conn, batch) {
   for (const c of cin) {
     const x = get(c.vendor_id);
     x.carried_in += cents(c.amount);
-    x.carried_in_detail.push({ carryover_id: c.carryover_id, from_batch_id: c.from_batch_id, start_date: day(c.start_date), end_date: day(c.end_date), invoice_no: c.invoice_no || null, amount: toDecimalString(cents(c.amount)) });
+    x.carried_in_detail.push({ carryover_id: c.carryover_id, from_batch_id: c.from_batch_id, start_date: day(c.start_date), end_date: day(c.end_date), invoice_no: c.invoice_no || null, amount: toDecimalString(cents(c.amount)),
+      kind: c.opening_balance_id ? 'opening' : 'batch', opening_balance_id: c.opening_balance_id || null, as_of_date: day(c.as_of_date),
+      description: c.ob_description || null, equipment_code: c.ob_equipment_code || null });
   }
   for (const c of cout) {
     const x = get(c.vendor_id);
@@ -244,6 +252,18 @@ async function carryCandidates(conn, { vendorIds, currency, beforeDate, excludeB
         amount: toDecimalString(x._balance), start_date: day(b.start_date), end_date: day(b.end_date), invoice_no: x.invoice_no, currency });
     }
   }
+  // opening balances (money owed from before the system) that are not carried into an active batch yet
+  const [obs] = await conn.query(
+    `SELECT ob.*, vd.vendor_name, e.equipment_code FROM eq_opening_balances ob JOIN eq_vendors vd ON vd.vendor_id = ob.vendor_id
+     LEFT JOIN eq_equipment e ON e.equipment_id = ob.equipment_id
+     WHERE ob.status = 'Active' AND ob.currency = ? AND ob.as_of_date < ? AND ob.vendor_id IN (?)
+       AND NOT EXISTS (SELECT 1 FROM eq_payment_carryovers c WHERE c.opening_balance_id = ob.opening_balance_id AND c.status = 'Active')
+     ORDER BY ob.as_of_date, ob.opening_balance_id${lock ? ' FOR UPDATE' : ''}`, [currency, beforeDate, vendorIds]);
+  for (const ob of obs) {
+    out.push({ from_batch_id: null, opening_balance_id: ob.opening_balance_id, kind: 'opening', vendor_id: ob.vendor_id, vendor_name: ob.vendor_name,
+      amount_cents: cents(ob.amount), amount: toDecimalString(cents(ob.amount)), start_date: day(ob.period_from), end_date: day(ob.period_to),
+      as_of_date: day(ob.as_of_date), description: ob.description, equipment_code: ob.equipment_code || null, invoice_no: ob.reference || null, currency });
+  }
   return out;
 }
 
@@ -253,8 +273,8 @@ async function applyCarryForward(conn, { toBatchId, vendorIds, currency, beforeD
   const now = businessNow();
   for (const c of list) {
     const [r] = await conn.execute(
-      'INSERT INTO eq_payment_carryovers (from_batch_id, to_batch_id, vendor_id, currency, amount, created_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [c.from_batch_id, toBatchId, c.vendor_id, currency, toDecimalString(c.amount_cents), userId, now]);
+      'INSERT INTO eq_payment_carryovers (from_batch_id, opening_balance_id, to_batch_id, vendor_id, currency, amount, created_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [c.from_batch_id || null, c.opening_balance_id || null, toBatchId, c.vendor_id, currency, toDecimalString(c.amount_cents), userId, now]);
     await audit.log(conn, { table: 'eq_payment_carryovers', id: r.insertId, action: 'carry_forward', newValues: { ...c, to_batch_id: toBatchId },
       relatedType: 'eq_payroll_batches', relatedId: toBatchId, userId, ip });
   }
@@ -267,8 +287,10 @@ async function releaseCarryIns(conn, batchId, { reason, userId, ip = null }) {
   for (const c of rows) {
     await conn.execute("UPDATE eq_payment_carryovers SET status = 'Released', released_reason = ?, released_by_user_id = ?, released_at = ? WHERE carryover_id = ?",
       [String(reason || '').slice(0, 500), userId, businessNow(), c.carryover_id]);
-    await audit.log(conn, { table: 'eq_payment_carryovers', id: c.carryover_id, action: 'release', reason, relatedType: 'eq_payroll_batches', relatedId: c.from_batch_id, userId, ip });
-    await refreshStatus(conn, c.from_batch_id, { userId, reason: `carried balance released: ${reason}`, ip });
+    await audit.log(conn, { table: 'eq_payment_carryovers', id: c.carryover_id, action: 'release', reason,
+      relatedType: c.from_batch_id ? 'eq_payroll_batches' : 'eq_opening_balances', relatedId: c.from_batch_id || c.opening_balance_id, userId, ip });
+    // an opening balance has no batch: it is simply open again
+    if (c.from_batch_id) await refreshStatus(conn, c.from_batch_id, { userId, reason: `carried balance released: ${reason}`, ip });
   }
   return rows.length;
 }
@@ -284,7 +306,7 @@ async function moveCarryIns(conn, fromBatchId, toBatchId, vendorIds, { reason, u
       await conn.execute("UPDATE eq_payment_carryovers SET status = 'Released', released_reason = ?, released_by_user_id = ?, released_at = ? WHERE carryover_id = ?",
         [`vendor not in new version #${toBatchId}`, userId, businessNow(), c.carryover_id]);
       await audit.log(conn, { table: 'eq_payment_carryovers', id: c.carryover_id, action: 'release', reason: `vendor not in new version #${toBatchId}`, userId, ip });
-      await refreshStatus(conn, c.from_batch_id, { userId, reason: 'carried balance released', ip });
+      if (c.from_batch_id) await refreshStatus(conn, c.from_batch_id, { userId, reason: 'carried balance released', ip });
     }
   }
 }

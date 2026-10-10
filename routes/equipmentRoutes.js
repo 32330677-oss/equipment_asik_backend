@@ -22,6 +22,7 @@ const liveC = require('../controllers/equipment/eqLiveController');
 const AS = requireRole('Admin', 'Supervisor');
 const fd = require('../controllers/equipment/eqFuelDiffController');
 const dnr = require('../controllers/equipment/dnrController');
+const ob = require('../controllers/equipment/openingBalanceController');
 
 router.use(requireAuth);
 
@@ -37,6 +38,11 @@ router.put('/contracts/:id', A, vendor.updateContract);
 router.post('/contracts/:id/document', A, uploadLimiter, vendor.uploadDocument);
 router.get('/contracts/:id/document', AC, vendor.downloadDocument);
 router.get('/contracts/:id/documents', AC, vendor.listDocuments);
+// opening balances: money owed to a vendor from before the system (014)
+router.get('/opening-balances', AC, ob.list);
+router.post('/vendors/:id/opening-balances', AC, ob.create);
+router.put('/opening-balances/:id', AC, ob.update);
+router.patch('/opening-balances/:id/cancel', AC, ob.cancel);
 
 // 5.2 types, machines, operators
 router.get('/types', ACS, fleet.listTypes);

@@ -194,7 +194,7 @@ async function generateInTx(conn, req, scope, extraIn = {}) {
     carried = await S.applyCarryForward(conn, { toBatchId: id, vendorIds: [...new Set(items.map((i) => i.vendor_id))], currency: items[0].currency,
       beforeDate: scope.start_date, userId: req.user.user_id, ip: req.ip });
     if (carried.length) {
-      warnings.push({ code: 'PREVIOUS_BALANCES_ADDED', count: carried.length, message: `${carried.length} unpaid balance(s) of earlier batches added: ${carried.map((c) => `#${c.from_batch_id} ${c.vendor_name} ${c.amount}`).join(', ')}.` });
+      warnings.push({ code: 'PREVIOUS_BALANCES_ADDED', count: carried.length, message: `${carried.length} unpaid balance(s) added: ${carried.map((c) => `${c.from_batch_id ? `#${c.from_batch_id}` : `opening balance #${c.opening_balance_id}`} ${c.vendor_name} ${c.amount}`).join(', ')}.` });
     }
   }
   return { id, warnings, accepted_blockers: blocking.map((b) => b.code), carried: carried.map(({ amount_cents: _c, ...x }) => x) };
@@ -651,9 +651,13 @@ async function reviewSummaryOf(conn, batch) {
        AND EXISTS (SELECT 1 FROM audit_logs x WHERE x.table_name = 'eq_delivery_notes' AND x.record_id = dn.delivery_note_id AND x.action_type = 'update')`, [id]);
   for (const r of dns) items.push({ kind: 'delivery_note_changed', ref: `${r.equipment_code} delivery note ${r.dn_number} (${String(r.note_date).slice(0, 10)}) changed after it was recorded` });
   const [carried] = await conn.query(
-    `SELECT c.from_batch_id, c.amount, c.currency, vd.vendor_name, u.full_name AS by_name, c.created_at FROM eq_payment_carryovers c JOIN eq_vendors vd ON vd.vendor_id = c.vendor_id
+    `SELECT c.from_batch_id, c.opening_balance_id, ob.description AS ob_description, c.amount, c.currency, vd.vendor_name, u.full_name AS by_name, c.created_at
+     FROM eq_payment_carryovers c JOIN eq_vendors vd ON vd.vendor_id = c.vendor_id LEFT JOIN eq_opening_balances ob ON ob.opening_balance_id = c.opening_balance_id
      JOIN users u ON u.user_id = c.created_by_user_id WHERE c.to_batch_id = ? AND c.status = 'Active'`, [id]);
-  for (const r of carried) items.push({ kind: 'previous_balance', ref: `${r.vendor_name}: ${Number(r.amount).toFixed(2)} ${r.currency} still owed on batch #${r.from_batch_id}`, by: r.by_name, at: r.created_at });
+  for (const r of carried) {
+    const from = r.from_batch_id ? `still owed on batch #${r.from_batch_id}` : `opening balance #${r.opening_balance_id} (from before the system: ${r.ob_description})`;
+    items.push({ kind: r.from_batch_id ? 'previous_balance' : 'opening_balance', ref: `${r.vendor_name}: ${Number(r.amount).toFixed(2)} ${r.currency} ${from}`, by: r.by_name, at: r.created_at });
+  }
   if (batch.accept_blockers_reason) items.push({ kind: 'accepted_blockers', ref: batch.accept_blockers_reason });
   return { eq_batch_id: id, items };
 }

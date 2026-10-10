@@ -791,7 +791,10 @@ async function accountStatementPdf(conn, { batch: b, vendor: x }, user) {
   ], y, 4);
   const rows = [{ d: fmt.date(String(b.finalized_at || '').slice(0, 10)), what: `Invoice ${x.invoice_no || ''} (this period)`, ref: '', debit: money(x.invoice_amount, cur), credit: '' }];
   for (const c of x.carried_in_detail) {
-    rows.push({ d: '', what: `Unpaid balance brought from batch #${c.from_batch_id} (${fmt.date(c.start_date)} - ${fmt.date(c.end_date)})`, ref: c.invoice_no || '', debit: money(c.amount, cur), credit: '' });
+    const what = c.kind === 'opening'
+      ? `Opening balance (before the system)${c.start_date && c.end_date ? ` ${fmt.date(c.start_date)} - ${fmt.date(c.end_date)}` : ''}${c.equipment_code ? ` | ${c.equipment_code}` : ''}: ${c.description || ''}`
+      : `Unpaid balance brought from batch #${c.from_batch_id} (${fmt.date(c.start_date)} - ${fmt.date(c.end_date)})`;
+    rows.push({ d: c.kind === 'opening' ? fmt.date(c.as_of_date) : '', what, ref: c.invoice_no || '', debit: money(c.amount, cur), credit: '' });
   }
   for (const p of x.payments) {
     rows.push({ d: fmt.date(p.paid_on), what: `Payment ${METHOD_TEXT[p.method] || p.method}${p.status === 'Reversed' ? ' - REVERSED' : ''}${p.note ? ` - ${p.note}` : ''}`, ref: `${p.voucher_no}${p.reference ? ` / ${p.reference}` : ''}`,

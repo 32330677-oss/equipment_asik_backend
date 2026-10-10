@@ -1115,3 +1115,14 @@ Additive only (rollback script in `database/migrations/rollback/013_dnr_and_part
 | `eq_payment_carryovers` | new: unpaid balance of an older finalized batch moved into a newer batch ("Add previous balances"); `Released` when the newer batch is voided |
 
 Rules: the vendor invoice never changes; balance = invoice + carried in − payments − carried out; no payment above the balance; the batch becomes `Paid` by itself when every vendor balance is 0 and nothing was carried out; a batch with payments or a carried-out balance cannot be voided or replaced. Batches marked paid before 013 (status `Paid`, no payment row) are treated as fully paid.
+
+## 5.7 Migration 014 — opening balances (10 Oct 2026)
+
+Money still owed to a vendor from **before the system was used** (no batch, no invoice in the app). Additive only (rollback script in `database/migrations/rollback/014_opening_balances.down.sql`):
+
+| Table | Change |
+|---|---|
+| `eq_opening_balances` | new: vendor, optional machine (information only), currency (one of the vendor's contract currencies), amount still owed (> 0, after the old payments), balance date, optional old period, description printed on the statement, old reference, `Active` / `Cancelled` (reason kept) |
+| `eq_payment_carryovers` | `from_batch_id` now NULL-able + new `opening_balance_id`; exactly one of the two is set (`chk_eqco_source`) |
+
+Rules: an open opening balance is offered by "Add previous balances" on New payroll when its balance date is before the batch start and the vendor is in the batch (same currency). Once carried it is paid in that batch with normal payment vouchers; the vendor invoice of the new period is not changed (the statement of account shows it on its own line "Opening balance (before the system) …"). Voiding the batch releases it (open again); a new version takes it along. It can be changed or cancelled only while it is not carried into an active batch.
