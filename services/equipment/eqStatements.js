@@ -138,7 +138,7 @@ function lineDesc(l, rate) {
   let s = LINE_LABEL[l.line_type] || l.line_type;
   if (l.line_type === 'Standby' && rate) s += ` @ ${n(rate.standby_billable_pct)}%`;
   if (l.line_type === 'Breakdown' && rate) s += ` @ ${n(rate.breakdown_billable_pct)}%`;
-  if (l.line_type === 'Overtime' && rate && rate.billing_mode !== 'Monthly') s += ` (> ${n(rate.overtime_threshold_hours ?? rate.standard_hours_per_day)} h/day)`;
+  if (l.line_type === 'Overtime' && rate && rate.billing_mode !== 'Monthly') s += ` (> ${n(rate.overtime_threshold_hours ?? rate.standard_hours_per_day)} h/shift)`;
   if (l.line_type === 'Overtime' && rate && rate.billing_mode === 'Monthly') s += ' (hours above the monthly hours due)';
   if (l.line_type === 'MinimumTopUp' && rate) s += ` (${n(rate.min_billable_hours_per_day)} h/day)`;
   if (l.note) s += ` - ${l.note}`;
@@ -415,7 +415,7 @@ function drawVendor(doc, ctx, b, items) {
     { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${v.vendor_name}${v.vendor_type === 'Individual' && v.vendor_national_id ? ` | ID ${v.vendor_national_id}` : ''}` },
     { label: 'Contract(s)', labelAr: 'العقود', value: [...new Set(items.map((i) => (i.rate && i.rate.contract_number) || i.contract_number).filter(Boolean))].join(', ') || '-' },
     { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
-    { label: 'Issued', labelAr: 'تاريخ الإصدار', value: final && b.finalized_at ? fmt.date(String(b.finalized_at).slice(0, 10)) : (b.unapproved_rows ? `${b.unapproved_rows} day(s) NOT APPROVED yet` : `${ctx.printedAt} (draft)`) },
+    { label: 'Issued', labelAr: 'تاريخ الإصدار', value: final && b.finalized_at ? fmt.date(String(b.finalized_at).slice(0, 10)) : (b.unapproved_rows ? `${b.unapproved_rows} attendance row(s) NOT APPROVED yet` : `${ctx.printedAt} (draft)`) },
   ], y, 4);
   y = sectionTitle(doc, y, '1. Machines summary', 'ملخص الآليات');
   const fuelOf = (it) => it.lines.filter((l) => l.line_type === 'Fuel').reduce((a, l) => a + n(l.amount), 0);
@@ -435,7 +435,7 @@ function drawVendor(doc, ctx, b, items) {
     y, rows, rowHeight: 16, headHeight: 26, fontSize: 6.8,
     columns: [
       { key: 'm', en: 'Machine', ar: 'الآلية', width: 66, align: 'left', wrap: true }, { key: 'site', en: 'Site', ar: 'الموقع', width: 30 },
-      { key: 'bill', en: 'Billing', ar: 'الأساس', width: 34 }, { key: 'days', en: 'Days', ar: 'الأيام', width: 28 },
+      { key: 'bill', en: 'Billing', ar: 'الأساس', width: 34 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 28 },
       { key: 'work', en: 'Work h', ar: 'العمل', width: 34 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 28 },
       { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 34 }, { key: 'bd', en: 'Brkdn h', ar: 'أعطال', width: 30 },
       { key: 'earn', en: 'Earnings', ar: 'المستحق', width: 48, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 40, align: 'right' },
@@ -476,7 +476,10 @@ function drawVendor(doc, ctx, b, items) {
   }
   const sum = (k) => items.reduce((a, i) => a + n(i[k]), 0);
   y = totalsBox(doc, y + 6, { gross: sum('gross_amount'), deductions: sum('deductions_amount'), net: sum('net_amount'), currency: cur });
-  P.text(doc, `Only approved attendance rows are included${ctx.requirePaper ? ', matched with the signed monthly timesheets' : ''}. Machine invoices: ${[...new Set(items.map((i) => i.invoice_no).filter(Boolean))].join(', ') || '-'}.`,
+  const approvalNote = b.provisional && b.unapproved_rows
+    ? `Includes ${b.unapproved_rows} attendance row(s) NOT approved yet: amounts may change after approval`
+    : `Only approved attendance rows are included${ctx.requirePaper ? ', matched with the signed monthly timesheets' : ''}`;
+  P.text(doc, `${approvalNote}. Machine invoices: ${[...new Set(items.map((i) => i.invoice_no).filter(Boolean))].join(', ') || '-'}.`,
     doc.page.margins.left, y, { size: 6.8, color: COLORS.muted, width: doc.page.width - 48 });
   signatureRow(doc, doc.y + 10, [['Prepared by (Finance)', 'إعداد: الإدارة المالية'], ['Approved by (Project Manager)', 'اعتماد: مدير المشروع'], ['Acknowledged by the lessor', 'إقرار ممثل الجهة المؤجرة']]);
 }
@@ -562,7 +565,7 @@ function drawSummary(doc, ctx, b, items) {
     columns: [
       { key: 'v', en: 'Lessor', ar: 'الجهة المؤجرة', width: 150, align: 'left' }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 100, align: 'left' },
       { key: 'inv', en: 'Invoice no.', ar: 'رقم الفاتورة', width: 70 }, { key: 'site', en: 'Site', ar: 'الموقع', width: 38 }, { key: 'bill', en: 'Billing', ar: 'الأساس', width: 44 },
-      { key: 'days', en: 'Days', ar: 'الأيام', width: 30 }, { key: 'work', en: 'Work h', ar: 'العمل', width: 42 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 36 },
+      { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 30 }, { key: 'work', en: 'Work h', ar: 'العمل', width: 42 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 36 },
       { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 40 }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 56, align: 'right' },
       { key: 'gross', en: 'Gross', ar: 'الإجمالي', width: 66, align: 'right' }, { key: 'ded', en: 'Deductions', ar: 'الحسومات', width: 60, align: 'right' },
       { key: 'net', en: 'Net', ar: 'الصافي', width: 61, align: 'right', bold: true },
@@ -598,11 +601,11 @@ async function render(conn, model, opts, user) {
     drawSummary(doc, ctx, b, items);
     fileName = `equipment-payroll-summary-${tag}.pdf`;
   }
-  if (b.provisional && b.unapproved_rows) watermark(doc, 'PROVISIONAL - INCLUDES DAYS NOT APPROVED');
+  if (b.provisional && b.unapproved_rows) watermark(doc, 'PROVISIONAL - INCLUDES ROWS NOT APPROVED');
   else if (b.provisional) watermark(doc, 'PROVISIONAL - NOT AN INVOICE');
   else if (b.status === 'Voided' || b.status === 'Superseded') watermark(doc, b.status.toUpperCase());
   else if (!b.is_finalized) watermark(doc, 'DRAFT - NOT FINAL');
-  const unapprovedNote = b.provisional && b.unapproved_rows ? ` | * ${b.unapproved_rows} day(s) not approved yet` : '';
+  const unapprovedNote = b.provisional && b.unapproved_rows ? ` | * ${b.unapproved_rows} attendance row(s) not approved yet` : '';
   P.footers(doc, `${ctx.company} | Equipment Flow | printed ${ctx.printedAt} by ${ctx.printedBy}${unapprovedNote}`);
   return { buffer: await P.toBuffer(doc), fileName: fileName.replace(/[^A-Za-z0-9._-]/g, '_') };
 }
@@ -658,7 +661,7 @@ async function batchXlsx(conn, detail) {
   head(m, [
     { header: 'Vendor', key: 'vendor', width: 26 }, { header: 'Machine', key: 'code', width: 12 }, { header: 'Type / no.', key: 'type', width: 18 },
     { header: 'Site', key: 'site', width: 8 }, { header: 'Billing', key: 'mode', width: 10 }, { header: 'Rows', key: 'rows', width: 7 },
-    { header: 'Worked days', key: 'days', width: 9 }, { header: 'Work h', key: 'work', width: 9 }, { header: 'OT h', key: 'ot', width: 8 },
+    { header: 'Worked shifts', key: 'days', width: 9 }, { header: 'Work h', key: 'work', width: 9 }, { header: 'OT h', key: 'ot', width: 8 },
     { header: 'Standby h', key: 'sb', width: 9 }, { header: 'Breakdown h', key: 'bd', width: 10 }, { header: 'Top-up h', key: 'tu', width: 9 },
     { header: 'Fuel price diff.', key: 'fd', width: 14 }, { header: 'Gross', key: 'gross', width: 14 }, { header: 'Deductions', key: 'ded', width: 14 }, { header: 'Net', key: 'net', width: 14 },
     { header: 'Invoice no.', key: 'inv', width: 16 }, { header: 'Fuel diff. no.', key: 'finv', width: 16 },
