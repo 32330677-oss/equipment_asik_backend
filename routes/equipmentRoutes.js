@@ -25,6 +25,7 @@ const AS = requireRole('Admin', 'Supervisor');
 const fd = require('../controllers/equipment/eqFuelDiffController');
 const dnr = require('../controllers/equipment/dnrController');
 const ob = require('../controllers/equipment/openingBalanceController');
+const ledger = require('../controllers/equipment/ledgerController');
 
 router.use(requireAuth);
 
@@ -199,6 +200,11 @@ router.patch('/payroll/payments/:id/reverse', AC, pay.reversePayment);
 router.get('/payroll/payments/:id/voucher.pdf', AC, pay.voucherPdf);
 router.patch('/payroll/requests/:id/approve', A, pay.approveRequest);
 router.patch('/payroll/requests/:id/reject', A, pay.rejectRequest);
+// running statements (11 Oct 2026): vendor statement of account, machine billing history
+router.get('/statements/vendor/:id/account', AC, ledger.vendorAccount);
+router.get('/statements/vendor/:id/account.pdf', AC, ledger.vendorAccountPdf);
+router.get('/statements/machine/:id/history', AC, ledger.machineHistory);
+router.get('/statements/machine/:id/history.pdf', AC, ledger.machineHistoryPdf);
 router.get('/statements/machine/:id.pdf', AC, pay.provisionalMachine);
 router.get('/statements/vendor/:id.pdf', AC, pay.provisionalVendor);
 
