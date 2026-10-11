@@ -23,8 +23,9 @@ async function insertDeployment(conn, req, d) {
   if (d.shift_type === 'Night' && Number(site.has_night_shift) !== 1) throw AppError.badRequest('NO_NIGHT_SHIFT', 'This site has no Night shift.');
   if (d.unassigned_date && d.unassigned_date < d.assigned_date) throw AppError.validation({ unassigned_date: 'must be on or after assigned_date' });
   await assertOperatorOk(conn, d.default_operator_id, machine);
-  // a deployment inside a finalized period would change monthly bases already invoiced
-  await lock.assertRangeOpen(conn, { vendorId: machine.vendor_id, equipmentId: d.equipment_id, from: d.assigned_date, to: d.unassigned_date || null, what: 'This deployment' });
+  // a deployment over days a finalized batch billed for this machine would change what was invoiced (11 Oct 2026:
+  // only what was billed is locked; a machine nobody billed may be deployed in a finalized period)
+  await lock.assertMachineRangeOpen(conn, { equipmentId: d.equipment_id, from: d.assigned_date, to: d.unassigned_date || null, what: 'This deployment' });
   const [clash] = await conn.execute(
     `SELECT a.eq_assignment_id, s.site_code, a.shift_type, a.assigned_date, a.unassigned_date FROM eq_site_assignments a JOIN sites s ON s.site_id = a.site_id
      WHERE a.equipment_id = ? AND a.shift_type = ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)
@@ -89,7 +90,7 @@ exports.end = async (req, res) => {
     const before = await C.loadDeployment(conn, id, true);
     if (unassigned_date < addDays(before.assigned_date, -1)) throw AppError.validation({ unassigned_date: 'cannot be before assigned_date - 1 (cancelled deployment)' });
     if (before.unassigned_date && unassigned_date > before.unassigned_date) throw AppError.validation({ unassigned_date: 'can only shorten a deployment' });
-    await lock.assertRangeOpen(conn, { equipmentId: before.equipment_id, from: addDays(unassigned_date, 1), to: before.unassigned_date, what: 'Ending this deployment removes days that' });
+    await lock.assertMachineRangeOpen(conn, { equipmentId: before.equipment_id, from: addDays(unassigned_date, 1), to: before.unassigned_date, what: 'Ending this deployment removes days that' });
     await assertNoRowsAfter(conn, before, unassigned_date);
     await conn.execute('UPDATE eq_site_assignments SET unassigned_date = ? WHERE eq_assignment_id = ?', [unassigned_date, id]);
     await audit.log(conn, { table: 'eq_site_assignments', id, action: 'end', oldValues: { unassigned_date: before.unassigned_date }, newValues: { unassigned_date }, reason: reason || null, ...audit.ctx(req) });
@@ -112,14 +113,14 @@ exports.changeStart = async (req, res) => {
     if (before.unassigned_date && from > String(before.unassigned_date).slice(0, 10)) throw AppError.validation({ assigned_date: 'must be on or before the last day of the deployment' });
     if (from > old) {
       // days [old, from - 1] leave the deployment
-      await lock.assertRangeOpen(conn, { equipmentId: before.equipment_id, from: old, to: addDays(from, -1), what: 'Moving the first day removes days that' });
+      await lock.assertMachineRangeOpen(conn, { equipmentId: before.equipment_id, from: old, to: addDays(from, -1), what: 'Moving the first day removes days that' });
       const [[r]] = await conn.execute(
         `SELECT MIN(record_date) AS first_row, COUNT(*) AS n FROM eq_attendance WHERE equipment_id = ? AND site_id = ? AND shift_type = ?
            AND record_date >= ? AND record_date < ? AND status <> 'Cancelled'`, [before.equipment_id, before.site_id, before.shift_type, old, from]);
       if (Number(r.n)) throw AppError.conflict('ATTENDANCE_BEFORE_START', `There is attendance on ${r.first_row}, before the new first day. Cancel or move those rows first.`, { first_row: r.first_row, rows: Number(r.n) });
     } else {
       // days [from, old - 1] join the deployment
-      await lock.assertRangeOpen(conn, { equipmentId: before.equipment_id, from, to: addDays(old, -1), what: 'Moving the first day earlier adds days that' });
+      await lock.assertMachineRangeOpen(conn, { equipmentId: before.equipment_id, from, to: addDays(old, -1), what: 'Moving the first day earlier adds days that' });
       const [clash] = await conn.execute(
         `SELECT a.eq_assignment_id, s.site_code FROM eq_site_assignments a JOIN sites s ON s.site_id = a.site_id
          WHERE a.equipment_id = ? AND a.shift_type = ? AND a.eq_assignment_id <> ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)
@@ -145,7 +146,7 @@ exports.transfer = async (req, res) => {
     if (before.unassigned_date && d.first_day_at_target > before.unassigned_date) throw AppError.validation({ first_day_at_target: 'the current deployment already ended before that date' });
     if (before.site_id === d.target_site_id && before.shift_type === d.target_shift_type) throw AppError.badRequest('SAME_SITE', 'The target is the same site and shift.');
     const lastDay = addDays(d.first_day_at_target, -1);
-    await lock.assertRangeOpen(conn, { equipmentId: before.equipment_id, from: d.first_day_at_target, to: before.unassigned_date, what: 'This transfer' });
+    await lock.assertMachineRangeOpen(conn, { equipmentId: before.equipment_id, from: d.first_day_at_target, to: before.unassigned_date, what: 'This transfer' });
     await assertNoRowsAfter(conn, before, lastDay);
     await conn.execute('UPDATE eq_site_assignments SET unassigned_date = ? WHERE eq_assignment_id = ?', [lastDay, id]);
     await audit.log(conn, { table: 'eq_site_assignments', id, action: 'transfer_out', oldValues: { unassigned_date: before.unassigned_date }, newValues: { unassigned_date: lastDay }, ...audit.ctx(req) });

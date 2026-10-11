@@ -43,10 +43,9 @@ exports.createFuel = async (req, res) => {
     await assertCanActOnSite(req.user, d.site_id, d.shift_type, d.issue_date);
   }
   const row = await withTransaction(async (conn) => {
-    const machine = await C.loadMachine(conn, d.equipment_id);
+    await C.loadMachine(conn, d.equipment_id);
     await C.loadSite(conn, d.site_id);
-    // a fuel issue dated inside a finalized period would never be billed: refuse it
-    await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: d.equipment_id, siteId: d.site_id, from: d.issue_date, what: 'This fuel issue date' });
+    // 11 Oct 2026: a fuel issue dated inside a finalized period is allowed; the next batch of the machine bills it
     const [r] = await conn.execute(
       'INSERT INTO eq_fuel_issues (equipment_id, site_id, issue_date, liters, price_per_liter, receipt_number, issued_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [d.equipment_id, d.site_id, d.issue_date, d.liters, d.price_per_liter ?? null, d.receipt_number || null, req.user.user_id]);
@@ -66,8 +65,8 @@ async function loadFuel(conn, id) {
 }
 
 /**
- * Price, litres or receipt number of a fuel issue in an OPEN period. The first price needs no reason; changing the litres
- * or a price already set does. A fuel issue of a closed (finalized) period is corrected through an official Correction.
+ * Price, litres or receipt number of a fuel issue not billed by a finalized batch. The first price needs no reason; changing the litres
+ * or a price already set does. A fuel issue billed by a finalized batch is corrected through an official Correction.
  */
 exports.updateFuel = async (req, res) => {
   const id = parseId(req.params.id);
@@ -81,9 +80,7 @@ exports.updateFuel = async (req, res) => {
     if (before.is_cancelled) throw AppError.conflict('INVALID_STATE', 'This fuel issue is cancelled.');
     const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
     if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized payroll batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
-    const machine = await C.loadMachine(conn, before.equipment_id);
-    // never billed but dated in a closed month: pricing it now must not reopen that month
-    await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: before.equipment_id, siteId: before.site_id, from: String(before.issue_date).slice(0, 10), what: 'This fuel issue date' });
+    // never billed (even if dated in a finalized period): it is priced / changed normally and billed by the next batch
     const changesMoney = (d.liters !== undefined && Number(d.liters) !== Number(before.liters))
       || (d.price_per_liter !== undefined && before.price_per_liter !== null && Number(d.price_per_liter) !== Number(before.price_per_liter));
     if (changesMoney && reason.length < 5) throw AppError.validation({ reason: 'say why the litres or the price already set change (at least 5 characters)' });
@@ -184,9 +181,9 @@ exports.createAdjustment = async (req, res) => {
   });
   if (d.amount === 0) throw AppError.validation({ amount: 'cannot be 0' });
   const row = await withTransaction(async (conn) => {
-    const machine = await C.loadMachine(conn, d.equipment_id);
+    await C.loadMachine(conn, d.equipment_id);
     if (d.site_id) await C.loadSite(conn, d.site_id);
-    await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: d.equipment_id, siteId: d.site_id || null, from: d.adjustment_date, what: 'This adjustment date' });
+    // 11 Oct 2026: an adjustment dated inside a finalized period is allowed; the next batch of the machine bills it
     const card = await C.rateCardOn(conn, d.equipment_id, d.adjustment_date);
     // a machine paid only per delivery note (DNR) has no rate card: the currency is the one of its DNR price
     const dnrPrice = card ? null : (await DNR.ratesForMachines(conn, [d.equipment_id], d.adjustment_date, d.adjustment_date))[0];

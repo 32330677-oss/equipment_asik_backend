@@ -153,8 +153,9 @@ function rateSummary(r) {
   }
   if (r.billing_mode === 'Monthly') {
     const parts = [`Monthly ${fmt.num(r.monthly_rate)}`, `${n(r.standard_hours_per_day)} h per working day`,
-      'hourly price = monthly / working days of the month / hours per day',
-      `overtime ${r.overtime_rate !== null && r.overtime_rate !== undefined ? `at ${fmt.num(r.overtime_rate)}/h` : 'at the hourly price'}`,
+      `hourly price = monthly / ${r.monthly_divisor === 'Fixed' ? `${n(r.monthly_working_days)} days` : 'working days of the month'} / hours per day (unless typed for the month)`,
+      n(r.overtime_enabled) === 0 && r.overtime_enabled !== undefined && r.overtime_enabled !== null ? 'overtime not paid'
+        : `overtime ${r.overtime_rate !== null && r.overtime_rate !== undefined ? `at ${fmt.num(r.overtime_rate)}/h` : 'at the hourly price'}`,
       'standby: hours given per day by the accountant', `breakdown ${n(r.breakdown_billable_pct)}%`, `breaks ${r.break_policy === 'Paid' ? 'paid' : 'deducted'}`];
     return parts.join(' | ');
   }
@@ -176,19 +177,35 @@ function drawMonthlyCalc(doc, y, it, cur) {
   return P.table(doc, {
     y, rowHeight: 15, headHeight: 26, fontSize: 7, onNewPage: () => doc.page.margins.top + 4,
     columns: [
-      { key: 'm', en: 'Month', ar: 'الشهر', width: 50 }, { key: 'wd', en: 'Working days', ar: 'أيام العمل', width: 52 },
+      { key: 'm', en: 'Month', ar: 'الشهر', width: 50 }, { key: 'wd', en: 'Divided by', ar: 'القسمة على', width: 52 },
       { key: 'dep', en: 'Deployed', ar: 'أيام التخصيص', width: 52 }, { key: 'hol', en: 'Holidays', ar: 'عطل رسمية', width: 44 },
       { key: 'hpd', en: 'H per day', ar: 'ساعات اليوم', width: 46 }, { key: 'req', en: 'Hours due', ar: 'الساعات المطلوبة', width: 56 },
       { key: 'done', en: 'Hours done', ar: 'الساعات المنفذة', width: 56 }, { key: 'hp', en: 'Hourly price', ar: 'سعر الساعة', width: 60, align: 'right' },
       { key: 'res', en: 'Result', ar: 'النتيجة', width: 131, align: 'left' },
     ],
     rows: mc.map((x) => ({
-      m: x.month, wd: x.working_days, dep: x.deployed_working_days, hol: x.holiday_days || '', hpd: fmt.num(x.hours_per_day), req: fmt.num(x.required_hours),
-      done: fmt.num(x.billable_hours), hp: fmt.num(x.hourly_price, 3),
-      res: x.overtime_hours > 0 ? `+${fmt.num(x.overtime_hours)} h overtime` : x.missing_hours > 0 ? `-${fmt.num(x.missing_hours)} h missing` : 'hours complete',
+      // D: typed for the month (manual), fixed on the card, or the calendar working days (terms of 11 Oct 2026)
+      m: x.month, wd: `${x.divisor ?? x.working_days}${x.divisor_source && x.divisor_source !== 'calendar' ? ` (${x.divisor_source})` : ''}`,
+      dep: x.deployed_working_days, hol: x.holiday_days || '', hpd: fmt.num(x.hours_per_day), req: fmt.num(x.required_hours),
+      done: fmt.num(x.billable_hours), hp: `${fmt.num(x.hourly_price, 3)}${x.hourly_source === 'manual' ? ' (manual)' : ''}`,
+      res: monthlyResult(x),
       _color: x.missing_hours > 0 ? COLORS.red : undefined,
     })),
   }) + 6;
+}
+
+/** Result column of a month: overtime paid (hours x price), extra hours not paid (overtime off), missing hours. */
+function monthlyResult(x) {
+  const part = x.part ? ' (month settlement)' : '';
+  if (x.overtime_hours > 0) {
+    const price = x.overtime_price ?? x.hourly_price;
+    return `+${fmt.num(x.overtime_hours)} h x ${fmt.num(price, 2)} = ${fmt.num(Math.round(x.overtime_hours * price * 100) / 100)}${part}`;
+  }
+  if (x.overtime_hours < 0) return `${fmt.num(x.overtime_hours)} h overtime${part}`;
+  if (x.unpaid_extra_hours > 0) return `+${fmt.num(x.unpaid_extra_hours)} h not paid (overtime off)${part}`;
+  if (x.missing_hours > 0) return `-${fmt.num(x.missing_hours)} h missing${part}`;
+  if (x.missing_hours < 0) return `${fmt.num(-x.missing_hours)} h missing given back${part}`;
+  return `hours complete${part}`;
 }
 
 /** Monthly machine at several sites: its cost split between the sites by the hours each got. */

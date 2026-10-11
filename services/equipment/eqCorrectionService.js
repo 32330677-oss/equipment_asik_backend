@@ -1,8 +1,8 @@
 // services/equipment/eqCorrectionService.js — official corrections of rows inside a FINALIZED payroll period.
 // The finalized batch is never touched: the difference is recalculated with the batch's own frozen prices and settings
 // and settled by an adjustment in the first open period, with an official debit / credit note number.
-// Flow (6 Oct 2026): an Admin or an Accountant requests it (several fields at once) -> ANOTHER Admin/Accountant approves it.
-// Whoever changes a request (amends it) cannot approve that version: the content is always seen by two people.
+// Flow (11 Oct 2026): an Admin's correction is applied at once; an Accountant requests it (several fields at once) and an
+// Admin approves it (another Accountant cannot). Terms of a monthly month are the ones frozen in the batch item.
 const { pool } = require('../../config/db');
 const AppError = require('../../utils/AppError');
 const { v, validate } = require('../../utils/validate');
@@ -211,6 +211,14 @@ async function computeDelta(rowId, changes, userId) {
       const snap = P.parseJson(i.rate_snapshot) || {};
       return [i.eq_item_id, { snap, rate: P.engineRate(snap), cardId: i.rate_card_id }];
     }));
+    // a monthly item that billed only PART of a month (11 Oct 2026): the part already billed by other batches is billed
+    // again on both sides (their rows as they are now), so the difference is the one of this part only
+    for (const m of meta.values()) {
+      const ids = (m.snap.monthly_prev && m.snap.monthly_prev.row_ids) || [];
+      if (!ids.length && !(m.snap.monthly_prev && (m.snap.monthly_prev.months || []).length)) continue;
+      const [prev] = ids.length ? await conn.query("SELECT * FROM eq_attendance WHERE eq_attendance_id IN (?) AND status <> 'Cancelled'", [ids]) : [[]];
+      m.prev = { rows: prev.map(P.engineRow), months: m.snap.monthly_prev.months || [] };
+    }
     const [srows] = await conn.query(
       `SELECT s.*, a.shift_type FROM eq_payroll_attendance_snapshot s LEFT JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id
        WHERE s.eq_batch_id = ? AND s.eq_item_id IN (?) ORDER BY s.record_date`, [item.eq_batch_id, items.map((i) => i.eq_item_id)]);
@@ -227,7 +235,8 @@ async function computeDelta(rowId, changes, userId) {
       for (const [itemId, m] of meta) {
         const rows = entries.filter((e) => e.itemId === itemId).map((e) => e.row);
         if (!rows.length) continue;
-        const ctx = m.rate.billing_mode === 'Monthly' ? { months: m.snap.months || [] } : {};
+        // the months frozen in the item carry its terms (divisor D, hourly price) — never today's eq_monthly_terms
+        const ctx = m.rate.billing_mode === 'Monthly' ? { months: m.snap.months || [], ...(m.prev ? { prev: m.prev } : {}) } : {};
         const fdInput = m.snap.fuel_diff ? { equipmentId: item.equipment_id, currency: item.currency, terms: m.snap.fuel_diff.terms || [],
           prices: m.snap.fuel_diff.prices || [], allowNegative } : null;
         const r = billWith(rows, m.rate, ctx, fdInput);

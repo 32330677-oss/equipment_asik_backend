@@ -256,8 +256,7 @@ exports.createNote = async (req, res) => {
     await C.loadSite(conn, d.site_id);
     const rate = await D.loadRate(conn, d.dnr_rate_id);
     D.assertUsable(rate, machine, d.note_date);
-    // a note dated inside a finalized period would never be billed: refuse it
-    await lock.assertOpen(conn, { vendorId: machine.vendor_id, equipmentId: d.equipment_id, siteId: d.site_id, from: d.note_date, what: 'This delivery note date' });
+    // 11 Oct 2026: a note dated inside a finalized period is allowed; the next batch of the machine bills it
     await assertNumberFree(conn, machine.vendor_id, d.dn_number);
     let r;
     try {
@@ -308,9 +307,7 @@ exports.updateNote = async (req, res) => {
     });
     if (changesMoney && reason.length < 5) throw AppError.validation({ reason: 'say why the quantity, price, date or site changes (at least 5 characters)' });
     if (next.note_date > businessToday()) throw AppError.badRequest('FUTURE_DATE', 'The date cannot be in the future.');
-    await lock.assertOpen(conn, { vendorId: before.vendor_id, equipmentId: before.equipment_id, siteId: before.site_id, from: day(before.note_date), what: 'This delivery note date' });
     if (d.site_id !== undefined) await C.loadSite(conn, d.site_id);
-    await lock.assertOpen(conn, { vendorId: before.vendor_id, equipmentId: before.equipment_id, siteId: next.site_id, from: next.note_date, what: 'The new date' });
     let unitPrice = before.unit_price; let currency = before.currency;
     if (d.dnr_rate_id !== undefined || d.note_date !== undefined) {
       const rate = await D.loadRate(conn, next.dnr_rate_id);

@@ -31,17 +31,25 @@ after(h.closePool);
 
 const code = async (req) => (await req).body.code;
 
-test('fuel and adjustments cannot be dated inside a finalized period', async () => {
-  assert.strictEqual(await code(h.api().post('/api/equipment/fuel-issues').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, issue_date: '2026-10-20', liters: 50, price_per_liter: 1 })), 'PAYROLL_PERIOD_FINALIZED');
+test('fuel and adjustments dated inside a finalized period are allowed: the next batch bills them (11 Oct 2026)', async () => {
+  const f = await ok(h.api().post('/api/equipment/fuel-issues').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, issue_date: '2026-10-20', liters: 50, price_per_liter: 1 }));
   await ok(h.api().post('/api/equipment/fuel-issues').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, issue_date: '2026-11-02', liters: 50, price_per_liter: 1 }));
-  assert.strictEqual(await code(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.exc.equipment_id, adjustment_date: '2026-10-15', adjustment_type: 'Bonus', amount: 10, reason: 'x' })), 'PAYROLL_PERIOD_FINALIZED');
-  assert.strictEqual(await code(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, adjustment_date: '2026-10-15', adjustment_type: 'Bonus', amount: 10, reason: 'x' })), 'PAYROLL_PERIOD_FINALIZED');
+  const a = await ok(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, adjustment_date: '2026-10-15', adjustment_type: 'Bonus', amount: 10, reason: 'x' }));
   await ok(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.exc.equipment_id, adjustment_date: '2026-11-15', adjustment_type: 'Bonus', amount: 10, reason: 'x' }));
+  // a new batch over October takes them (and nothing the finalized batch billed)
+  const pv = await ok(h.api().post('/api/equipment/payroll/preview').set(ACC()).send({ start_date: '2026-10-01', end_date: '2026-10-31', equipment_id: F.exc.equipment_id }));
+  const lines = pv.items.flatMap((i) => i.lines);
+  assert.ok(lines.find((l) => l.line_type === 'Adjustment'));
+  assert.ok(!lines.find((l) => l.line_type === 'Work'), 'the finalized row is not billed again');
+  // they are not billed now: cancelled, so the next tests see only November
+  await ok(h.api().patch(`/api/equipment/fuel-issues/${f.fuel_issue_id}/cancel`).set(ACC()).send({ reason: 'test only' }));
+  await ok(h.api().patch(`/api/equipment/adjustments/${a.adjustment_id}/cancel`).set(ACC()).send({ reason: 'test only' }));
 });
 
-test('deployments and supervisor periods cannot change finalized days', async () => {
+test('deployments cannot change days a finalized batch billed; supervisor periods follow the finalized period', async () => {
   const deps = await ok(h.api().get(`/api/equipment/deployments?equipment_id=${F.exc.equipment_id}`).set(A()));
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/deployments/${deps[0].eq_assignment_id}/end`).set(A()).send({ unassigned_date: '2026-10-10' })), 'PAYROLL_PERIOD_FINALIZED');
+  // ending on 4 Oct would remove 5 Oct, billed by the finalized batch (11 Oct 2026: only what was billed is locked)
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/deployments/${deps[0].eq_assignment_id}/end`).set(A()).send({ unassigned_date: '2026-10-04' })), 'PAYROLL_PERIOD_FINALIZED');
   assert.strictEqual(await code(h.api().post('/api/equipment/deployments').set(A()).send({ equipment_id: F.exc.equipment_id, site_id: 9, shift_type: 'Night', assigned_date: '2026-10-01' })), 'PAYROLL_PERIOD_FINALIZED');
   await ok(h.api().post('/api/equipment/deployments').set(A()).send({ equipment_id: F.exc.equipment_id, site_id: 9, shift_type: 'Night', assigned_date: '2026-11-01' }));
   assert.strictEqual(await code(h.api().post('/api/sites/8/supervisors/replace').set(A()).send({ user_id: 4, shift_type: 'Day', first_day: '2026-10-15' })), 'PAYROLL_PERIOD_FINALIZED');
@@ -67,11 +75,12 @@ test('a generated batch turns stale when a fuel issue of its period changes, not
 test('official correction of a finalized day: difference at the batch prices, debit note, adjustment in the open period', async () => {
   const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-05'", [F.exc.equipment_id]);
   // paid 8 h x 40 = 320; the paper says 17:00 -> 10 h = 400 (overtime starts above 10 h): +80
+  // an Admin's correction is applied at once (policy of 11 Oct 2026)
   const c = await ok(h.api().post(`/api/equipment/admin/attendance/${row.eq_attendance_id}/correction`).set(A()).send({ reason: 'Signed sheet shows 17:00', changes: { check_out_time: '2026-10-05 17:00' } }));
   assert.strictEqual(Number(c.delta_amount), 80);
   assert.strictEqual(c.delta_detail.invoice_no, 'MI-2026-00001');
-  await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/review`).set(ACC()).send({ note: 'matches the sheet' }));
-  const done = await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(A()).send({}));
+  assert.strictEqual(c.request_status, 'Approved');
+  const done = c;
   assert.strictEqual(done.note.kind, 'DebitNote');
   assert.strictEqual(Number(done.note.amount), 80);
   const [adj] = await h.query('SELECT amount, adjustment_date, reason FROM eq_adjustments WHERE correction_id = ?', [c.correction_id]);
@@ -117,11 +126,10 @@ test('the supervisor recalls a Submitted row (reason kept) until the office appr
   await ok(h.api().post('/api/equipment/admin/attendance/approve').set(A()).send({ ids: [id2] }));
 });
 
-test('the Admin edits an Approved row with a reason: it stays Approved, is flagged, and a generated batch turns stale', async () => {
+test('the Admin edits an Approved row (reason optional, kept when given): it stays Approved, is flagged, and a generated batch turns stale', async () => {
   const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-11-10'", [F.exc.equipment_id]);
   const [row2] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-11-11'", [F.exc.equipment_id]);
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-11-01', end_date: '2026-11-15', equipment_id: F.exc.equipment_id }));
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: '2026-11-10 17:00' })), 'VALIDATION_ERROR');
   const e = await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ check_out_time: '2026-11-10 17:00', reason: 'Signed sheet says 17:00' }));
   assert.strictEqual(e.status, 'Approved');
   assert.strictEqual(e.edited_after_approval, true);

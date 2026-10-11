@@ -44,7 +44,7 @@ async function balances(conn, batch) {
   const [cin] = await conn.execute(
     `SELECT c.*, COALESCE(b.start_date, ob.period_from) AS start_date, COALESCE(b.end_date, ob.period_to) AS end_date, b.version_number,
        ob.as_of_date, ob.description AS ob_description, ob.reference AS ob_reference, e.equipment_code AS ob_equipment_code,
-       COALESCE((SELECT x.invoice_no FROM eq_invoices x WHERE x.eq_batch_id = c.from_batch_id AND x.kind = 'Vendor' AND x.vendor_id = c.vendor_id ORDER BY x.invoice_id DESC LIMIT 1),
+       COALESCE((SELECT x.invoice_no FROM eq_invoices x WHERE x.eq_batch_id = c.from_batch_id AND x.kind = 'Vendor' AND x.vendor_id = c.vendor_id AND x.status = 'Issued' ORDER BY x.invoice_id DESC LIMIT 1),
          ob.reference) AS invoice_no
      FROM eq_payment_carryovers c LEFT JOIN eq_payroll_batches b ON b.eq_batch_id = c.from_batch_id
      LEFT JOIN eq_opening_balances ob ON ob.opening_balance_id = c.opening_balance_id LEFT JOIN eq_equipment e ON e.equipment_id = ob.equipment_id
@@ -57,7 +57,7 @@ async function balances(conn, batch) {
      LEFT JOIN users r ON r.user_id = p.reversed_by_user_id WHERE p.eq_batch_id = ? ORDER BY p.payment_id`, [id]);
   const [inv] = await conn.execute(
     `SELECT i.invoice_id, i.invoice_no, i.vendor_id, i.amount, (c.invoice_id IS NOT NULL) AS cancelled FROM eq_invoices i
-     LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = i.invoice_id WHERE i.eq_batch_id = ? AND i.kind = 'Vendor'`, [id]);
+     LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = i.invoice_id WHERE i.eq_batch_id = ? AND i.kind = 'Vendor' AND i.status = 'Issued'`, [id]);
   const legacyPaid = batch.status === 'Paid' && pays.length === 0;
   const byVendor = new Map();
   const get = (vid, name, code) => {

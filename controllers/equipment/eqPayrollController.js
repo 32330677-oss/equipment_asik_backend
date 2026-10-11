@@ -5,7 +5,7 @@ const { v, validate, parseId } = require('../../utils/validate');
 const audit = require('../../services/audit');
 const settings = require('../../services/settings');
 const { businessNow } = require('../../utils/businessDate');
-const { diffMinutes } = require('../../utils/dateTime');
+const { diffMinutes, addMinutes } = require('../../utils/dateTime');
 const { toDecimalString } = require('../../utils/money');
 const P = require('../../services/equipment/eqPayrollService');
 const statements = require('../../services/equipment/eqStatements');
@@ -14,10 +14,44 @@ const S = require('../../services/equipment/eqSettlement');
 const SCOPE = {
   start_date: v.date({ required: true }), end_date: v.date({ required: true }),
   vendor_id: v.id(), equipment_id: v.id(), site_id: v.id(), currency: v.currency(),
+  // 11 Oct 2026: several machines of ONE vendor chosen by hand (empty = the whole scope)
+  equipment_ids: v.ids(),
+  // take the chosen machines out of other DRAFT batches (they are voided, or recalculated without them)
+  take_from_drafts: v.bool({ default: false }),
   accept_blockers: v.bool({ default: false }), accept_reason: v.string({ max: 500 }),
   // "Add previous balances": the unpaid balance of older finalized batches of the same vendors moves into this batch
   carry_forward: v.bool({ default: false }),
 };
+
+/** "1,2,3" in a query string -> [1,2,3] (GET routes). */
+function queryIds(q) {
+  const out = { ...q };
+  if (typeof out.equipment_ids === 'string') out.equipment_ids = out.equipment_ids.split(',').map((x) => x.trim()).filter(Boolean);
+  if (Array.isArray(out.equipment_ids) && !out.equipment_ids.length) delete out.equipment_ids;
+  return out;
+}
+
+/**
+ * Validates a scope. equipment_ids needs the vendor, and every machine must be that vendor's (422). The old single
+ * equipment_id still works (a list of one). When every machine of the vendor is chosen, the list is dropped.
+ */
+async function checkScope(conn, input) {
+  const scope = validate(input, SCOPE);
+  if (scope.equipment_id && !scope.equipment_ids) scope.equipment_ids = [scope.equipment_id];
+  if (scope.equipment_ids) {
+    scope.equipment_ids = [...new Set(scope.equipment_ids)].sort((a, b) => a - b);
+    if (!scope.vendor_id) {
+      if (scope.equipment_ids.length > 1) throw AppError.validation({ vendor_id: 'is required when several machines are chosen' });
+    } else {
+      const [own] = await conn.query('SELECT equipment_id FROM eq_equipment WHERE vendor_id = ? AND equipment_id IN (?)', [scope.vendor_id, scope.equipment_ids]);
+      if (own.length !== scope.equipment_ids.length) {
+        throw new AppError(422, 'MACHINE_OTHER_VENDOR', 'Every chosen machine must belong to the chosen vendor.', { equipment_ids: scope.equipment_ids.filter((x) => !own.some((o) => o.equipment_id === x)) });
+      }
+    }
+    scope.equipment_id = scope.equipment_ids.length === 1 && !scope.vendor_id ? scope.equipment_ids[0] : null;
+  }
+  return scope;
+}
 
 function hoursOf(min) { return (Number(min || 0) / 60).toFixed(2); }
 
@@ -70,8 +104,8 @@ function pickCurrency(items, currency) {
 }
 
 exports.preview = async (req, res) => {
-  const scope = validate(req.body, SCOPE);
   const conn = pool;
+  const scope = await checkScope(conn, req.body);
   const blockers = await P.blockers(conn, scope);
   const { items, warnings } = await P.calculate(conn, scope);
   const names = await namesFor(conn, items);
@@ -84,8 +118,72 @@ exports.preview = async (req, res) => {
   res.json({ status: 'success', data: { scope, totals: summarize(items), blockers, warnings, items: items.map((i) => itemView(i, names)), carry_forward: carry } });
 };
 
+/**
+ * Coverage of one vendor's machines in a period (11 Oct 2026), for "New payroll": per machine, what a new batch would
+ * take now (ready), which batches already hold its units (held_by), and what blocks it.
+ */
+exports.coverage = async (req, res) => {
+  const q = validate(req.query, { vendor_id: v.id({ required: true }), start_date: v.date({ required: true }), end_date: v.date({ required: true }) });
+  if (q.end_date < q.start_date) throw AppError.validation({ end_date: 'must be on or after start_date' });
+  const [machines] = await pool.query(
+    `SELECT e.equipment_id, e.equipment_code, e.machine_label, e.plate_number, t.type_name FROM eq_equipment e JOIN eq_types t ON t.type_id = e.type_id
+     WHERE e.vendor_id = ? AND (
+       EXISTS (SELECT 1 FROM eq_site_assignments a WHERE a.equipment_id = e.equipment_id AND a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?))
+       OR EXISTS (SELECT 1 FROM eq_attendance ea WHERE ea.equipment_id = e.equipment_id AND ea.record_date BETWEEN ? AND ? AND ea.status <> 'Cancelled')
+       OR EXISTS (SELECT 1 FROM eq_fuel_issues f WHERE f.equipment_id = e.equipment_id AND f.issue_date BETWEEN ? AND ? AND f.is_cancelled = 0)
+       OR EXISTS (SELECT 1 FROM eq_adjustments ad WHERE ad.equipment_id = e.equipment_id AND ad.adjustment_date BETWEEN ? AND ? AND ad.status = 'Active')
+       OR EXISTS (SELECT 1 FROM eq_delivery_notes dn WHERE dn.equipment_id = e.equipment_id AND dn.note_date BETWEEN ? AND ? AND dn.status = 'Active'))
+     ORDER BY e.equipment_code`,
+    [q.vendor_id, q.end_date, q.start_date, q.start_date, q.end_date, q.start_date, q.end_date, q.start_date, q.end_date, q.start_date, q.end_date]);
+  const out = [];
+  for (const m of machines) {
+    const scope = { start_date: q.start_date, end_date: q.end_date, vendor_id: q.vendor_id, equipment_ids: [m.equipment_id] };
+    const [[card]] = await pool.query(
+      `SELECT billing_mode FROM eq_rate_cards WHERE equipment_id = ? AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)
+       ORDER BY effective_from DESC LIMIT 1`, [m.equipment_id, q.end_date, q.start_date]);
+    const ready = { rows: 0, monthly_days: 0, fuel: 0, adjustments: 0, dnr: 0, net: [] };
+    let calcError = null;
+    try {
+      const { items } = await P.calculate(pool, scope);
+      for (const it of items) {
+        ready.rows += it.per_row ? it.per_row.length : 0;
+        ready.monthly_days += it.monthly_days ? it.monthly_days.length : 0;
+        ready.fuel += it.lines.filter((l) => l.line_type === 'Fuel').length;
+        ready.adjustments += it.lines.filter((l) => l.line_type === 'Adjustment').length;
+        ready.dnr += it.lines.filter((l) => l.line_type === 'DeliveryNote').length;
+        ready.net.push({ currency: it.currency, net: toDecimalString(it.net_cents) });
+      }
+    } catch (e) {
+      if (!e.isAppError) throw e;
+      calcError = { code: e.code, message: e.message };
+    }
+    const [held] = await pool.query(
+      `SELECT x.eq_batch_id, b.is_finalized, b.version_number, b.status, COUNT(DISTINCT x.day) AS days, MIN(x.day) AS first_day, MAX(x.day) AS last_day FROM (
+         SELECT ps.eq_batch_id, ps.record_date AS day FROM eq_payroll_attendance_snapshot ps JOIN eq_payroll_items i ON i.eq_item_id = ps.eq_item_id
+           WHERE i.equipment_id = ? AND ps.record_date BETWEEN ? AND ?
+         UNION ALL
+         SELECT md.eq_batch_id, md.day FROM eq_payroll_monthly_days md WHERE md.equipment_id = ? AND md.day BETWEEN ? AND ?
+       ) x JOIN eq_payroll_batches b ON b.eq_batch_id = x.eq_batch_id AND b.status IN ('Generated','Paid')
+       GROUP BY x.eq_batch_id, b.is_finalized, b.version_number, b.status ORDER BY x.eq_batch_id`,
+      [m.equipment_id, q.start_date, q.end_date, m.equipment_id, q.start_date, q.end_date]);
+    const blockers = {};
+    for (const b of await P.blockers(pool, scope)) if (P.BLOCKING.includes(b.code)) blockers[b.code.toLowerCase()] = b.count;
+    if (calcError) blockers[calcError.code.toLowerCase()] = 1;
+    const isReady = ready.rows + ready.monthly_days + ready.fuel + ready.adjustments + ready.dnr > 0;
+    out.push({
+      equipment_id: m.equipment_id, label: m.machine_label || `${m.equipment_code} ${m.type_name}`, equipment_code: m.equipment_code, plate: m.plate_number,
+      billing_mode: card ? card.billing_mode : null, ready, is_ready: isReady,
+      held_by: held.map((h) => ({ eq_batch_id: h.eq_batch_id, finalized: Boolean(Number(h.is_finalized)), version_number: h.version_number, status: h.status,
+        days: Number(h.days), first_day: String(h.first_day).slice(0, 10), last_day: String(h.last_day).slice(0, 10) })),
+      in_draft: held.filter((h) => !Number(h.is_finalized) && h.status === 'Generated').map((h) => h.eq_batch_id),
+      blockers, calc_error: calcError,
+    });
+  }
+  res.json({ status: 'success', data: out });
+};
+
 exports.blockers = async (req, res) => {
-  const scope = validate(req.query, SCOPE);
+  const scope = await checkScope(pool, queryIds(req.query));
   res.json({ status: 'success', data: await P.blockers(pool, scope) });
 };
 
@@ -118,12 +216,14 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
     `INSERT INTO eq_payroll_batches (start_date, end_date, scope_vendor_id, scope_equipment_id, scope_site_id, currency, version_number,
        supersedes_batch_id, supersede_reason, total_equipment, total_gross, total_deductions, total_net, generated_by_user_id, settings_snapshot)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [scope.start_date, scope.end_date, scope.vendor_id || null, scope.equipment_id || null, scope.site_id || null, currency,
+    [scope.start_date, scope.end_date, scope.vendor_id || null, machineList(scope) ? null : (scope.equipment_id || null), scope.site_id || null, currency,
       extra.version_number || 1, extra.supersedes_batch_id || null, extra.supersede_reason || null,
       new Set(items.map((i) => i.equipment_id)).size, toDecimalString(totals.g), toDecimalString(totals.d), toDecimalString(totals.n),
       req.user.user_id, JSON.stringify(await P.billingSettings())]);
   if (extra.accept_reason) await conn.execute('UPDATE eq_payroll_batches SET accept_blockers_reason = ? WHERE eq_batch_id = ?', [extra.accept_reason, b.insertId]);
   const batchId = b.insertId;
+  // machines chosen by hand (11 Oct 2026); empty = the whole scope
+  for (const eid of machineList(scope) || []) await conn.execute('INSERT INTO eq_payroll_batch_machines (eq_batch_id, equipment_id) VALUES (?, ?)', [batchId, eid]);
   const labels = await labelsFor(conn, items);
   for (const it of items) {
     const [ir] = await conn.execute(
@@ -131,7 +231,8 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
          work_hours, overtime_hours, standby_hours, breakdown_hours, topup_hours, gross_amount, deductions_amount, net_amount)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [batchId, it.equipment_id, it.vendor_id, it.site_id, it.rate_card_id,
-        JSON.stringify({ ...it.rate_snapshot, months: it.months, monthly_calc: it.monthly_calc || null, fuel_diff: it.fuel_diff || null, site_allocation: it.site_allocation || null, labels: labels(it) }), it.billing_mode,
+        JSON.stringify({ ...it.rate_snapshot, months: it.months, monthly_calc: it.monthly_calc || null, monthly_prev: it.monthly_prev || null, monthly_terms: it.monthly_terms || null,
+          fuel_diff: it.fuel_diff || null, site_allocation: it.site_allocation || null, labels: labels(it) }), it.billing_mode,
         it.days_recorded, it.worked_days, hoursOf(it.work_minutes), hoursOf(it.overtime_minutes), hoursOf(it.standby_minutes),
         hoursOf(it.breakdown_minutes), hoursOf(it.topup_minutes), toDecimalString(it.gross_cents), toDecimalString(it.deductions_cents), toDecimalString(it.net_cents)]);
     for (const l of it.lines) {
@@ -139,6 +240,11 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
         `INSERT INTO eq_payroll_lines (eq_item_id, line_type, quantity, unit, unit_price, amount, source_table, source_id, note)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [ir.insertId, l.line_type, l.quantity, l.unit, (l.unit_price_exact ?? l.unit_price_cents / 100).toFixed(3), toDecimalString(l.amount_cents), l.source_table || null, l.source_id || null, l.note || null]);
+    }
+    // each deployed day of a monthly machine is billed by one batch only (11 Oct 2026)
+    for (const md of it.monthly_days || []) {
+      await conn.execute('INSERT INTO eq_payroll_monthly_days (eq_batch_id, eq_item_id, equipment_id, day, site_id) VALUES (?, ?, ?, ?, ?)',
+        [batchId, ir.insertId, it.equipment_id, md.day, md.site_id]);
     }
     for (const pr of it.per_row) {
       const r = pr.row;
@@ -154,22 +260,53 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
   return batchId;
 }
 
-/** Monthly bases are not tied to rows: never bill the same machine/site twice for overlapping periods. */
-async function assertNoOverlappingMonthly(conn, scope, items, excludeBatchId) {
-  for (const it of items.filter((i) => i.billing_mode === 'Monthly')) {
-    const [rows] = await conn.execute(
-      `SELECT b.eq_batch_id, b.start_date, b.end_date FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-       WHERE i.equipment_id = ? AND i.billing_mode = 'Monthly' AND b.status IN ('Generated','Paid')
-         AND b.start_date <= ? AND b.end_date >= ? AND b.eq_batch_id <> ? LIMIT 1`,
-      [it.equipment_id, scope.end_date, scope.start_date, excludeBatchId || 0]);
-    if (rows[0]) {
-      throw AppError.conflict('OVERLAPPING_BATCH', `A monthly machine in this scope is already billed by batch #${rows[0].eq_batch_id} (${rows[0].start_date} to ${rows[0].end_date}).`, rows[0]);
+/** The machines chosen by hand for a scope (a list kept on the batch), or null for the whole scope. */
+function machineList(scope) {
+  if (!scope.equipment_ids || !scope.equipment_ids.length) return null;
+  if (scope.equipment_ids.length === 1 && !scope.vendor_id) return null; // the old single-machine scope (scope_equipment_id)
+  return scope.equipment_ids;
+}
+
+/** Machines of the scope that sit in another DRAFT batch (rows, monthly days, fuel, adjustments, delivery notes). */
+async function draftsHolding(conn, scope, excludeBatchId = 0) {
+  const machines = P.scopeMachines(scope);
+  if (!machines) return [];
+  const [rows] = await conn.query(
+    `SELECT DISTINCT b.eq_batch_id, i.equipment_id FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
+     WHERE b.status = 'Generated' AND b.is_finalized = 0 AND b.eq_batch_id <> ? AND i.equipment_id IN (?)
+       AND b.start_date <= ? AND b.end_date >= ?`, [excludeBatchId || 0, machines, scope.end_date, scope.start_date]);
+  return rows;
+}
+
+/**
+ * take_from_drafts: the chosen machines leave the other DRAFT batches that hold them, inside the same transaction —
+ * a draft left with none of its machines is voided, otherwise it is recalculated (new version) without them.
+ */
+async function takeFromDrafts(conn, req, scope) {
+  const held = await draftsHolding(conn, scope);
+  const out = [];
+  for (const batchId of [...new Set(held.map((x) => x.eq_batch_id))]) {
+    const old = await loadBatch(conn, batchId, true);
+    const [items] = await conn.execute('SELECT DISTINCT equipment_id FROM eq_payroll_items WHERE eq_batch_id = ?', [batchId]);
+    const taken = held.filter((x) => x.eq_batch_id === batchId).map((x) => x.equipment_id);
+    const left = items.map((x) => x.equipment_id).filter((x) => !taken.includes(x));
+    const why = `machines moved to a new batch (${taken.map((x) => `#${x}`).join(', ')})`;
+    if (!left.length) {
+      await doVoid(conn, req, batchId, why);
+      out.push({ eq_batch_id: batchId, action: 'voided' });
+    } else {
+      const vendorId = old.scope_vendor_id || (await conn.query('SELECT vendor_id FROM eq_equipment WHERE equipment_id = ?', [left[0]]))[0][0].vendor_id;
+      const r = await doSupersede(conn, req, batchId, why, true, { vendor_id: vendorId, equipment_ids: left, equipment_id: null });
+      out.push({ eq_batch_id: batchId, action: 'recalculated', new_batch_id: r.id });
     }
   }
+  return out;
 }
 
 async function generateInTx(conn, req, scope, extraIn = {}) {
   let extra = extraIn;
+  let moved = [];
+  if (scope.take_from_drafts && !extra.supersedes_batch_id) moved = await takeFromDrafts(conn, req, scope);
   const blockers = await P.blockers(conn, { ...scope, exclude_batch_id: extra.supersedes_batch_id });
   const blocking = blockers.filter((b) => P.BLOCKING.includes(b.code));
   const hard = blocking.find((b) => b.code === 'MONTHLY_MULTI_SITE'); // wrong hours due: never accepted
@@ -185,8 +322,10 @@ async function generateInTx(conn, req, scope, extraIn = {}) {
   const { items: all, warnings } = await P.calculate(conn, { ...scope, lock: true, exclude_batch_id: extra.supersedes_batch_id });
   const items = pickCurrency(all, scope.currency);
   if (!items.length) throw AppError.conflict('NOTHING_TO_PAY', 'Nothing to pay in this scope and period.');
-  await assertNoOverlappingMonthly(conn, scope, items, extra.supersedes_batch_id);
+  // 11 Oct 2026: no OVERLAPPING_BATCH — what another batch already bills (rows, monthly days...) is skipped above
   const id = await persistBatch(conn, req, scope, items, extra);
+  for (const m of moved) warnings.push({ code: m.action === 'voided' ? 'DRAFT_VOIDED' : 'DRAFT_RECALCULATED', ...m,
+    message: m.action === 'voided' ? `Draft #${m.eq_batch_id} was voided (its machines moved here).` : `Draft #${m.eq_batch_id} was recalculated without the machines moved here (new #${m.new_batch_id}).` });
   const negative = items.filter((i) => i.net_cents < 0).map((i) => i.equipment_id);
   if (negative.length) warnings.push({ code: 'NEGATIVE_NET', equipment_ids: negative });
   let carried = [];
@@ -201,7 +340,7 @@ async function generateInTx(conn, req, scope, extraIn = {}) {
 }
 
 exports.generate = async (req, res) => {
-  const scope = validate(req.body, SCOPE);
+  const scope = await checkScope(pool, req.body);
   const out = await withTransaction(async (conn) => {
     const r = await generateInTx(conn, req, scope);
     await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate', newValues: { scope, accepted_blockers: r.accepted_blockers, carried_forward: r.carried },
@@ -225,11 +364,83 @@ async function isStale(conn, batch) {
   return (await staleReasons(conn, batch)).length > 0;
 }
 
-/** Official numbers of a batch that no longer stands (voided or superseded): kept, never reused, marked cancelled. */
+/**
+ * Official numbers of a batch that no longer stands (voided): kept, never reused, marked cancelled — its own numbers and
+ * the numbers WITHDRAWN (reserved) by an undone Finalize anywhere in its version chain (decision of 11 Oct 2026).
+ */
 async function cancelInvoices(conn, batchId, reason, userId) {
-  await conn.execute(
+  const chain = await versionChainBack(conn, batchId);
+  await conn.query(
     `INSERT IGNORE INTO eq_invoice_cancellations (invoice_id, reason, cancelled_by_user_id, cancelled_at)
-     SELECT invoice_id, ?, ?, ? FROM eq_invoices WHERE eq_batch_id = ? AND kind IN ('Vendor','Machine','FuelDiff')`, [reason, userId, businessNow(), batchId]);
+     SELECT invoice_id, ?, ?, ? FROM eq_invoices WHERE kind IN ('Vendor','Machine','FuelDiff')
+       AND (eq_batch_id = ? OR (eq_batch_id IN (?) AND status = 'Withdrawn'))`, [String(reason).slice(0, 500), userId, businessNow(), batchId, chain]);
+}
+
+/** This batch and the versions it replaces (walking back supersedes_batch_id). */
+async function versionChainBack(conn, batchId) {
+  const ids = []; let cur = batchId;
+  while (cur && !ids.includes(cur)) {
+    ids.push(cur);
+    const [[b]] = await conn.execute('SELECT supersedes_batch_id FROM eq_payroll_batches WHERE eq_batch_id = ?', [cur]);
+    cur = b ? b.supersedes_batch_id : null;
+  }
+  return ids;
+}
+
+/** Numbers withdrawn by an undone Finalize in this batch's version chain and not cancelled: they are given back on Finalize. */
+async function withdrawnInChain(conn, batchId) {
+  const chain = await versionChainBack(conn, batchId);
+  const [rows] = await conn.query(
+    `SELECT i.* FROM eq_invoices i LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = i.invoice_id
+     WHERE i.eq_batch_id IN (?) AND i.status = 'Withdrawn' AND c.invoice_id IS NULL AND i.kind IN ('Vendor','Machine','FuelDiff')
+     ORDER BY i.invoice_id FOR UPDATE`, [chain]);
+  return rows;
+}
+
+/** The official numbers of a finalized batch go back to "reserved" (Withdrawn) when its Finalize is undone. */
+async function withdrawInvoices(conn, batchId) {
+  await conn.execute(
+    `UPDATE eq_invoices i LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = i.invoice_id SET i.status = 'Withdrawn'
+     WHERE i.eq_batch_id = ? AND i.kind IN ('Vendor','Machine','FuelDiff') AND c.invoice_id IS NULL`, [batchId]);
+}
+
+/**
+ * Can the Finalize of this batch still be undone (back to a draft, same numbers)? Only within eq_finalize_undo_hours of
+ * finalizing it, while it is not paid, has no active payment, no official correction and no balance carried out.
+ * Afterwards: official Correction.
+ */
+async function finalizeUndoState(conn, batch, hoursIn = null) {
+  const hours = hoursIn ?? await settings.getInt('eq_finalize_undo_hours');
+  const id = batch.eq_batch_id;
+  if (batch.status === 'Paid') return { possible: false, reason: 'paid', window_hours: hours };
+  if (!Number(batch.is_finalized) || batch.status !== 'Generated') return { possible: false, reason: 'not_finalized', window_hours: hours };
+  const [[p]] = await conn.execute("SELECT COUNT(*) AS n FROM eq_payments WHERE eq_batch_id = ? AND status = 'Active'", [id]);
+  if (Number(p.n) > 0) return { possible: false, reason: 'payments', window_hours: hours };
+  const [[c]] = await conn.execute("SELECT COUNT(*) AS n FROM eq_attendance_corrections WHERE locked_batch_id = ? AND request_status IN ('Requested','Reviewed','Approved')", [id]);
+  if (Number(c.n) > 0) return { possible: false, reason: 'corrections', window_hours: hours };
+  const [[o]] = await conn.execute("SELECT COUNT(*) AS n FROM eq_payment_carryovers WHERE from_batch_id = ? AND status = 'Active'", [id]);
+  if (Number(o.n) > 0) return { possible: false, reason: 'carried_out', window_hours: hours };
+  if (!batch.finalized_at || hours <= 0) return { possible: false, reason: 'window_passed', window_hours: hours };
+  const at = String(batch.finalized_at).slice(0, 19).replace('T', ' ');
+  const left = hours * 60 - diffMinutes(at, businessNow());
+  const deadline = addMinutes(at, hours * 60);
+  if (left <= 0) return { possible: false, reason: 'window_passed', window_hours: hours, deadline };
+  return { possible: true, reason: null, window_hours: hours, deadline, hours_left: Math.floor(left / 60), minutes_left: left };
+}
+
+const UNDO_WHY = {
+  not_finalized: 'This batch is not finalized.',
+  paid: 'This batch is Paid: undo "Mark paid" first, or settle the difference with an official Correction.',
+  payments: 'A payment is recorded on this batch: reverse it first, or settle the difference with an official Correction.',
+  corrections: 'An official Correction is based on this batch: settle further differences with corrections.',
+  carried_out: 'The balance of this batch was carried into a later batch: void that batch first.',
+};
+function undoError(st) {
+  if (st.reason === 'window_passed') {
+    return AppError.conflict('FINALIZE_WINDOW_PASSED',
+      `The Finalize can only be undone within ${st.window_hours} hours. Use a Correction.`, st);
+  }
+  return AppError.conflict('UNFINALIZE_NOT_ALLOWED', UNDO_WHY[st.reason] || 'The Finalize of this batch cannot be undone.', st);
 }
 
 /**
@@ -273,21 +484,31 @@ async function batchDetail(conn, id) {
   const money = await S.balances(conn, batch);
   const allPayments = money.vendors.flatMap((x) => x.payments);
   const undo = paidUndoState(batch, undoHours, { total: allPayments.length, markPaid: allPayments.filter((p) => p.status === 'Active' && p.source === 'MarkPaid').length });
+  const finalizeUndo = await finalizeUndoState(conn, batch);
+  // numbers kept for this draft by an undone Finalize (its own and those of the versions it replaces)
+  const reserved = batch.status === 'Generated' && !Number(batch.is_finalized)
+    ? (await withdrawnInChain(conn, id)).map((x) => ({ invoice_no: x.invoice_no, kind: x.kind, vendor_id: x.vendor_id, equipment_id: x.equipment_id })) : [];
+  const [chosen] = await conn.execute(
+    `SELECT m.equipment_id, e.equipment_code, e.machine_label, e.plate_number FROM eq_payroll_batch_machines m JOIN eq_equipment e ON e.equipment_id = m.equipment_id
+     WHERE m.eq_batch_id = ? ORDER BY e.equipment_code`, [id]);
   return {
     ...batch, settings_snapshot: P.parseJson(batch.settings_snapshot) || null, is_finalized: Boolean(Number(batch.is_finalized)),
-    finalize_admin_only: await settings.getBool('payroll_finalize_admin_only'), paid_undo: undo,
+    scope_machines: chosen,
+    finalize_admin_only: await settings.getBool('payroll_finalize_admin_only'), paid_undo: undo, finalize_undo: finalizeUndo, reserved_numbers: reserved,
     settlement: { vendors: money.vendors, totals: money.totals, payment_status: money.payment_status, legacy_paid: money.legacy_paid, payable: money.payable },
     requests, pending_request: requests.find((r) => r.status === 'Pending') || null,
     generated_by: u ? u.full_name : null, stale, stale_reasons: reasons, invoices,
     items: items.map((i) => {
       const snap = P.parseJson(i.rate_snapshot) || {};
-      const inv = (kind) => (invoices.find((x) => x.kind === kind && x.eq_item_id === i.eq_item_id) || {}).invoice_no || null;
+      // a withdrawn (reserved) number is not the item's invoice until the batch is finalized again
+      const live = (x) => !x.cancelled && x.status !== 'Withdrawn';
+      const inv = (kind) => (invoices.find((x) => live(x) && x.kind === kind && x.eq_item_id === i.eq_item_id) || {}).invoice_no || null;
       return {
         ...i, ...(snap.labels || {}), rate_snapshot: snap, lines: byItem[i.eq_item_id] || [],
         fuel_difference: (byItem[i.eq_item_id] || []).filter((l) => l.line_type === 'FuelPriceDifference').reduce((a, l) => a + Number(l.amount), 0).toFixed(2),
         site_allocation: snap.site_allocation ? snap.site_allocation.map((a) => ({ site_id: a.site_id, site_code: siteCode[a.site_id], hours: a.hours, share_pct: a.share_pct, amount: (a.amount_cents / 100).toFixed(2) })) : null,
         invoice_no: inv('Machine'), fuel_invoice_no: inv('FuelDiff'),
-        vendor_invoice_no: (invoices.find((x) => x.kind === 'Vendor' && x.vendor_id === i.vendor_id) || {}).invoice_no || null,
+        vendor_invoice_no: (invoices.find((x) => live(x) && x.kind === 'Vendor' && x.vendor_id === i.vendor_id) || {}).invoice_no || null,
       };
     }),
   };
@@ -320,6 +541,7 @@ exports.list = async (req, res) => {
   const [rows] = await pool.query(
     `SELECT b.*, vd.vendor_name AS scope_vendor_name, e.equipment_code AS scope_equipment_code, s.site_code AS scope_site_code, u.full_name AS generated_by,
        (SELECT COUNT(*) FROM eq_batch_requests r WHERE r.eq_batch_id = b.eq_batch_id AND r.status = 'Pending') AS pending_requests,
+       (SELECT COUNT(*) FROM eq_payroll_batch_machines m WHERE m.eq_batch_id = b.eq_batch_id) AS scope_machine_count,
        (SELECT COUNT(*) FROM eq_payments p WHERE p.eq_batch_id = b.eq_batch_id) AS payments_count,
        (SELECT COALESCE(SUM(p.amount), 0) FROM eq_payments p WHERE p.eq_batch_id = b.eq_batch_id AND p.status = 'Active') AS paid_total,
        (SELECT COALESCE(SUM(c.amount), 0) FROM eq_payment_carryovers c WHERE c.to_batch_id = b.eq_batch_id AND c.status = 'Active') AS carried_in_total,
@@ -375,15 +597,29 @@ async function nextInvoiceNo(conn, kind, year) {
 
 /**
  * Official numbers given when a batch is finalized: one vendor invoice per vendor, one machine invoice per item,
- * and one fuel-difference statement per item that has a fuel price difference.
+ * and one fuel-difference statement per item that has a fuel price difference. A number WITHDRAWN by an undone Finalize
+ * in this version chain is given back to the same vendor (and machine) first; what is left withdrawn afterwards belongs
+ * to a machine that left the batch and is cancelled.
  */
-async function issueInvoices(conn, batchId, currency, now) {
+async function issueInvoices(conn, batchId, currency, now, userId = null) {
   const year = Number(String(now).slice(0, 4));
+  const reserved = await withdrawnInChain(conn, batchId);
+  const takeReserved = (kind, vendorId, equipmentId) => {
+    const k = reserved.findIndex((x) => x.kind === kind && x.vendor_id === vendorId && (kind === 'Vendor' || x.equipment_id === equipmentId));
+    return k < 0 ? null : reserved.splice(k, 1)[0];
+  };
   const [items] = await conn.execute('SELECT eq_item_id, equipment_id, vendor_id, net_amount FROM eq_payroll_items WHERE eq_batch_id = ? ORDER BY vendor_id, eq_item_id', [batchId]);
   const [fd] = await conn.execute(
     `SELECT l.eq_item_id, SUM(l.amount) AS amount FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id
      WHERE i.eq_batch_id = ? AND l.line_type = 'FuelPriceDifference' GROUP BY l.eq_item_id`, [batchId]);
   const insert = async (kind, vendorId, equipmentId, itemId, amount) => {
+    const back = takeReserved(kind, vendorId, equipmentId);
+    if (back) {
+      await conn.execute(
+        "UPDATE eq_invoices SET eq_batch_id = ?, eq_item_id = ?, currency = ?, amount = ?, status = 'Issued', reissued_at = ? WHERE invoice_id = ?",
+        [batchId, itemId, currency, amount, now, back.invoice_id]);
+      return;
+    }
     const n = await nextInvoiceNo(conn, kind, year);
     await conn.execute(
       `INSERT INTO eq_invoices (invoice_no, kind, year, seq, eq_batch_id, vendor_id, equipment_id, eq_item_id, currency, amount, issued_at)
@@ -397,6 +633,10 @@ async function issueInvoices(conn, batchId, currency, now) {
   for (const f of fd) {
     const i = items.find((x) => x.eq_item_id === f.eq_item_id);
     await insert('FuelDiff', i.vendor_id, i.equipment_id, i.eq_item_id, f.amount);
+  }
+  for (const w of reserved) {
+    await conn.execute('INSERT IGNORE INTO eq_invoice_cancellations (invoice_id, reason, cancelled_by_user_id, cancelled_at) VALUES (?, ?, ?, ?)',
+      [w.invoice_id, `Not in batch #${batchId} when it was finalized again (the machine / vendor left the batch)`, userId, now]);
   }
 }
 
@@ -431,7 +671,7 @@ exports.finalize = async (req, res) => {
     }
     const now = businessNow();
     await conn.execute('UPDATE eq_payroll_batches SET is_finalized = 1, finalized_by_user_id = ?, finalized_at = ? WHERE eq_batch_id = ?', [req.user.user_id, now, id]);
-    await issueInvoices(conn, id, b.currency, now);
+    await issueInvoices(conn, id, b.currency, now, req.user.user_id);
     await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'finalize', newValues: { acknowledged_changes: summary.items.length }, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: await batchDetail(pool, id) });
@@ -668,37 +908,70 @@ exports.reviewSummary = async (req, res) => {
   res.json({ status: 'success', data: await reviewSummaryOf(pool, b) });
 };
 
-/** Voids a Generated batch (inside the caller's transaction). */
+/** Voids a Generated batch (inside the caller's transaction). The reason is optional on a draft (11 Oct 2026). */
 async function doVoid(conn, req, id, reason) {
   const b = await loadBatch(conn, id, true);
   if (b.status !== 'Generated') throw AppError.conflict('BATCH_STATE', `A ${b.status} batch cannot be voided.`);
   if (Number(b.is_finalized)) await assertNoCorrections(conn, id);
   await S.assertNoMoneyMoved(conn, id);
-  await conn.execute("UPDATE eq_payroll_batches SET status = 'Voided', voided_by_user_id = ?, voided_at = ?, void_reason = ? WHERE eq_batch_id = ?", [req.user.user_id, businessNow(), reason, id]);
-  if (Number(b.is_finalized)) await cancelInvoices(conn, id, `Batch voided: ${reason}`, req.user.user_id);
+  const why = reason ? `: ${reason}` : '';
+  await conn.execute("UPDATE eq_payroll_batches SET status = 'Voided', voided_by_user_id = ?, voided_at = ?, void_reason = ? WHERE eq_batch_id = ?", [req.user.user_id, businessNow(), reason || null, id]);
+  // its numbers (and the numbers reserved for it by an undone Finalize) are cancelled, never reused
+  await cancelInvoices(conn, id, `Batch #${id} voided${why}`, req.user.user_id);
   // balances carried INTO this batch are owed again on their own batches
-  await S.releaseCarryIns(conn, id, { reason: `batch #${id} voided: ${reason}`, userId: req.user.user_id, ip: req.ip });
-  await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'void', reason, ...audit.ctx(req) });
+  await S.releaseCarryIns(conn, id, { reason: `batch #${id} voided${why}`, userId: req.user.user_id, ip: req.ip });
+  await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'void', reason: reason || null, ...audit.ctx(req) });
   return { id };
 }
 
-/** Replaces a finalized, unpaid batch by a recalculated version (inside the caller's transaction). */
-async function doSupersede(conn, req, id, reason, acceptBlockers) {
+/**
+ * Recalculates a batch as a new version (inside the caller's transaction):
+ *  - a DRAFT: "Recalculate" (11 Oct 2026) — no number to handle, reason optional;
+ *  - a FINALIZED, unpaid batch: only while its Finalize can still be undone (eq_finalize_undo_hours). It is an undo of the
+ *    Finalize and a recalculation in one step: its numbers are withdrawn and given back when the new version is finalized.
+ *    Afterwards: official Correction (FINALIZE_WINDOW_PASSED).
+ */
+async function doSupersede(conn, req, id, reason, acceptBlockers, scopeOverride = null) {
   const old = await loadBatch(conn, id, true);
   if (old.status === 'Paid') throw AppError.conflict('BATCH_PAID', 'A paid batch is never recalculated. Settle any difference with an official Correction (debit / credit note).');
-  if (!Number(old.is_finalized) || old.status !== 'Generated') throw AppError.conflict('BATCH_STATE', 'Only a finalized, unpaid batch can be superseded.');
-  await assertNoCorrections(conn, id);
-  await S.assertNoMoneyMoved(conn, id);
-  const scope = { start_date: old.start_date, end_date: old.end_date, vendor_id: old.scope_vendor_id, equipment_id: old.scope_equipment_id, site_id: old.scope_site_id, currency: old.currency, accept_blockers: acceptBlockers };
-  const r = await generateInTx(conn, req, scope, { version_number: Number(old.version_number) + 1, supersedes_batch_id: id, supersede_reason: reason });
+  if (old.status !== 'Generated') throw AppError.conflict('BATCH_STATE', `A ${old.status} batch cannot be recalculated.`);
+  const fin = Number(old.is_finalized) === 1;
+  if (fin) {
+    await assertNoCorrections(conn, id);
+    await S.assertNoMoneyMoved(conn, id);
+    const st = await finalizeUndoState(conn, old);
+    if (!st.possible) throw undoError(st);
+  }
+  // same scope as the old version, with its machines chosen by hand (or fewer: take_from_drafts)
+  const scope = { ...(await P.batchScope(conn, old)), ...(scopeOverride || {}), currency: old.currency, accept_blockers: acceptBlockers };
+  // a draft recalculated (Recalculate, take_from_drafts): the open problems accepted on it stay accepted, same reason
+  if (!fin && old.accept_blockers_reason) {
+    scope.accept_blockers = true;
+    scope.accept_reason = reason || String(old.accept_blockers_reason).replace(/^[A-Z_]+(, [A-Z_]+)*: /, '');
+  }
+  const r = await generateInTx(conn, req, scope, { version_number: Number(old.version_number) + 1, supersedes_batch_id: id, supersede_reason: reason || null });
   await conn.execute("UPDATE eq_payroll_batches SET status = 'Superseded' WHERE eq_batch_id = ?", [id]);
   // balances carried into the old version follow the new version
   const [nv] = await conn.execute('SELECT DISTINCT vendor_id FROM eq_payroll_items WHERE eq_batch_id = ?', [r.id]);
   await S.moveCarryIns(conn, id, r.id, nv.map((x) => x.vendor_id), { reason: `replaced by version #${r.id}`, userId: req.user.user_id, ip: req.ip });
-  await cancelInvoices(conn, id, `Replaced by batch #${r.id} (version ${Number(old.version_number) + 1}): ${reason}`, req.user.user_id);
-  await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'superseded', newValues: { by: r.id }, reason, ...audit.ctx(req) });
-  await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate_version', newValues: { supersedes: id }, reason, ...audit.ctx(req) });
+  if (fin) await withdrawInvoices(conn, id); // reserved for the new version (given back on its Finalize)
+  await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'superseded', newValues: { by: r.id, was_finalized: fin }, reason: reason || null, ...audit.ctx(req) });
+  await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate_version', newValues: { supersedes: id }, reason: reason || null, ...audit.ctx(req) });
   return r;
+}
+
+/** Undo the Finalize (inside the caller's transaction): the batch is a draft again; its numbers stay reserved. */
+async function doUnfinalize(conn, req, id, reason) {
+  const b = await loadBatch(conn, id, true);
+  const st = await finalizeUndoState(conn, b);
+  if (!st.possible) throw undoError(st);
+  await conn.execute(
+    `UPDATE eq_payroll_batches SET is_finalized = 0, finalized_by_user_id = NULL, finalized_at = NULL, finalize_undo_count = finalize_undo_count + 1
+     WHERE eq_batch_id = ?`, [id]);
+  await withdrawInvoices(conn, id);
+  await audit.log(conn, { table: 'eq_payroll_batches', id, action: 'unfinalize', oldValues: { is_finalized: 1, finalized_at: b.finalized_at, finalized_by_user_id: b.finalized_by_user_id },
+    newValues: { is_finalized: 0 }, reason, ...audit.ctx(req) });
+  return { id };
 }
 
 /**
@@ -706,12 +979,18 @@ async function doSupersede(conn, req, id, reason, acceptBlockers) {
  * stored as a request and runs when an Admin approves it. Returns the request, or null when the user may act now.
  */
 async function requestIfNeeded(conn, req, id, action, reason, acceptBlockers) {
-  if (req.user.role !== 'Accountant' || !(await settings.getBool('payroll_finalize_admin_only'))) return null;
+  // undoing a Finalize always needs the Admin; void / new version only when the Admin alone closes payroll
+  if (req.user.role !== 'Accountant') return null;
+  if (action !== 'unfinalize' && !(await settings.getBool('payroll_finalize_admin_only'))) return null;
   const b = await loadBatch(conn, id, true);
   if (!Number(b.is_finalized)) return null;
   if (b.status !== 'Generated') throw AppError.conflict('BATCH_STATE', `A ${b.status} batch cannot be ${action === 'void' ? 'voided' : 'replaced'}.`);
   await assertNoCorrections(conn, id);
   await S.assertNoMoneyMoved(conn, id);
+  if (action !== 'void') { // the request must be possible when the Admin approves it
+    const st = await finalizeUndoState(conn, b);
+    if (!st.possible) throw undoError(st);
+  }
   const [[open]] = await conn.execute("SELECT request_id FROM eq_batch_requests WHERE eq_batch_id = ? AND status = 'Pending' LIMIT 1", [id]);
   if (open) throw AppError.conflict('REQUEST_PENDING', `Request #${open.request_id} for this batch is already waiting for the Admin.`);
   const [r] = await conn.execute(
@@ -721,9 +1000,18 @@ async function requestIfNeeded(conn, req, id, action, reason, acceptBlockers) {
   return { request_id: r.insertId, action, status: 'Pending' };
 }
 
+/** A reason is optional on a draft and required (3+ characters) once the batch is finalized (11 Oct 2026). */
+async function reasonFor(id, reason) {
+  const text = (reason || '').trim();
+  const b = await loadBatch(pool, id);
+  if (Number(b.is_finalized) && text.length < 3) throw AppError.validation({ reason: 'is required for a finalized batch (at least 3 characters)' });
+  return text || null;
+}
+
 exports.void = async (req, res) => {
   const id = parseId(req.params.id);
-  const { reason } = validate(req.body, { reason: v.string({ required: true, min: 3, max: 500 }) });
+  const d = validate(req.body || {}, { reason: v.string({ max: 500 }) });
+  const reason = await reasonFor(id, d.reason);
   const request = await withTransaction(async (conn) => {
     const rq = await requestIfNeeded(conn, req, id, 'void', reason, false);
     if (!rq) await doVoid(conn, req, id, reason);
@@ -733,9 +1021,12 @@ exports.void = async (req, res) => {
   res.json({ status: 'success', data: await batchDetail(pool, id) });
 };
 
+/** New version = "Recalculate" on a draft (reason optional), or undo + recalculate of a finalized batch within the window. */
 exports.supersede = async (req, res) => {
   const id = parseId(req.params.id);
-  const { reason, accept_blockers } = validate(req.body, { reason: v.string({ required: true, min: 3, max: 500 }), accept_blockers: v.bool({ default: false }) });
+  const d = validate(req.body || {}, { reason: v.string({ max: 500 }), accept_blockers: v.bool({ default: false }) });
+  const reason = await reasonFor(id, d.reason);
+  const accept_blockers = d.accept_blockers;
   const out = await withTransaction(async (conn) => {
     const rq = await requestIfNeeded(conn, req, id, 'supersede', reason, accept_blockers);
     if (rq) return { request: rq };
@@ -743,6 +1034,23 @@ exports.supersede = async (req, res) => {
   });
   if (out.request) return res.status(202).json({ status: 'success', data: await batchDetail(pool, id), message: 'The batch is finalized: your request was sent to the Admin for approval.' });
   res.status(201).json({ status: 'success', data: await batchDetail(pool, out.id), warnings: out.warnings });
+};
+
+/**
+ * Undo the Finalize (11 Oct 2026): within eq_finalize_undo_hours, while nothing was paid, corrected or carried out.
+ * The batch is a draft again and keeps its invoice numbers (reserved). The Admin does it at once; an Accountant's
+ * request waits for the Admin (approveRequest), and then runs in the Admin's name. Reason required.
+ */
+exports.unfinalize = async (req, res) => {
+  const id = parseId(req.params.id);
+  const { reason } = validate(req.body, { reason: v.string({ required: true, min: 3, max: 500 }) });
+  const request = await withTransaction(async (conn) => {
+    const rq = await requestIfNeeded(conn, req, id, 'unfinalize', reason, false);
+    if (!rq) await doUnfinalize(conn, req, id, reason);
+    return rq;
+  });
+  if (request) return res.status(202).json({ status: 'success', data: await batchDetail(pool, id), message: 'Sent to the Admin for approval.' });
+  res.json({ status: 'success', data: await batchDetail(pool, id), message: 'Finalize undone: the batch is a draft again and keeps its invoice numbers.' });
 };
 
 async function loadRequest(conn, rid) {
@@ -759,7 +1067,10 @@ exports.approveRequest = async (req, res) => {
   const out = await withTransaction(async (conn) => {
     const r = await loadRequest(conn, rid);
     const reason = `${r.reason} (requested by the accountant, approved by the Admin${note ? `: ${note}` : ''})`;
-    const result = r.action === 'void' ? await doVoid(conn, req, r.eq_batch_id, reason) : await doSupersede(conn, req, r.eq_batch_id, reason, Boolean(r.accept_blockers));
+    let result;
+    if (r.action === 'void') result = await doVoid(conn, req, r.eq_batch_id, reason);
+    else if (r.action === 'unfinalize') result = await doUnfinalize(conn, req, r.eq_batch_id, reason);
+    else result = await doSupersede(conn, req, r.eq_batch_id, reason, Boolean(r.accept_blockers));
     await conn.execute("UPDATE eq_batch_requests SET status = 'Approved', decided_by_user_id = ?, decided_at = ?, decision_note = ?, result_batch_id = ? WHERE request_id = ?",
       [req.user.user_id, businessNow(), note || null, r.action === 'supersede' ? result.id : null, rid]);
     return { batchId: r.action === 'supersede' ? result.id : r.eq_batch_id, warnings: result.warnings };

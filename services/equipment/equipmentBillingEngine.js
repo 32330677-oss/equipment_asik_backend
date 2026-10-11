@@ -234,22 +234,31 @@ function standbyCredit(row, maxCredit) {
   return Math.min(Math.round(c), maxCredit, Math.round(Number(row.standby_minutes || 0)));
 }
 
-// A monthly machine owes a number of hours per month:
-//   working days of the month = calendar days minus the weekly day off (Friday by default)
-//   daily price  = monthly price / working days of that month
-//   hourly price = daily price / hours per day agreed for the machine (standard_hours_per_day)
-//   required hours = deployed working days (minus official holidays recorded) x hours per day
+// A monthly machine owes a number of hours per month (terms of 11 Oct 2026):
+//   D (divisor)  = per month: typed for this machine and month (eq_monthly_terms), else the card: the working days of
+//                  the calendar month (calendar days minus the weekly day off, Friday by default) or a fixed number (26)
+//   hourly price H = typed for this machine and month, else monthly price / D / hours per day (standard_hours_per_day)
+//   base days    = min(deployed working days, D); base = H x hours per day x base days (= monthly x base days / D)
+//   required hours = (base days - official holidays recorded) x hours per day
 //   billable hours = work + standby hours GIVEN by the Admin/Accountant per row (standby_credit_minutes, max hours per day)
 //                    + breakdown x breakdown%   (breaks deducted per break_policy). No standby % for monthly machines.
-// Billable >= required -> full base + overtime (extra hours x hourly price, or the overtime_rate typed on the card).
-// Billable <  required -> base - missing hours x hourly price.
-// ctx.months: [{ month:'2026-10', workingDays:26, assignedWorkingDays:26, holidayDays:0, daysInMonth, assignedDays }]
+// Billable >  required -> overtime ONLY when the card has overtime_enabled: extra hours x overtime_rate (or H when empty).
+//                         Overtime off: the extra hours are not paid (shown as unpaid_extra_hours).
+// Billable <  required -> base - missing hours x H.
+// ctx.months: [{ month:'2026-10', workingDays:26, assignedWorkingDays:26, holidayDays:0, daysInMonth, assignedDays,
+//                divisor?, divisorSource?: 'calendar'|'card'|'manual', hourlyCents?, hourlySource?: 'auto'|'manual' }]
+// A rate without overtime_enabled at all (old callers) keeps the old rule: overtime paid.
+function monthlyOvertimePaid(rate) {
+  return !(rate.overtime_enabled === false || rate.overtime_enabled === 0 || rate.overtime_enabled === '0');
+}
+
 function billMonthly(rows, rate, ctx) {
   const monthly = toCents(rate.monthly_rate);
   const hpd = Number(rate.standard_hours_per_day);
   const maxCredit = Math.round(hpd * 60);
   const bdPct = Number(rate.breakdown_billable_pct) / 100;
-  const t = { work: 0, ot: 0, standby: 0, breakdown: 0, workedDays: 0, baseCents: 0, shortMinutes: 0, requiredMinutes: 0, billableMinutes: 0 };
+  const otPaid = monthlyOvertimePaid(rate);
+  const t = { work: 0, ot: 0, standby: 0, breakdown: 0, workedDays: 0, baseCents: 0, shortMinutes: 0, requiredMinutes: 0, billableMinutes: 0, unpaidExtraMinutes: 0 };
   const lines = [];
   const details = [];
   const months = ctx.months || [];
@@ -263,31 +272,91 @@ function billMonthly(rows, rate, ctx) {
       if (m.status === 'Working' && m.work > 0) t.workedDays += 1;
     }
     const wd = Math.max(1, Number(mo.workingDays));
-    const hourlyC = monthly / wd / hpd; // cents per hour, not rounded
-    const baseC = roundCents(monthly * mo.assignedWorkingDays / wd);
-    const requiredMin = Math.max(0, Math.round((mo.assignedWorkingDays - (mo.holidayDays || 0)) * hpd * 60));
+    const D = Math.max(1, Number(mo.divisor ?? wd));
+    const divisorSource = mo.divisorSource || 'calendar';
+    const manualH = mo.hourlyCents !== null && mo.hourlyCents !== undefined && Number(mo.hourlyCents) > 0;
+    const hourlyC = manualH ? Number(mo.hourlyCents) : monthly / D / hpd; // cents per hour, not rounded
+    const baseDays = Math.min(Number(mo.assignedWorkingDays), D);
+    const baseC = manualH ? roundCents(hourlyC * hpd * baseDays) : roundCents(monthly * baseDays / D);
+    const requiredMin = Math.max(0, Math.round((baseDays - (mo.holidayDays || 0)) * hpd * 60));
     const billableMin = Math.round(work + credit + breakdown * bdPct);
-    const label = `${mo.month}: ${mo.assignedWorkingDays} of ${wd} working days`;
-    lines.push({ line_type: 'MonthlyBase', quantity: round4(mo.assignedWorkingDays / wd), unit: 'month', unit_price_cents: monthly, amount_cents: baseC, note: label });
-    let otMin = 0; let shortMin = 0;
+    const label = `${mo.month}: ${mo.assignedWorkingDays} deployed working days, divisor ${D} (${divisorSource}), ${baseDays} paid as base`
+      + `${manualH ? `, hourly price ${(hourlyC / 100).toFixed(2)} (manual)` : ''}`;
+    lines.push({ line_type: 'MonthlyBase', quantity: round4(baseDays / D), unit: 'month', unit_price_cents: manualH ? roundCents(hourlyC * hpd * D) : monthly,
+      amount_cents: baseC, note: label, month: mo.month });
+    let otMin = 0; let shortMin = 0; let unpaidMin = 0;
+    const done = `${mo.month}: ${(billableMin / 60).toFixed(2)} h done, ${(requiredMin / 60).toFixed(2)} h due`;
     if (billableMin > requiredMin) {
-      otMin = billableMin - requiredMin;
-      const otC = rate.overtime_rate !== null && rate.overtime_rate !== undefined ? toCents(rate.overtime_rate) : hourlyC;
-      lines.push({ line_type: 'Overtime', quantity: round4(otMin / 60), unit: 'h', unit_price_cents: roundCents(otC), unit_price_exact: Math.round(otC * 10) / 1000,
-        amount_cents: roundCents((otMin / 60) * otC), note: `${mo.month}: ${(billableMin / 60).toFixed(2)} h done, ${(requiredMin / 60).toFixed(2)} h due` });
+      if (otPaid) {
+        otMin = billableMin - requiredMin;
+        const otC = rate.overtime_rate !== null && rate.overtime_rate !== undefined ? toCents(rate.overtime_rate) : hourlyC;
+        lines.push({ line_type: 'Overtime', quantity: round4(otMin / 60), unit: 'h', unit_price_cents: roundCents(otC), unit_price_exact: Math.round(otC * 10) / 1000,
+          amount_cents: roundCents((otMin / 60) * otC), note: done, month: mo.month });
+      } else {
+        unpaidMin = billableMin - requiredMin;
+      }
     } else if (billableMin < requiredMin) {
       shortMin = requiredMin - billableMin;
       lines.push({ line_type: 'HoursShortfall', quantity: round4(shortMin / 60), unit: 'h', unit_price_cents: -roundCents(hourlyC), unit_price_exact: -Math.round(hourlyC * 10) / 1000,
-        amount_cents: -roundCents((shortMin / 60) * hourlyC), note: `${mo.month}: ${(billableMin / 60).toFixed(2)} h done, ${(requiredMin / 60).toFixed(2)} h due` });
+        amount_cents: -roundCents((shortMin / 60) * hourlyC), note: done, month: mo.month });
     }
-    t.work += work; t.standby += standby; t.breakdown += breakdown; t.ot += otMin; t.baseCents += baseC;
+    t.work += work; t.standby += standby; t.breakdown += breakdown; t.ot += otMin; t.baseCents += baseC; t.unpaidExtraMinutes += unpaidMin;
     t.shortMinutes += shortMin; t.requiredMinutes += requiredMin; t.billableMinutes += billableMin;
     details.push({ month: mo.month, working_days: wd, deployed_working_days: mo.assignedWorkingDays, holiday_days: mo.holidayDays || 0,
-      hours_per_day: hpd, hourly_price: Math.round(hourlyC * 10) / 1000, daily_price: Math.round(monthly / wd) / 100,
+      divisor: D, divisor_source: divisorSource, hourly_source: manualH ? 'manual' : 'auto', base_days: baseDays,
+      hours_per_day: hpd, hourly_price: Math.round(hourlyC * 10) / 1000, daily_price: Math.round(hourlyC * hpd) / 100,
       required_hours: requiredMin / 60, billable_hours: billableMin / 60, overtime_hours: otMin / 60, missing_hours: shortMin / 60,
+      overtime_paid: otPaid, unpaid_extra_hours: unpaidMin / 60,
+      overtime_price: otPaid ? Math.round((rate.overtime_rate !== null && rate.overtime_rate !== undefined ? toCents(rate.overtime_rate) : hourlyC) * 10) / 1000 : null,
       work_hours: work / 60, standby_hours: standby / 60, standby_paid_hours: credit / 60, breakdown_hours: breakdown / 60 });
   }
   return { totals: t, lines: lines.filter((l) => l.quantity !== 0 || l.line_type === 'MonthlyBase'), monthly_details: details };
+}
+
+/**
+ * Part of a month already partly billed by other batches (11 Oct 2026: each monthly day is billed once).
+ *   amount(this part) = F(previous days + these days, previous rows + these rows) - F(previous days, previous rows)
+ * line by line (MonthlyBase, Overtime, HoursShortfall) and month by month, so the parts always add up to the whole
+ * month — also with a typed overtime price or overtime off. A part may carry a negative overtime or a positive
+ * shortfall line: the settlement of the month's hours.
+ * ctx: { months: <months of all the days>, prev: { rows: [...], months: [...] } }  (rows = the rows of this part only)
+ */
+function billMonthlySplit(rows, rate, ctx) {
+  const prev = ctx.prev || {};
+  const prevRows = prev.rows || [];
+  const all = billMonthly([...prevRows, ...rows], rate, { months: ctx.months || [] });
+  const before = billMonthly(prevRows, rate, { months: prev.months || [] });
+  const t = { work: 0, ot: 0, standby: 0, breakdown: 0, workedDays: 0, baseCents: 0, shortMinutes: 0, requiredMinutes: 0, billableMinutes: 0, unpaidExtraMinutes: 0 };
+  for (const r of rows) {
+    const m = dayMinutes(r, rate);
+    t.work += m.work; t.standby += m.standby; t.breakdown += m.breakdown;
+    if (m.status === 'Working' && m.work > 0) t.workedDays += 1;
+  }
+  const sum = (res, type, month, k) => res.lines.filter((l) => l.line_type === type && l.month === month).reduce((a, l) => a + l[k], 0);
+  const lines = [];
+  const details = [];
+  for (const mo of ctx.months || []) {
+    const b = before.monthly_details.find((x) => x.month === mo.month) || null;
+    const a = all.monthly_details.find((x) => x.month === mo.month);
+    for (const type of ['MonthlyBase', 'Overtime', 'HoursShortfall']) {
+      const amount = sum(all, type, mo.month, 'amount_cents') - sum(before, type, mo.month, 'amount_cents');
+      const qty = round4(sum(all, type, mo.month, 'quantity') - sum(before, type, mo.month, 'quantity'));
+      if (amount === 0 && qty === 0 && type !== 'MonthlyBase') continue;
+      if (amount === 0 && qty === 0 && b && a.base_days === b.base_days) continue; // no new base day
+      const ref = all.lines.find((l) => l.line_type === type && l.month === mo.month) || before.lines.find((l) => l.line_type === type && l.month === mo.month) || {};
+      lines.push({ line_type: type, quantity: qty, unit: type === 'MonthlyBase' ? 'month' : 'h', unit_price_cents: ref.unit_price_cents || 0,
+        ...(ref.unit_price_exact !== undefined ? { unit_price_exact: ref.unit_price_exact } : {}), amount_cents: amount, month: mo.month,
+        note: b ? `${mo.month}: month settlement — whole month ${a.base_days} base day(s), ${a.billable_hours.toFixed(2)} h done / ${a.required_hours.toFixed(2)} h due; `
+          + `already billed ${b.base_days} base day(s), ${b.billable_hours.toFixed(2)} h / ${b.required_hours.toFixed(2)} h` : (ref.note || '') });
+    }
+    const d = (k) => Math.round(((a[k] || 0) - (b ? b[k] || 0 : 0)) * 10000) / 10000;
+    t.ot += Math.round(d('overtime_hours') * 60); t.shortMinutes += Math.round(d('missing_hours') * 60); t.unpaidExtraMinutes += Math.round(d('unpaid_extra_hours') * 60);
+    t.requiredMinutes += Math.round(d('required_hours') * 60); t.billableMinutes += Math.round(d('billable_hours') * 60);
+    details.push({ ...a, part: Boolean(b), overtime_hours: d('overtime_hours'), missing_hours: d('missing_hours'), unpaid_extra_hours: d('unpaid_extra_hours'),
+      billed_before: b ? { base_days: b.base_days, deployed_working_days: b.deployed_working_days, required_hours: b.required_hours, billable_hours: b.billable_hours } : null });
+  }
+  t.baseCents = lines.filter((l) => l.line_type === 'MonthlyBase').reduce((x, l) => x + l.amount_cents, 0);
+  return { totals: t, lines, monthly_details: details };
 }
 
 function round4(x) { return Math.round(x * 10000) / 10000; }
@@ -306,7 +375,7 @@ function billItem(rows, rate, ctx = {}, extras = {}) {
   let res;
   if (rate.billing_mode === 'Hourly') res = billHourly(rows, rate);
   else if (rate.billing_mode === 'Daily') res = billDaily(rows, rate);
-  else if (rate.billing_mode === 'Monthly') res = billMonthly(rows, rate, ctx);
+  else if (rate.billing_mode === 'Monthly') res = ctx.prev ? billMonthlySplit(rows, rate, ctx) : billMonthly(rows, rate, ctx);
   else throw new Error(`Unknown billing_mode ${rate.billing_mode}`);
 
   if (!rate.operator_included && rate.operator_daily_rate != null) {
@@ -332,6 +401,6 @@ function billItem(rows, rate, ctx = {}, extras = {}) {
 }
 
 module.exports = {
-  standbyCredit, exactCents, dayMinutes, billItem, billHourly, billDaily, billMonthly, minimumTopUp, otThresholdMin,
+  monthlyOvertimePaid, billMonthlySplit, standbyCredit, exactCents, dayMinutes, billItem, billHourly, billDaily, billMonthly, minimumTopUp, otThresholdMin,
   allowOf, planDay, planDays, dayPlans, plansFor, shiftOrder, blockAllowances,
 };

@@ -1,5 +1,6 @@
-// P13 — correction policy of 6 Oct 2026: closed months are never reopened by a new batch, official corrections (several
-// fields, one approval by another person, also for money that is not attendance), correction settlements cannot be
+// P13 — correction policy of 6 Oct 2026, updated 11 Oct 2026 (an Admin approves; an Admin's own correction applies at once;
+// a Finalize locks what it billed, not the whole period): official corrections (several
+// fields, one approval, also for money that is not attendance), correction settlements cannot be
 // cancelled, office edits before the lock, undo Mark Paid, late entries (warning only), historical supervisors, cancelled rows.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
@@ -14,7 +15,7 @@ const ACC = () => h.auth(h.T.accountant());
 const S9 = () => h.auth(h.T.sup9());
 const code = async (req) => (await req).body.code;
 const pj = (v) => (typeof v === 'string' ? JSON.parse(v) : v);
-let F; let oct; let lateRow; let paidRow;
+let F; let oct; let late; let lateRow; let paidRow;
 
 async function workDay(m, date, inT, outT, { approve = true, sup = S8, site = 8, shift = 'Day' } = {}) {
   // a past day is recorded as one whole session (check-in with its check-out), as the paper sheet shows it
@@ -47,54 +48,56 @@ before(async () => {
 });
 after(async () => { BD.setClock(() => NOW); await h.closePool(); });
 
-test('closed month: a late row is neither approved nor rejected normally, and no new batch pays it', async () => {
-  const ap = await ok(h.api().post('/api/equipment/admin/attendance/approve').set(A()).send({ ids: [lateRow] }));
-  assert.deepStrictEqual(ap.approved, []);
-  assert.strictEqual(ap.skipped[0].reason, 'PAYROLL_PERIOD_FINALIZED');
-  const rj = await ok(h.api().post('/api/equipment/admin/attendance/reject').set(A()).send({ ids: [lateRow], notes: 'check' }));
-  assert.strictEqual(rj.skipped[0].reason, 'PAYROLL_PERIOD_FINALIZED');
+test('a late row of a finalized month is approved normally and paid by the next batch (11 Oct 2026)', async () => {
+  // the finalized October batch did not bill it (it was still Submitted): nothing locks it
   const blk = await ok(h.api().get(`/api/equipment/payroll/blockers?start_date=2026-10-01&end_date=2026-10-31&equipment_id=${F.exc.equipment_id}`).set(ACC()));
-  const closed = blk.find((b) => b.code === 'IN_CLOSED_PERIOD');
-  assert.ok(closed && closed.items.find((r) => r.eq_attendance_id === lateRow), 'the late row is shown as needing a Correction');
-  // even if a row got approved by another route (old data), a new batch over the closed month pays nothing of it
-  await h.query("UPDATE eq_attendance SET status = 'Approved' WHERE eq_attendance_id = ?", [lateRow]);
-  const again = await h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-10-01', end_date: '2026-10-31', equipment_id: F.exc.equipment_id });
-  assert.strictEqual(again.body.code, 'NOTHING_TO_PAY');
-  await h.query("UPDATE eq_attendance SET status = 'Submitted' WHERE eq_attendance_id = ?", [lateRow]);
-  // fuel recorded in October but never priced cannot be priced now (it would never be billed): Correction
+  assert.ok(!blk.find((b) => b.code === 'IN_CLOSED_PERIOD'), 'no closed-period rule any more');
+  assert.ok(blk.find((b) => b.code === 'NOT_APPROVED').items.find((r) => r.eq_attendance_id === lateRow));
+  const ap = await ok(h.api().post('/api/equipment/admin/attendance/approve').set(A()).send({ ids: [lateRow] }));
+  assert.deepStrictEqual(ap.approved, [lateRow]);
+  // fuel recorded in October but never priced is priced now and billed by the next batch
   const [f] = await h.query("INSERT INTO eq_fuel_issues (equipment_id, site_id, issue_date, liters, issued_by_user_id) VALUES (?, 8, '2026-10-07', 30, 3)", [F.exc.equipment_id]).then((x) => [x]);
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/fuel-issues/${f.insertId}`).set(ACC()).send({ price_per_liter: 1 })), 'PAYROLL_PERIOD_FINALIZED');
+  await ok(h.api().patch(`/api/equipment/fuel-issues/${f.insertId}`).set(ACC()).send({ price_per_liter: 1 }));
+  late = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-10-01', end_date: '2026-10-31', equipment_id: F.exc.equipment_id }));
+  const rows = await ok(h.api().get(`/api/equipment/payroll/batches/${late.eq_batch_id}/rows`).set(ACC()));
+  assert.deepStrictEqual(rows.map((r) => r.eq_attendance_id), [lateRow], 'only the late row: the finalized one is not billed again');
+  assert.ok(late.items[0].lines.find((l) => l.line_type === 'Fuel' && l.source_id === f.insertId));
+  await ok(h.api().patch(`/api/equipment/payroll/batches/${late.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
 });
 
-test('a late row of a closed month is paid through an official Correction (requested by the Accountant, approved by the Admin)', async () => {
+test('a row billed by a finalized batch is corrected only officially (requested by the Accountant, approved by the Admin)', async () => {
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${lateRow}`).set(ACC()).send({ check_out_time: '2026-10-06 16:00' })), 'PAYROLL_PERIOD_FINALIZED');
   const c = await ok(h.api().post(`/api/equipment/admin/attendance/${lateRow}/correction`).set(ACC())
-    .send({ reason: 'Approved late: signed sheet received', changes: { check_out_time: '2026-10-06 16:00' }, amount_override: 360, override_reason: '9 h x 40 from the paper sheet' }));
+    .send({ reason: 'Signed sheet received: 16:00', changes: { check_out_time: '2026-10-06 16:00' } }));
   assert.strictEqual(c.request_status, 'Requested');
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(ACC()).send({})), 'SAME_PERSON');
+  assert.strictEqual(c.locked_batch_id, late.eq_batch_id);
+  assert.strictEqual(Number(c.delta_amount), 40); // paid 8 h x 40; 9 h now
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(ACC()).send({})), 'ADMIN_APPROVES');
   const done = await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(A()).send({}));
   assert.strictEqual(done.request_status, 'Approved');
   assert.strictEqual(done.note.kind, 'DebitNote');
   const [row] = await h.query('SELECT status, check_out_time FROM eq_attendance WHERE eq_attendance_id = ?', [lateRow]);
-  assert.strictEqual(row.status, 'Approved', 'the office accepted the corrected row');
+  assert.strictEqual(row.status, 'Approved');
   assert.strictEqual(row.check_out_time, '2026-10-06 16:00:00');
   const [adj] = await h.query('SELECT adjustment_id, amount, adjustment_date FROM eq_adjustments WHERE correction_id = ?', [c.correction_id]);
-  assert.strictEqual(Number(adj.amount), 360);
+  assert.strictEqual(Number(adj.amount), 40);
   assert.ok(adj.adjustment_date > '2026-10-31', 'settled in the first open period');
   // F1 / C1: the settlement belongs to the correction: never cancelled by hand (API refuses, list says why)
   assert.strictEqual(await code(h.api().patch(`/api/equipment/adjustments/${adj.adjustment_id}/cancel`).set(ACC()).send({ reason: 'mistake' })), 'CORRECTION_ADJUSTMENT_LOCKED');
   assert.strictEqual(await code(h.api().patch(`/api/equipment/adjustments/${adj.adjustment_id}/cancel`).set(A()).send({ reason: 'mistake' })), 'CORRECTION_ADJUSTMENT_LOCKED');
   const list = await ok(h.api().get(`/api/equipment/adjustments?equipment_id=${F.exc.equipment_id}`).set(ACC()));
   assert.match(list.find((a) => a.adjustment_id === adj.adjustment_id).correction_note_no, /^DN-/);
-  // the row is still never paid again by a batch of the closed month
+  // nothing of October is billed twice
   assert.strictEqual(await code(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-10-01', end_date: '2026-10-31', equipment_id: F.exc.equipment_id })), 'NOTHING_TO_PAY');
 });
 
-test('one correction carries several fields; one approval by another person; the author of an amendment cannot approve it', async () => {
+test('one correction carries several fields; one approval by the Admin; the Admin may approve a version they amended', async () => {
   const changes = { check_in_time: '2026-10-05 06:30', check_out_time: '2026-10-05 16:00', downtime: [{ downtime_type: 'Break', start_time: '2026-10-05 12:00', end_time: '2026-10-05 12:30' }] };
-  const c = await ok(h.api().post(`/api/equipment/admin/attendance/${paidRow}/correction`).set(A()).send({ reason: 'Signed sheet: 06:30-16:00, 30 min break', changes }));
+  const c = await ok(h.api().post(`/api/equipment/admin/attendance/${paidRow}/correction`).set(ACC()).send({ reason: 'Signed sheet: 06:30-16:00, 30 min break', changes }));
   assert.strictEqual(Number(c.delta_amount), 40); // paid 8 h = 320; corrected 9 h x 40 = 360
   assert.strictEqual(await code(h.api().post(`/api/equipment/admin/attendance/${paidRow}/correction`).set(ACC()).send({ reason: 'another one', changes: { remarks: 'x' } })), 'CORRECTION_PENDING');
-  const done = await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(ACC()).send({ note: 'matches the sheet' }));
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(ACC()).send({})), 'ADMIN_APPROVES');
+  const done = await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(A()).send({ note: 'matches the sheet' }));
   assert.deepStrictEqual(done.events.map((e) => e.action), ['request', 'approve']);
   const [row] = await h.query('SELECT check_in_time, check_out_time, working_minutes, break_minutes FROM eq_attendance WHERE eq_attendance_id = ?', [paidRow]);
   assert.strictEqual(row.check_in_time, '2026-10-05 06:30:00');
@@ -102,10 +105,11 @@ test('one correction carries several fields; one approval by another person; the
   assert.strictEqual(Number(row.break_minutes), 30);
   const notes = await h.query("SELECT kind, amount FROM eq_invoices WHERE kind IN ('DebitNote','CreditNote') AND eq_batch_id = ?", [oct.eq_batch_id]);
   assert.ok(notes.find((n) => Number(n.amount) === 40), 'one note for the three fields');
-  // amendment: the Accountant changes the amount; the Accountant may not approve that version, the Admin may
-  const c2 = await ok(h.api().post(`/api/equipment/admin/attendance/${paidRow}/correction`).set(A()).send({ reason: 'Work description wrong', changes: { work_description: 'Excavation B2' } }));
-  await ok(h.api().patch(`/api/equipment/admin/corrections/${c2.correction_id}/review`).set(ACC()).send({ note: 'no money', amount_override: 0, override_reason: 'text only' }));
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c2.correction_id}/approve`).set(ACC()).send({})), 'SAME_PERSON');
+  // amendment: the Admin changes the Accountant's amount and approves that version themselves
+  const c2 = await ok(h.api().post(`/api/equipment/admin/attendance/${paidRow}/correction`).set(ACC()).send({ reason: 'Work description wrong', changes: { work_description: 'Excavation B2' } }));
+  const rv = await ok(h.api().patch(`/api/equipment/admin/corrections/${c2.correction_id}/review`).set(A()).send({ note: 'no money', amount_override: 0, override_reason: 'text only' }));
+  assert.strictEqual(rv.request_status, 'Reviewed');
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c2.correction_id}/approve`).set(ACC()).send({})), 'ADMIN_APPROVES');
   const ok2 = await ok(h.api().patch(`/api/equipment/admin/corrections/${c2.correction_id}/approve`).set(A()).send({}));
   assert.strictEqual(ok2.note, null, 'no money difference: no note');
   // the finalized batch itself never changes
@@ -121,7 +125,7 @@ test('official correction of money that is not attendance: fuel litres of a fina
   const c = await ok(h.api().post('/api/equipment/admin/corrections/financial').set(ACC())
     .send({ target_type: 'fuel_issue', target_id: fuelLine.source_id, eq_item_id: item.eq_item_id, fuel_changes: { liters: 40 }, reason: 'Receipt shows 40 L, not 50 L' }));
   assert.strictEqual(Number(c.delta_amount), 10, 'we deducted 50, should have deducted 40');
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(ACC()).send({})), 'SAME_PERSON');
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(ACC()).send({})), 'ADMIN_APPROVES');
   const done = await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(A()).send({}));
   assert.strictEqual(done.note.kind, 'DebitNote');
   const [f] = await h.query('SELECT liters FROM eq_fuel_issues WHERE fuel_issue_id = ?', [fuelLine.source_id]);
@@ -131,14 +135,14 @@ test('official correction of money that is not attendance: fuel litres of a fina
   // a rate card used by a finalized batch is not edited; its price is corrected the same way (amount given)
   const rc = await ok(h.api().post('/api/equipment/admin/corrections/financial').set(A())
     .send({ target_type: 'rate_card', target_id: item.rate_card_id, eq_item_id: item.eq_item_id, amount: -15, reason: 'Agreed discount not applied' }));
-  const rcDone = await ok(h.api().patch(`/api/equipment/admin/corrections/${rc.correction_id}/approve`).set(ACC()).send({}));
-  assert.strictEqual(rcDone.note.kind, 'CreditNote');
+  assert.strictEqual(rc.request_status, 'Approved', 'an Admin\'s correction applies at once');
+  assert.strictEqual(rc.note.kind, 'CreditNote');
 });
 
 test('before the lock the office corrects directly: the Accountant needs no Admin approval; stale batch; audit keeps field changes', async () => {
   const id = await workDay(F.exc, '2026-11-10', '07:00', '15:00');
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${id}`).set(ACC()).send({ check_out_time: '2026-11-10 16:00' })), 'VALIDATION_ERROR');
-  const e = await ok(h.api().patch(`/api/equipment/admin/attendance/${id}`).set(ACC()).send({ check_out_time: '2026-11-10 16:00', check_in_time: '2026-11-10 06:45', reason: 'Signed sheet shows 06:45-16:00' }));
+  // no reason is needed before the lock (11 Oct 2026); the audit keeps the before / after values
+  const e = await ok(h.api().patch(`/api/equipment/admin/attendance/${id}`).set(ACC()).send({ check_out_time: '2026-11-10 16:00', check_in_time: '2026-11-10 06:45' }));
   assert.strictEqual(e.status, 'Approved');
   assert.strictEqual(e.edited_after_approval, true);
   const [log] = await h.query("SELECT changed_fields, payroll_effect, reason FROM audit_logs WHERE table_name = 'eq_attendance' AND record_id = ? AND action_type = 'office_edit_after_approval'", [id]);
@@ -219,8 +223,8 @@ test('a row that should not exist is cancelled, not falsified; its slot can be r
   const [lookedUp] = await h.query('SELECT status FROM eq_attendance WHERE eq_attendance_id = ?', [approved]);
   assert.strictEqual(lookedUp.status, 'Rejected', 'nothing changed');
   await h.query("UPDATE eq_attendance SET status = 'Approved' WHERE eq_attendance_id = ?", [approved]);
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${approved}/cancel`).set(ACC()).send({})), 'VALIDATION_ERROR');
-  const v = await ok(h.api().patch(`/api/equipment/admin/attendance/${approved}/cancel`).set(ACC()).send({ reason: 'duplicate of the night shift row' }));
+  // the office voids it before the lock without a mandatory reason (11 Oct 2026)
+  const v = await ok(h.api().patch(`/api/equipment/admin/attendance/${approved}/cancel`).set(ACC()).send({}));
   assert.strictEqual(v.status, 'Cancelled');
   // inside the closed month: only an official Correction (cancel_row)
   assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${paidRow}/cancel`).set(ACC()).send({ reason: 'wrong machine' })), 'PAYROLL_PERIOD_FINALIZED');
@@ -333,7 +337,7 @@ test('final decisions of 6 Oct 2026: no amount threshold, no extra separation of
   assert.strictEqual(big.status, 'Active');
   const gone = await ok(h.api().patch(`/api/equipment/adjustments/${big.adjustment_id}/cancel`).set(ACC()).send({ reason: 'entered on the wrong machine' }));
   assert.strictEqual(gone.status, 'Cancelled');
-  // no extra separation of duties: the same Admin generates, finalizes and marks paid (only the official Correction needs two people)
+  // no extra separation of duties: the same Admin generates, finalizes and marks paid (an Accountant's official Correction waits for an Admin)
   const id = await workDay(F.loader, '2026-11-17', '07:00', '15:00', { sup: S9 });
   const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-11&equipment_id=${F.loader.equipment_id}`).set(A()));
   for (const sh of sheets) await ok(h.api().post(`/api/equipment/timesheets/${sh.timesheet_id}/scans`).set(A()).attach('files', await QRCode.toBuffer(`signed ${sh.timesheet_id}`), 'scan.png'));

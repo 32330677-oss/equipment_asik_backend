@@ -139,16 +139,20 @@ test('finalize locks; supersede creates v2; void rules; accountant finalize sett
   const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-03'", [F.exc.equipment_id]);
   const edit = await h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'x' });
   assert.strictEqual(edit.body.code, 'PAYROLL_PERIOD_FINALIZED');
-  // finalized, not paid: a new version may replace it; the old invoice numbers stay, marked cancelled
+  // finalized, not paid, within eq_finalize_undo_hours: a new version may replace it (undo + recalculate, 11 Oct 2026);
+  // the old numbers are withdrawn (reserved for the new version), and cancelled if that version is voided
   const sup = await ok(h.api().post(`/api/equipment/payroll/batches/${batch.eq_batch_id}/supersede`).set(A()).send({ reason: 'rate correction' }));
   assert.strictEqual(sup.version_number, 2);
   assert.strictEqual(sup.total_net, '8235.00');
+  assert.ok(sup.reserved_numbers.length > 0, 'the draft keeps the numbers of the version it replaces');
   const old = await ok(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}`).set(ACC()));
-  assert.ok(old.invoices.length > 0 && old.invoices.every((i) => i.cancelled), 'superseded invoices are cancelled, never reused');
+  assert.ok(old.invoices.length > 0 && old.invoices.every((i) => i.status === 'Withdrawn' && !i.cancelled), 'superseded numbers are reserved, not cancelled');
   const chain = await ok(h.api().get(`/api/equipment/payroll/batches/${sup.eq_batch_id}/versions`).set(ACC()));
   assert.deepStrictEqual(chain.map((c) => c.status), ['Superseded', 'Generated']);
   const voided = await ok(h.api().patch(`/api/equipment/payroll/batches/${sup.eq_batch_id}/void`).set(A()).send({ reason: 'redo' }));
   assert.strictEqual(voided.status, 'Voided');
+  const oldAfter = await ok(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}`).set(ACC()));
+  assert.ok(oldAfter.invoices.every((i) => i.cancelled), 'voiding the new version cancels the reserved numbers');
   const again = await ok(h.api().post('/api/equipment/payroll/preview').set(ACC()).send(SCOPE));
   assert.strictEqual(again.totals[0].net, '8235.00', 'void frees rows');
 });

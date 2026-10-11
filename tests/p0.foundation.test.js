@@ -13,7 +13,7 @@ test('schema + migrations: 30 tables, idempotent', async () => {
   await conn.query(fs.readFileSync(path.join(__dirname, '../database/schema.sql'), 'utf8'));
   await conn.query(fs.readFileSync(path.join(__dirname, '../database/seed.sql'), 'utf8'));
   const [[{ n }]] = await conn.query('SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = DATABASE()');
-  assert.strictEqual(Number(n), 40); // 30 in schema.sql + 4 from migrations 001-010 + eq_attendance_change_requests (012) + 4 (013: DNR, payments) + eq_opening_balances (014)
+  assert.strictEqual(Number(n), 43); // 30 in schema.sql + 4 from migrations 001-010 + eq_attendance_change_requests (012) + 4 (013: DNR, payments) + eq_opening_balances (014) + eq_monthly_terms (018) + eq_payroll_batch_machines, eq_payroll_monthly_days (019)
   const [[{ s }]] = await conn.query('SELECT COUNT(*) AS s FROM settings');
   assert.ok(Number(s) >= 11);
   const [[{ t }]] = await conn.query('SELECT COUNT(*) AS t FROM eq_types');

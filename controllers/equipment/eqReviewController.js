@@ -1,10 +1,12 @@
 // Office review: list, approve, reject, anomalies, office edit, void row, change requests, and official corrections (§5.6).
 //
-// Policy (6 Oct 2026):
-//  - Not financially committed (no FINALIZED batch covers the row) -> the office (Admin or Accountant) corrects it directly.
-//    An Approved row stays Approved, flagged "edited after approval", with a reason; a Generated batch over it turns stale.
-//  - Financially committed (Finalized / Paid)                     -> only the official Correction: requested by an Admin or
-//    an Accountant, approved by ANOTHER Admin/Accountant; the difference is settled by a debit / credit note + adjustment.
+// Policy (6 Oct 2026, updated 11 Oct 2026):
+//  - Not financially committed (no FINALIZED batch billed the row / its monthly day) -> the office (Admin or Accountant) corrects it directly.
+//    An Approved row stays Approved, flagged "edited after approval" (reason optional since 11 Oct 2026; the audit keeps
+//    the before / after values); a Generated batch over it turns stale.
+//  - Financially committed (Finalized / Paid)                     -> only the official Correction. Policy of 11 Oct 2026:
+//    an Admin applies it at once (no second person); an Accountant sends it to an Admin, who approves it (another
+//    Accountant cannot). The difference is settled by a debit / credit note + adjustment.
 const { pool, withTransaction } = require('../../config/db');
 const AppError = require('../../utils/AppError');
 const { v, validate, parseId, pageParams } = require('../../utils/validate');
@@ -15,8 +17,6 @@ const lock = require('../../services/equipment/eqLock');
 const att = require('./eqAttendanceController');
 const C = require('../../services/equipment/eqCommon');
 const CORR = require('../../services/equipment/eqCorrectionService');
-
-const OFFICE = ['Admin', 'Accountant'];
 
 exports.list = async (req, res) => {
   const { page, pageSize, offset } = pageParams(req.query);
@@ -152,7 +152,7 @@ const touchesPaper = (changes) => PAPER_FIELDS.some((k) => changes && changes[k]
 
 /**
  * Office edit of a row that is NOT financially committed (no finalized batch covers it): any field, the day status and
- * the stops, several at once. An Approved row stays Approved but is flagged "edited after approval" (reason required).
+ * the stops, several at once. An Approved row stays Approved but is flagged "edited after approval" (reason optional).
  * Shared by the direct office edit and by an approved supervisor change request.
  */
 async function officeEdit(conn, req, id, changes, reason, extra = {}) {
@@ -161,7 +161,6 @@ async function officeEdit(conn, req, id, changes, reason, extra = {}) {
   await lock.assertEqEditable(conn, row);
   if (changes.cancel_row) throw AppError.validation({ cancel_row: 'use "Void row" to cancel a row' });
   const approved = row.status === 'Approved';
-  if (approved && (!reason || reason.trim().length < 5)) throw AppError.validation({ reason: 'explain why an approved row is changed (at least 5 characters)' });
   const status = changes.day_status || row.day_status;
   if (status !== 'Working' && (changes.operator_id || changes.meter_start !== undefined || changes.meter_end !== undefined)) {
     throw AppError.conflict('INVALID_STATE', `A ${status} row has no operator or meter readings.`);
@@ -173,7 +172,7 @@ async function officeEdit(conn, req, id, changes, reason, extra = {}) {
   if (touchesPaper(changes)) await resetPaper(conn, row, req.user.user_id);
   if (approved) {
     await conn.execute('UPDATE eq_attendance SET edited_after_approval = 1, admin_edit_reason = ?, admin_edit_by_user_id = ?, admin_edit_at = ? WHERE eq_attendance_id = ?',
-      [reason.trim(), req.user.user_id, businessNow(), id]);
+      [reason && reason.trim() ? reason.trim() : null, req.user.user_id, businessNow(), id]);
   }
   const afterFull = { ...after, downtime: await S.loadDowntime(conn, id) };
   await audit.log(conn, {
@@ -202,7 +201,7 @@ exports.adminEdit = async (req, res) => {
  */
 exports.voidRow = async (req, res) => {
   const id = parseId(req.params.id);
-  const { reason } = validate(req.body, { reason: v.string({ required: true, min: 5, max: 1000 }) });
+  const { reason } = validate(req.body || {}, { reason: v.string({ max: 1000 }) }); // optional before the lock (11 Oct 2026)
   await withTransaction(async (conn) => {
     const row = await S.loadRow(conn, id, true);
     if (row.status === 'Cancelled') throw AppError.conflict('ROW_CANCELLED', 'This row is already cancelled.');
@@ -210,7 +209,7 @@ exports.voidRow = async (req, res) => {
     if (row.day_status === 'Working' && row.check_in_time && !row.check_out_time) {
       throw AppError.conflict('OPEN_SESSION', 'The machine is still checked in on this row. Check it out (or fix the times) first.');
     }
-    await att.cancelRow(conn, req, row, reason, 'void');
+    await att.cancelRow(conn, req, row, reason && reason.trim() ? reason.trim() : null, 'void');
   });
   res.json({ status: 'success', data: await att.rowView(pool, id), message: 'Row voided (kept as Cancelled).' });
 };
@@ -316,6 +315,7 @@ exports.approveChangeRequest = async (req, res) => {
       }
       if (!preDelta) throw AppError.conflict('INVALID_STATE', 'The row was locked meanwhile; try again.');
       correctionId = await createCorrection(conn, req, cr.eq_attendance_id, cr.proposed_changes, reason, null, null, preDelta);
+      if (isAdmin(req)) await approveInTx(conn, req, correctionId, preDelta, d.note || null); // an Admin's correction applies at once
     } else {
       await officeEdit(conn, req, cr.eq_attendance_id, cr.proposed_changes, reason, { relatedType: 'eq_attendance_change_requests', relatedId: id });
     }
@@ -326,7 +326,9 @@ exports.approveChangeRequest = async (req, res) => {
     return { correctionId };
   });
   res.json({ status: 'success', data: await changeRequestView(pool, id),
-    message: result.correctionId ? `Converted to correction #${result.correctionId}; another person approves it.` : 'Change applied.' });
+    message: result.correctionId
+      ? (isAdmin(req) ? `Converted to correction #${result.correctionId} and applied.` : `Converted to correction #${result.correctionId}; ${SENT_MSG}`)
+      : 'Change applied.' });
 };
 
 exports.rejectChangeRequest = async (req, res) => {
@@ -370,17 +372,17 @@ async function loadCorrection(conn, id, lockRow = false) {
   return c;
 }
 
-/** The person whose version is on the table (the requester, or whoever amended it last) cannot approve it. */
+/** The person whose version is on the table (the requester, or whoever amended it last). */
 function lastAuthor(c) {
   return c.request_status === 'Reviewed' && c.reviewed_by_user_id ? c.reviewed_by_user_id : c.corrected_by_user_id;
 }
+/** Policy of 11 Oct 2026: only an Admin approves a correction — even one they asked for or amended last. */
 function assertMayApprove(c, user) {
-  if (lastAuthor(c) === user.user_id) {
-    throw AppError.forbidden('SAME_PERSON', c.request_status === 'Reviewed'
-      ? 'You changed this correction last; another Admin or Accountant approves it.'
-      : 'You asked for this correction; another Admin or Accountant approves it.');
-  }
+  if (user.role !== 'Admin') throw AppError.forbidden('ADMIN_APPROVES', 'Only an Admin approves a correction.');
 }
+const isAdmin = (req) => Boolean(req.user && req.user.role === 'Admin');
+const SENT_MSG = 'Sent to the Admin for approval.';
+const APPLIED_MSG = 'Correction applied. The finalized payroll was not changed; the difference is settled in the next open period.';
 
 /**
  * Creates an attendance correction request (inside the caller's transaction). Returns its id.
@@ -414,13 +416,18 @@ exports.correction = async (req, res) => {
   const d = validate(body, { reason: v.string({ required: true, min: 5, max: 1000 }), amount_override: v.number({ min: -99999999, max: 99999999, decimals: 2 }), override_reason: v.string({ max: 1000 }) });
   const changes = CORR.normalizeChanges(body.changes);
   const delta = await CORR.computeDelta(id, changes, req.user.user_id); // validates the changes on a dry run
-  const cid = await withTransaction((conn) => createCorrection(conn, req, id, changes, d.reason, d.amount_override ?? null, d.override_reason || null, delta));
-  res.status(201).json({ status: 'success', data: await correctionView(pool, cid), message: 'Correction requested. Another Admin or Accountant approves it.' });
+  // an Admin's correction is applied at once (same transaction); an Accountant's waits for an Admin
+  const cid = await withTransaction(async (conn) => {
+    const newId = await createCorrection(conn, req, id, changes, d.reason, d.amount_override ?? null, d.override_reason || null, delta);
+    if (isAdmin(req)) await approveInTx(conn, req, newId, delta, null);
+    return newId;
+  });
+  res.status(201).json({ status: 'success', data: await correctionView(pool, cid), message: isAdmin(req) ? APPLIED_MSG : SENT_MSG });
 };
 
 /**
  * Official correction of money that is not an attendance row: a fuel issue, a rate card price, a fuel price / terms,
- * an adjustment or a deployment already inside a FINALIZED batch (or a fuel issue dated in a closed period).
+ * an adjustment or a deployment already billed by a FINALIZED batch.
  * Same approval as attendance corrections; settled by a debit / credit note + adjustment in the first open period.
  */
 exports.financialCorrection = async (req, res) => {
@@ -462,11 +469,10 @@ exports.financialCorrection = async (req, res) => {
           auto = Math.round(Number(line.amount) * (newValue / oldValue) * 100) - Math.round(Number(line.amount) * 100);
         }
       } else {
-        const b = await lock.finalizedOverlap(conn, { vendorId: f.vendor_id, equipmentId: f.equipment_id, siteId: f.site_id, from: f.issue_date, to: f.issue_date });
-        if (!b) throw AppError.conflict('NOT_LOCKED', 'This fuel issue is not in a closed period: change it normally.');
-        lockedBatch = b.eq_batch_id;
-        const card = await C.rateCardOn(conn, f.equipment_id, String(f.issue_date).slice(0, 10));
-        currency = card ? card.currency : null;
+        // 11 Oct 2026: only what a finalized batch billed is locked; a fuel issue no finalized batch billed is changed normally
+        const b = await lock.sourceConsumed(conn, 'eq_fuel_issues', f.fuel_issue_id, true);
+        if (!b) throw AppError.conflict('NOT_LOCKED', 'This fuel issue was not billed by a finalized batch: change it normally.');
+        throw AppError.validation({ eq_item_id: `choose the item of finalized batch #${b.eq_batch_id} that billed this fuel issue` });
       }
     } else if (!item) {
       throw AppError.validation({ eq_item_id: 'choose the finalized payroll item (machine invoice) that is corrected' });
@@ -495,9 +501,10 @@ exports.financialCorrection = async (req, res) => {
     await corrEvent(conn, r.insertId, 'request', req, d.reason, { target_type: d.target_type, target_id: d.target_id ?? null, amount_cents: cents, fuel_changes: fuel });
     await audit.log(conn, { table: 'eq_attendance_corrections', id: r.insertId, action: 'request_financial', newValues: { ...d, fuel_changes: fuel },
       reason: d.reason, relatedType: d.target_type, relatedId: d.target_id ?? null, payrollEffect: `correction:${r.insertId}`, ...audit.ctx(req) });
+    if (isAdmin(req)) await approveInTx(conn, req, r.insertId, null, null);
     return r.insertId;
   });
-  res.status(201).json({ status: 'success', data: await correctionView(pool, cid), message: 'Correction requested. Another Admin or Accountant approves it.' });
+  res.status(201).json({ status: 'success', data: await correctionView(pool, cid), message: isAdmin(req) ? APPLIED_MSG : SENT_MSG });
 };
 
 async function correctionView(conn, id) {
@@ -602,7 +609,78 @@ async function settle(conn, req, c, cents, { equipmentId, siteId, vendorId, batc
   return { adjustmentId: a.insertId, noteId: n.invoice_id };
 }
 
-/** Approve (by someone other than the author of the version on the table): the record is corrected, the difference settled. */
+/**
+ * Applies a correction inside the caller's transaction: the record is corrected and the difference settled.
+ * `delta` (attendance corrections) is computed by the caller BEFORE its transaction; null for financial corrections.
+ */
+async function approveInTx(conn, req, id, delta, note) {
+  const c = await loadCorrection(conn, id, true);
+  if (!['Requested', 'Reviewed'].includes(c.request_status)) throw AppError.conflict('INVALID_STATE', `This correction is ${c.request_status}.`);
+  assertMayApprove(c, req.user);
+  const override = c.amount_override !== null && c.amount_override !== undefined;
+  let settled = { adjustmentId: null, noteId: null }; let cents = 0; let afterValues = c.corrected_values;
+  if (c.eq_attendance_id) {
+    if (!delta.auto && !override) throw AppError.validation({ amount_override: 'this row was not paid by a finalized batch: amend the correction with the amount to settle (0 if none)' });
+    const before = await S.loadRow(conn, c.eq_attendance_id, true);
+    const changes = c.proposed_changes || {};
+    await CORR.applyChanges(conn, c.eq_attendance_id, changes, req.user.user_id);
+    if (touchesPaper(changes)) await resetPaper(conn, before, req.user.user_id);
+    if (changes.cancel_row) {
+      await conn.execute("UPDATE eq_attendance SET status = 'Cancelled', cancelled_by_user_id = ?, cancelled_at = ?, cancel_reason = ? WHERE eq_attendance_id = ?",
+        [req.user.user_id, businessNow(), `Correction #${id}: ${c.reason}`.slice(0, 1000), c.eq_attendance_id]);
+    } else if (before.status !== 'Approved') {
+      // a row not billed by the finalized batch (e.g. a monthly day it billed): the office accepted its values and settles them here
+      await conn.execute("UPDATE eq_attendance SET status = 'Approved', approved_by_user_id = ?, approval_date = ?, admin_rejection_notes = NULL WHERE eq_attendance_id = ?",
+        [req.user.user_id, businessNow(), c.eq_attendance_id]);
+    }
+    const afterRow = await S.loadRow(conn, c.eq_attendance_id);
+    afterValues = pick(afterRow);
+    cents = override ? Math.round(Number(c.amount_override) * 100) : (delta.auto ? delta.delta_cents : 0);
+    const item = await CORR.paidItemOf(conn, c.eq_attendance_id);
+    const [[b]] = await conn.execute('SELECT eq_batch_id, currency FROM eq_payroll_batches WHERE eq_batch_id = ?', [item ? item.eq_batch_id : c.locked_batch_id]);
+    const currency = b.currency;
+    const ref = item && item.invoice_no ? `invoice ${item.invoice_no}` : `batch #${b.eq_batch_id}`;
+    settled = await settle(conn, req, c, cents, {
+      equipmentId: before.equipment_id, siteId: before.site_id, vendorId: before.vendor_id, batchId: b.eq_batch_id, itemId: item ? item.eq_item_id : null, currency,
+      refText: `correction of ${ref}, sheet row ${before.sheet_row_no} (${before.record_date})${changes.cancel_row ? ' cancelled' : ''}`,
+    });
+    await audit.log(conn, { table: 'eq_attendance', id: c.eq_attendance_id, action: 'correction', oldValues: pick(before), newValues: afterValues, reason: c.reason,
+      relatedType: 'eq_attendance_corrections', relatedId: id, payrollEffect: settled.adjustmentId ? `adjustment:${settled.adjustmentId}` : `correction:${id}`, ...audit.ctx(req) });
+  } else {
+    const detail = c.delta_detail || {};
+    cents = override ? Math.round(Number(c.amount_override) * 100) : Number(detail.delta_cents || 0);
+    const [[eq]] = await conn.execute('SELECT vendor_id FROM eq_equipment WHERE equipment_id = ?', [detail.equipment_id]);
+    const [[b]] = await conn.execute('SELECT eq_batch_id, currency FROM eq_payroll_batches WHERE eq_batch_id = ?', [c.locked_batch_id]);
+    const currency = detail.currency || b.currency;
+    let ref = `batch #${b.eq_batch_id}`;
+    if (c.eq_item_id) {
+      const [[inv]] = await conn.execute("SELECT invoice_no FROM eq_invoices WHERE eq_item_id = ? AND kind = 'Machine' LIMIT 1", [c.eq_item_id]);
+      if (inv) ref = `invoice ${inv.invoice_no}`;
+    }
+    if (c.target_type === 'fuel_issue' && detail.fuel_changes) {
+      const [[f]] = await conn.execute('SELECT * FROM eq_fuel_issues WHERE fuel_issue_id = ? FOR UPDATE', [c.target_id]);
+      const keys = Object.keys(detail.fuel_changes);
+      await conn.execute(`UPDATE eq_fuel_issues SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE fuel_issue_id = ?`, [...keys.map((k) => detail.fuel_changes[k]), c.target_id]);
+      await audit.log(conn, { table: 'eq_fuel_issues', id: c.target_id, action: 'correction', oldValues: { liters: f.liters, price_per_liter: f.price_per_liter },
+        newValues: detail.fuel_changes, reason: c.reason, relatedType: 'eq_attendance_corrections', relatedId: id, ...audit.ctx(req) });
+    }
+    settled = await settle(conn, req, c, cents, {
+      equipmentId: detail.equipment_id, siteId: detail.site_id, vendorId: eq.vendor_id, batchId: b.eq_batch_id, itemId: c.eq_item_id, currency,
+      refText: `correction of ${ref}, ${c.target_type.replace('_', ' ')}${c.target_id ? ` #${c.target_id}` : ''}`,
+    });
+  }
+  await conn.execute(
+    `UPDATE eq_attendance_corrections SET request_status = 'Approved', approved_by_user_id = ?, approved_at = ?, corrected_values = ?,
+       delta_amount = COALESCE(?, delta_amount), delta_detail = COALESCE(?, delta_detail), note_invoice_id = ?, resolved_adjustment_id = ?, adjustment_status = 'Resolved',
+       resolved_by_user_id = ?, resolved_at = ?, resolution_note = ? WHERE correction_id = ?`,
+    [req.user.user_id, businessNow(), JSON.stringify(afterValues), delta && delta.auto ? (delta.delta_cents / 100).toFixed(2) : null, delta ? JSON.stringify(delta) : null,
+      settled.noteId, settled.adjustmentId, req.user.user_id, businessNow(), note || (cents === 0 ? 'No money difference' : null), id]);
+  await corrEvent(conn, id, 'approve', req, note || null, { settled_cents: cents, adjustment_id: settled.adjustmentId });
+  await audit.log(conn, { table: 'eq_attendance_corrections', id, action: 'approve', newValues: { settled_cents: cents, adjustment_id: settled.adjustmentId, note_invoice_id: settled.noteId },
+    reason: note || null, payrollEffect: settled.adjustmentId ? `adjustment:${settled.adjustmentId}` : 'none', ...audit.ctx(req) });
+}
+
+/** Approve (Admin only): the record is corrected, the difference settled. */
 exports.approveCorrection = async (req, res) => {
   const id = parseId(req.params.id);
   const { note } = validate(req.body, { note: v.string({ max: 1000 }) });
@@ -610,73 +688,8 @@ exports.approveCorrection = async (req, res) => {
   if (!['Requested', 'Reviewed'].includes(c0.request_status)) throw AppError.conflict('INVALID_STATE', `This correction is ${c0.request_status}.`);
   assertMayApprove(c0, req.user);
   const delta = c0.eq_attendance_id ? await CORR.computeDelta(c0.eq_attendance_id, c0.proposed_changes, req.user.user_id) : null; // fresh numbers
-  await withTransaction(async (conn) => {
-    const c = await loadCorrection(conn, id, true);
-    if (!['Requested', 'Reviewed'].includes(c.request_status)) throw AppError.conflict('INVALID_STATE', `This correction is ${c.request_status}.`);
-    assertMayApprove(c, req.user);
-    const override = c.amount_override !== null && c.amount_override !== undefined;
-    let settled = { adjustmentId: null, noteId: null }; let cents = 0; let afterValues = c.corrected_values;
-    if (c.eq_attendance_id) {
-      if (!delta.auto && !override) throw AppError.validation({ amount_override: 'this row was not paid by a finalized batch: amend the correction with the amount to settle (0 if none)' });
-      const before = await S.loadRow(conn, c.eq_attendance_id, true);
-      const changes = c.proposed_changes || {};
-      await CORR.applyChanges(conn, c.eq_attendance_id, changes, req.user.user_id);
-      if (touchesPaper(changes)) await resetPaper(conn, before, req.user.user_id);
-      if (changes.cancel_row) {
-        await conn.execute("UPDATE eq_attendance SET status = 'Cancelled', cancelled_by_user_id = ?, cancelled_at = ?, cancel_reason = ? WHERE eq_attendance_id = ?",
-          [req.user.user_id, businessNow(), `Correction #${id}: ${c.reason}`.slice(0, 1000), c.eq_attendance_id]);
-      } else if (before.status !== 'Approved') {
-        // a late / stuck row inside the closed period: the office accepted its corrected values and settles them here
-        await conn.execute("UPDATE eq_attendance SET status = 'Approved', approved_by_user_id = ?, approval_date = ?, admin_rejection_notes = NULL WHERE eq_attendance_id = ?",
-          [req.user.user_id, businessNow(), c.eq_attendance_id]);
-      }
-      const afterRow = await S.loadRow(conn, c.eq_attendance_id);
-      afterValues = pick(afterRow);
-      cents = override ? Math.round(Number(c.amount_override) * 100) : (delta.auto ? delta.delta_cents : 0);
-      const item = await CORR.paidItemOf(conn, c.eq_attendance_id);
-      const [[b]] = await conn.execute('SELECT eq_batch_id, currency FROM eq_payroll_batches WHERE eq_batch_id = ?', [item ? item.eq_batch_id : c.locked_batch_id]);
-      const currency = b.currency;
-      const ref = item && item.invoice_no ? `invoice ${item.invoice_no}` : `batch #${b.eq_batch_id}`;
-      settled = await settle(conn, req, c, cents, {
-        equipmentId: before.equipment_id, siteId: before.site_id, vendorId: before.vendor_id, batchId: b.eq_batch_id, itemId: item ? item.eq_item_id : null, currency,
-        refText: `correction of ${ref}, sheet row ${before.sheet_row_no} (${before.record_date})${changes.cancel_row ? ' cancelled' : ''}`,
-      });
-      await audit.log(conn, { table: 'eq_attendance', id: c.eq_attendance_id, action: 'correction', oldValues: pick(before), newValues: afterValues, reason: c.reason,
-        relatedType: 'eq_attendance_corrections', relatedId: id, payrollEffect: settled.adjustmentId ? `adjustment:${settled.adjustmentId}` : `correction:${id}`, ...audit.ctx(req) });
-    } else {
-      const detail = c.delta_detail || {};
-      cents = override ? Math.round(Number(c.amount_override) * 100) : Number(detail.delta_cents || 0);
-      const [[eq]] = await conn.execute('SELECT vendor_id FROM eq_equipment WHERE equipment_id = ?', [detail.equipment_id]);
-      const [[b]] = await conn.execute('SELECT eq_batch_id, currency FROM eq_payroll_batches WHERE eq_batch_id = ?', [c.locked_batch_id]);
-      const currency = detail.currency || b.currency;
-      let ref = `batch #${b.eq_batch_id}`;
-      if (c.eq_item_id) {
-        const [[inv]] = await conn.execute("SELECT invoice_no FROM eq_invoices WHERE eq_item_id = ? AND kind = 'Machine' LIMIT 1", [c.eq_item_id]);
-        if (inv) ref = `invoice ${inv.invoice_no}`;
-      }
-      if (c.target_type === 'fuel_issue' && detail.fuel_changes) {
-        const [[f]] = await conn.execute('SELECT * FROM eq_fuel_issues WHERE fuel_issue_id = ? FOR UPDATE', [c.target_id]);
-        const keys = Object.keys(detail.fuel_changes);
-        await conn.execute(`UPDATE eq_fuel_issues SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE fuel_issue_id = ?`, [...keys.map((k) => detail.fuel_changes[k]), c.target_id]);
-        await audit.log(conn, { table: 'eq_fuel_issues', id: c.target_id, action: 'correction', oldValues: { liters: f.liters, price_per_liter: f.price_per_liter },
-          newValues: detail.fuel_changes, reason: c.reason, relatedType: 'eq_attendance_corrections', relatedId: id, ...audit.ctx(req) });
-      }
-      settled = await settle(conn, req, c, cents, {
-        equipmentId: detail.equipment_id, siteId: detail.site_id, vendorId: eq.vendor_id, batchId: b.eq_batch_id, itemId: c.eq_item_id, currency,
-        refText: `correction of ${ref}, ${c.target_type.replace('_', ' ')}${c.target_id ? ` #${c.target_id}` : ''}`,
-      });
-    }
-    await conn.execute(
-      `UPDATE eq_attendance_corrections SET request_status = 'Approved', approved_by_user_id = ?, approved_at = ?, corrected_values = ?,
-         delta_amount = COALESCE(?, delta_amount), delta_detail = COALESCE(?, delta_detail), note_invoice_id = ?, resolved_adjustment_id = ?, adjustment_status = 'Resolved',
-         resolved_by_user_id = ?, resolved_at = ?, resolution_note = ? WHERE correction_id = ?`,
-      [req.user.user_id, businessNow(), JSON.stringify(afterValues), delta && delta.auto ? (delta.delta_cents / 100).toFixed(2) : null, delta ? JSON.stringify(delta) : null,
-        settled.noteId, settled.adjustmentId, req.user.user_id, businessNow(), note || (cents === 0 ? 'No money difference' : null), id]);
-    await corrEvent(conn, id, 'approve', req, note || null, { settled_cents: cents, adjustment_id: settled.adjustmentId });
-    await audit.log(conn, { table: 'eq_attendance_corrections', id, action: 'approve', newValues: { settled_cents: cents, adjustment_id: settled.adjustmentId, note_invoice_id: settled.noteId },
-      reason: note || null, payrollEffect: settled.adjustmentId ? `adjustment:${settled.adjustmentId}` : 'none', ...audit.ctx(req) });
-  });
-  res.json({ status: 'success', data: await correctionView(pool, id), message: 'Correction approved. The finalized payroll was not changed; the difference is settled in the next open period.' });
+  await withTransaction((conn) => approveInTx(conn, req, id, delta, note));
+  res.json({ status: 'success', data: await correctionView(pool, id), message: APPLIED_MSG });
 };
 
 /** Cancel a correction still in progress: its requester, the person who amended it, or an Admin. */
@@ -718,7 +731,7 @@ exports.listCorrections = async (req, res) => {
   for (const r of rows) {
     for (const k of ['original_values', 'corrected_values', 'proposed_changes', 'delta_detail']) r[k] = C.parseJson(r[k]);
     r.last_author_user_id = lastAuthor(r);
-    r.can_approve = ['Requested', 'Reviewed'].includes(r.request_status) && OFFICE.includes(req.user.role) && r.last_author_user_id !== req.user.user_id;
+    r.can_approve = ['Requested', 'Reviewed'].includes(r.request_status) && req.user.role === 'Admin';
   }
   res.json({ status: 'success', data: rows });
 };

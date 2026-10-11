@@ -64,7 +64,10 @@ test('payroll: one DNR item per machine x site, finalize, then the notes are loc
   const [dn] = await h.query("SELECT delivery_note_id FROM eq_delivery_notes WHERE dn_number = 'DN-1'");
   assert.strictEqual(await code(h.api().patch(`/api/equipment/delivery-notes/${dn.delivery_note_id}`).set(ACC()).send({ quantity: 4, reason: 'counted again' })), 'PAYROLL_PERIOD_FINALIZED');
   const sand = (await ok(h.api().get('/api/equipment/dnr-rates').set(ACC()).query({ vendor_id: V.vendor_id }))).find((r) => r.unit === 'trip');
-  assert.strictEqual(await code(h.api().post('/api/equipment/delivery-notes').set(ACC()).send({ equipment_id: truck.equipment_id, site_id: 8, dnr_rate_id: sand.dnr_rate_id, dn_number: 'DN-LATE', note_date: '2026-10-20', quantity: 1 })), 'PAYROLL_PERIOD_FINALIZED');
+  // 11 Oct 2026: a new note dated in the finalized month is allowed; the next batch bills it (the finalized notes are not billed again)
+  const late = await ok(h.api().post('/api/equipment/delivery-notes').set(ACC()).send({ equipment_id: truck.equipment_id, site_id: 8, dnr_rate_id: sand.dnr_rate_id, dn_number: 'DN-LATE', note_date: '2026-10-20', quantity: 1 }));
+  const again = await ok(h.api().post('/api/equipment/payroll/preview').set(ACC()).send({ start_date: '2026-10-01', end_date: '2026-10-31', vendor_id: V.vendor_id }));
+  assert.strictEqual(again.totals[0].net, late.amount);
 });
 
 test('partial payment: voucher, balance, no over-payment, void refused', async () => {

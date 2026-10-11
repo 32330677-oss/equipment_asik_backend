@@ -3,7 +3,14 @@
 // APPEND-ONLY for it: SELECT + INSERT, never UPDATE / DELETE (an edit there needs the migration / admin user).
 // The figures a batch was generated with are append-only too: a batch is voided or replaced, never rewritten (C12).
 const APPEND_ONLY = ['audit_logs', 'eq_invoices', 'eq_invoice_cancellations', 'eq_correction_events', 'eq_file_versions', 'login_history',
-  'eq_payroll_items', 'eq_payroll_lines', 'eq_payroll_attendance_snapshot'];
+  'eq_payroll_items', 'eq_payroll_lines', 'eq_payroll_attendance_snapshot', 'eq_payroll_monthly_days', 'eq_payroll_batch_machines'];
+
+/**
+ * Columns the app may still UPDATE on an append-only table (column-level right). 11 Oct 2026: an undone Finalize
+ * WITHDRAWS its official numbers and the next Finalize gives them back to the new version of the batch — the number
+ * itself (invoice_no, kind, year, seq) never changes.
+ */
+const COLUMN_UPDATES = { eq_invoices: ['status', 'eq_batch_id', 'eq_item_id', 'currency', 'amount', 'reissued_at'] };
 
 function ident(name) {
   if (!/^[A-Za-z0-9_]+$/.test(name)) throw new Error(`Unsafe identifier: ${name}`);
@@ -23,6 +30,8 @@ async function applyGrants(conn, { database, appUser, hosts = ['localhost', '%']
   const db = ident(database);
   const [tables] = await conn.query(
     "SELECT table_name AS t FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name", [database]);
+  const [cols] = await conn.query('SELECT table_name AS t, column_name AS c FROM information_schema.columns WHERE table_schema = ?', [database]);
+  const updatable = (t) => (COLUMN_UPDATES[t] || []).filter((c) => cols.some((x) => x.t === t && x.c === c));
   const done = [];
   // only the hosts the app user really exists on (granting to a missing account fails on MySQL 8)
   let existing = hosts;
@@ -39,7 +48,10 @@ async function applyGrants(conn, { database, appUser, hosts = ['localhost', '%']
       if (/1141|no such grant/i.test(msg)) { /* had no database-wide rights */ } else if (/1133|3162|1396|doesn't exist|does not exist|unknown user/i.test(msg)) { log(`skip ${who}: ${e.message}`); continue; } else throw e;
     }
     for (const { t } of tables) {
-      const rights = APPEND_ONLY.includes(t) ? 'SELECT, INSERT' : 'SELECT, INSERT, UPDATE, DELETE';
+      const upd = updatable(t);
+      const rights = APPEND_ONLY.includes(t)
+        ? `SELECT, INSERT${upd.length ? `, UPDATE (${upd.map(ident).join(', ')})` : ''}`
+        : 'SELECT, INSERT, UPDATE, DELETE';
       try { await conn.query(`REVOKE ALL PRIVILEGES ON ${db}.${ident(t)} FROM ${who}`); } catch (_) { /* no table grant yet */ }
       try {
         await conn.query(`GRANT ${rights} ON ${db}.${ident(t)} TO ${who}`);
@@ -54,4 +66,4 @@ async function applyGrants(conn, { database, appUser, hosts = ['localhost', '%']
   return { tables: tables.length, append_only: APPEND_ONLY, hosts: done };
 }
 
-module.exports = { applyGrants, APPEND_ONLY };
+module.exports = { applyGrants, APPEND_ONLY, COLUMN_UPDATES };

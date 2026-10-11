@@ -18,6 +18,7 @@ const review = require('../controllers/equipment/eqReviewController');
 const fuel = require('../controllers/equipment/eqFuelAdjustmentController');
 const ts = require('../controllers/equipment/timesheetController');
 const pay = require('../controllers/equipment/eqPayrollController');
+const monthlyTerms = require('../controllers/equipment/monthlyTermsController');
 const liveC = require('../controllers/equipment/eqLiveController');
 const clientRep = require('../controllers/equipment/clientReportController');
 const AS = requireRole('Admin', 'Supervisor');
@@ -124,7 +125,7 @@ router.patch('/admin/attendance/:id/standby-credit', AC, review.standbyCredit);
 router.patch('/admin/attendance/:id/cancel', AC, review.voidRow);
 // not financially committed: the office (Admin or Accountant) corrects the row directly, with a reason once Approved
 router.patch('/admin/attendance/:id', AC, review.adminEdit);
-// financially committed: official correction, requested by an Admin or an Accountant, approved by another one
+// financially committed: official correction. An Admin applies it at once; an Accountant's request waits for an Admin (11 Oct 2026)
 router.post('/admin/attendance/:id/correction', AC, review.correction);
 router.get('/admin/change-requests', AC, review.listChangeRequests);
 router.patch('/admin/change-requests/:id/approve', AC, review.approveChangeRequest);
@@ -174,6 +175,9 @@ router.patch('/timesheets/:id/reopen', A, ts.reopen);
 // 5.9 payroll
 router.post('/payroll/preview', AC, pay.preview);
 router.get('/payroll/blockers', AC, pay.blockers);
+router.get('/payroll/coverage', AC, pay.coverage); // per machine of a vendor: ready / held by / blockers (11 Oct 2026)
+router.get('/payroll/monthly-terms', AC, monthlyTerms.list); // terms of the month of monthly machines
+router.put('/payroll/monthly-terms', AC, monthlyTerms.put);
 router.post('/payroll/generate', AC, pay.generate);
 router.get('/payroll/batches', AC, pay.list);
 router.get('/payroll/batches/:id', AC, pay.get);
@@ -182,6 +186,7 @@ router.get('/payroll/batches/:id/versions', AC, pay.versions);
 router.get('/payroll/batches/:id/export.pdf', AC, pay.exportPdf);
 router.get('/payroll/batches/:id/export.xlsx', AC, pay.exportXlsx);
 router.patch('/payroll/batches/:id/finalize', AC, pay.finalize);
+router.patch('/payroll/batches/:id/unfinalize', AC, pay.unfinalize); // undo Finalize within eq_finalize_undo_hours (11 Oct 2026)
 router.patch('/payroll/batches/:id/mark-paid', AC, pay.markPaid);
 router.patch('/payroll/batches/:id/undo-paid', AC, pay.undoPaid);
 router.patch('/payroll/batches/:id/payment-reference', AC, pay.setPaymentReference);
