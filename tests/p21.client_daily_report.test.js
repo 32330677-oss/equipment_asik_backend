@@ -1,4 +1,5 @@
-// P21 — Daily Equipment Report for an external party: only machines with a check-in on a Working row,
+// P21 — Daily Equipment Report for an external party: every machine on site with its state (Standby only on request),
+// breakdowns and stoppages with their reason, month-to-date figures,
 // deliveries of the day, fleet movements, typed info lines; English and Arabic PDFs; supervisor limits.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
@@ -67,6 +68,18 @@ test('the queries return exactly what the report shows', async () => {
   const mv = d.movements.map((m) => `${m.plate_number}:${m.movement}`).sort();
   assert.deepStrictEqual(mv, ['P-003:Released', 'R-77:Arrived'], 'the cancelled deployment is not a movement');
 
+  // the whole fleet on site, with its state: the crane is deployed but has no row yet (today = not started)
+  const st = Object.fromEntries(d.fleet.filter((f) => f.site_id === 8).map((f) => [f.plate_number, f.state]));
+  assert.deepStrictEqual(st, { 'P-001': 'Working', 'P-002': 'Working', 'P-003': 'Pending' });
+  assert.strictEqual(d.fleet.find((f) => f.plate_number === 'P-002').partlyStopped, true, 'the loader broke down during the day');
+  assert.strictEqual(d.fleet.find((f) => f.plate_number === 'P-001').partlyStopped, false);
+  // the breakdown is reported with its reason, never with its times
+  const ev = d.events.filter((e) => e.site_id === 8).map((e) => `${e.plate_number}:${e.kind}:${e.extent}:${e.reason}`);
+  assert.deepStrictEqual(ev, ['P-002:Breakdown:TillEnd:pump']);
+  // month to date: machine-days worked and delivery trips since the 1st
+  assert.ok(d.mtd.machineDays >= 2);
+  assert.strictEqual(d.mtd.trips, 2);
+
   // shift filter and site filter
   const day = await R.loadData(pool, { date: '2026-10-19', siteIds: [9], shift: 'Day' });
   assert.strictEqual(day.machines.length, 0);
@@ -86,6 +99,10 @@ test('English and Arabic PDFs, with info lines', async () => {
     assert.ok(r.body.length > 5000);
     assert.match(r.headers['content-disposition'], new RegExp(`DER-20261020-\\d{4}-${lang.toUpperCase()}\\.pdf`));
   }
+  // Standby machines and stoppages are shown only on request
+  const withStandby = await h.api().get(URL).set(A()).query({ lang: 'en', site_ids: '8', include_standby: 'true' });
+  assert.strictEqual(withStandby.status, 200, withStandby.text);
+  assert.strictEqual((await h.api().get(URL).set(A()).query({ include_standby: 'maybe' })).body.code, 'VALIDATION_ERROR');
   // defaults: today, all active sites, both shifts
   assert.strictEqual((await h.api().get(URL).set(ACC())).status, 200);
 });

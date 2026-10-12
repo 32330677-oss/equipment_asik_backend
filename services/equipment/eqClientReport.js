@@ -1,6 +1,6 @@
 // services/equipment/eqClientReport.js — Daily Equipment Report for an external party (main contractor / client).
-// Only the machines that WORKED on the day (a check-in on a Working row) are listed: no vendor, no hours, no money,
-// no internal codes. One PDF per language (English = main copy, Arabic = separate copy).
+// Every machine on site that day with its state (Standby only when asked), what it did, the breakdowns and stoppages
+// with their reason, month-to-date figures: no vendor, no hours or times, no money, no internal codes. One PDF per language (English = main copy, Arabic = separate copy).
 'use strict';
 
 const P = require('../pdfKit');
@@ -12,26 +12,88 @@ const { COLORS } = P;
 const day = (d) => (d ? String(d).slice(0, 10) : null);
 
 // ------------------------------------------------------------------ data
+const MACHINE_COLS = 'e.equipment_id, e.machine_label, e.type_seq, e.plate_number, e.make, e.model, e.capacity, t.type_name, t.type_name_ar';
+const SHIFT_ORDER = { Day: 0, Night: 1 };
+/** Machine order inside a site: shift, type, number on the type, plate. */
+const byMachine = (a, b) => (a.site_id - b.site_id) || (SHIFT_ORDER[a.shift_type] - SHIFT_ORDER[b.shift_type])
+  || String(a.type_name).localeCompare(String(b.type_name)) || ((a.type_seq || 0) - (b.type_seq || 0))
+  || String(a.plate_number || '').localeCompare(String(b.plate_number || ''));
+const firstOfMonth = (d) => `${d.slice(0, 7)}-01`;
+
 /**
  * Everything the report shows, read once.
- * opts: { date, siteIds (array, empty = every active site), shift: 'Day' | 'Night' | 'All' }
+ * opts: { date, siteIds (array, empty = every active site), shift: 'Day' | 'Night' | 'All', includeStandby (default false) }
+ * fleet   = every machine on site that day (deployed or recorded) with its state:
+ *           Working | Standby | Breakdown | Absent | Holiday | Pending (deployed, nothing recorded yet)
+ *           Standby machines are left out unless includeStandby.
+ * machines = the fleet machines that worked (a check-in on a Working row).
+ * events  = breakdowns / stoppages / absences of the day with their reason (no times).
+ * mtd     = month to date: machine-days worked per type, delivery trips.
  */
-async function loadData(conn, { date, siteIds, shift }) {
+async function loadData(conn, { date, siteIds, shift, includeStandby = false }) {
   const [sites] = siteIds && siteIds.length
     ? await conn.query('SELECT site_id, site_code, site_name, project_name, location FROM sites WHERE site_id IN (?) ORDER BY site_code', [siteIds])
     : await conn.query("SELECT site_id, site_code, site_name, project_name, location FROM sites WHERE status = 'Active' ORDER BY site_code");
   const ids = sites.map((s) => s.site_id);
-  if (!ids.length) return { sites: [], machines: [], deliveries: [], movements: [] };
+  if (!ids.length) return { sites: [], fleet: [], machines: [], events: [], deliveries: [], movements: [], mtd: { byType: {}, machineDays: 0, trips: 0 } };
   const shiftSql = shift === 'Day' || shift === 'Night' ? ' AND ea.shift_type = ?' : '';
+  const shiftA = shiftSql ? ' AND a.shift_type = ?' : '';
   const shiftParams = shiftSql ? [shift] : [];
-  // machines that worked: a Working row with a check-in (any approval state except Cancelled)
-  const [machines] = await conn.query(
-    `SELECT ea.site_id, ea.shift_type, ea.check_in_time, ea.work_description, e.equipment_id, e.machine_label, e.type_seq, e.plate_number,
-       t.type_name, t.type_name_ar, o.full_name AS operator_name
+
+  // every row recorded on the day (any approval state except Cancelled)
+  const [rows] = await conn.query(
+    `SELECT ea.eq_attendance_id, ea.site_id, ea.shift_type, ea.day_status, ea.check_in_time, ea.check_out_time, ea.work_description, ea.remarks,
+       ${MACHINE_COLS}, o.full_name AS operator_name
      FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id JOIN eq_types t ON t.type_id = e.type_id
      LEFT JOIN eq_operators o ON o.operator_id = ea.operator_id
-     WHERE ea.record_date = ? AND ea.site_id IN (?) AND ea.status <> 'Cancelled' AND ea.day_status = 'Working' AND ea.check_in_time IS NOT NULL${shiftSql}
-     ORDER BY ea.site_id, ea.shift_type, t.type_name, e.type_seq, ea.check_in_time`, [date, ids, ...shiftParams]);
+     WHERE ea.record_date = ? AND ea.site_id IN (?) AND ea.status <> 'Cancelled'${shiftSql}`, [date, ids, ...shiftParams]);
+  // machines deployed on the day (a deployment that ends today still counts; a cancelled one never does)
+  const [deps] = await conn.query(
+    `SELECT a.site_id, a.shift_type, ${MACHINE_COLS}, o.full_name AS operator_name
+     FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id AND e.status = 'Active' JOIN eq_types t ON t.type_id = e.type_id
+     LEFT JOIN eq_operators o ON o.operator_id = a.default_operator_id
+     WHERE a.site_id IN (?) AND a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?)${shiftA}`, [ids, date, date, ...shiftParams]);
+
+  const key = (r) => `${r.site_id}|${r.shift_type}|${r.equipment_id}`;
+  const seen = new Set();
+  const all = [];
+  for (const r of rows) {
+    if (seen.has(key(r))) continue;
+    seen.add(key(r));
+    const state = r.day_status === 'Working' ? (r.check_in_time ? 'Working' : 'Pending') : r.day_status;
+    all.push({ ...r, state, partlyStopped: false });
+  }
+  for (const d of deps) {
+    if (seen.has(key(d))) continue;
+    seen.add(key(d));
+    all.push({ ...d, eq_attendance_id: null, day_status: null, check_in_time: null, check_out_time: null, work_description: null, remarks: null, state: 'Pending', partlyStopped: false });
+  }
+  const fleet = all.filter((f) => includeStandby || f.state !== 'Standby').sort(byMachine);
+
+  // stoppages inside a working day (Breakdown, and Standby when shown); breaks and refuels are not reported
+  const working = fleet.filter((f) => f.state === 'Working');
+  const kinds = includeStandby ? ['Breakdown', 'Standby'] : ['Breakdown'];
+  let periods = [];
+  if (working.length) {
+    [periods] = await conn.query(
+      `SELECT eq_attendance_id, downtime_type, start_time, end_time, reason FROM eq_downtime_periods
+       WHERE eq_attendance_id IN (?) AND downtime_type IN (?) ORDER BY start_time`, [working.map((f) => f.eq_attendance_id), kinds]);
+  }
+  const byRow = new Map(working.map((f) => [f.eq_attendance_id, f]));
+  const events = [];
+  for (const f of fleet) {
+    if (['Breakdown', 'Standby', 'Absent'].includes(f.state)) events.push({ ...f, kind: f.state, extent: 'FullDay', reason: f.remarks || '' });
+  }
+  for (const p of periods) {
+    const f = byRow.get(p.eq_attendance_id);
+    if (!f) continue;
+    f.partlyStopped = true;
+    // an open stoppage is closed by the check-out: it then lasted until the end of the work
+    const tillEnd = !p.end_time || (f.check_out_time && String(p.end_time) >= String(f.check_out_time));
+    events.push({ ...f, kind: p.downtime_type, extent: tillEnd ? 'TillEnd' : 'Resumed', reason: p.reason || '' });
+  }
+  events.sort(byMachine);
+
   // deliveries (per-unit work, DNR) of the day, grouped by what was moved and where
   const [deliveries] = await conn.query(
     `SELECT dn.site_id, r.item_name, r.unit, COALESCE(dn.material, '') AS material, COALESCE(dn.from_location, '') AS from_location,
@@ -41,33 +103,68 @@ async function loadData(conn, { date, siteIds, shift }) {
      GROUP BY dn.site_id, r.item_name, r.unit, COALESCE(dn.material, ''), COALESCE(dn.from_location, ''), COALESCE(dn.to_location, '')
      ORDER BY dn.site_id, r.item_name`, [date, ids]);
   // fleet movements: first day on site today (arrived) / last day on site today (released)
-  const shiftA = shiftSql ? ' AND a.shift_type = ?' : '';
   const [movements] = await conn.query(
     `SELECT a.site_id, a.shift_type, IF(a.assigned_date = ?, 'Arrived', 'Released') AS movement, e.machine_label, e.type_seq, e.plate_number, t.type_name, t.type_name_ar
      FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN eq_types t ON t.type_id = e.type_id
      WHERE a.site_id IN (?) AND (a.assigned_date = ? OR a.unassigned_date = ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)${shiftA}
      ORDER BY a.site_id, movement, t.type_name, e.type_seq`, [date, ids, date, date, ...shiftParams]);
-  return { sites, machines, deliveries, movements };
+
+  // month to date (1st of the month .. the report date)
+  const from = firstOfMonth(date);
+  const [mtdTypes] = await conn.query(
+    `SELECT t.type_name, t.type_name_ar, COUNT(*) AS days
+     FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id JOIN eq_types t ON t.type_id = e.type_id
+     WHERE ea.record_date BETWEEN ? AND ? AND ea.site_id IN (?) AND ea.status <> 'Cancelled' AND ea.day_status = 'Working' AND ea.check_in_time IS NOT NULL${shiftSql}
+     GROUP BY t.type_name, t.type_name_ar`, [from, date, ids, ...shiftParams]);
+  const [[trips]] = await conn.query(
+    "SELECT COUNT(*) AS n FROM eq_delivery_notes WHERE note_date BETWEEN ? AND ? AND status = 'Active' AND site_id IN (?)", [from, date, ids]);
+  const byType = {};
+  for (const r of mtdTypes) byType[r.type_name] = { type_name: r.type_name, type_name_ar: r.type_name_ar, days: Number(r.days) };
+  const mtd = { byType, machineDays: mtdTypes.reduce((a, r) => a + Number(r.days), 0), trips: Number(trips.n) };
+
+  return { sites, fleet, machines: fleet.filter((f) => f.state === 'Working'), events, deliveries, movements, mtd };
 }
 
 // ------------------------------------------------------------------ texts
 const T = {
   en: {
     title: 'DAILY EQUIPMENT REPORT', date: 'Date', to: 'To', issuedBy: 'Issued by', asOf: 'Status as of', reportNo: 'Report No.',
-    endOfDay: 'End of day', working: 'Machines working', sites: 'Sites', types: 'Equipment types', trips: 'Delivery trips',
-    byType: 'Summary by equipment type', type: 'Equipment type', total: 'Total', machine: 'Machine', plate: 'Plate No.',
-    operator: 'Operator', start: 'Start', work: 'Work description', noMachine: 'No machine working on this site.',
+    endOfDay: 'End of day', sites: 'Sites', trips: 'Delivery trips',
+    onSite: 'Machines on site', working: 'Working', availability: 'Availability',
+    byType: 'Summary by equipment type', type: 'Equipment type', total: 'Total', mtd: 'Month to date', mtdUnit: 'machine-days',
+    machine: 'Machine', plate: 'Plate No.', operator: 'Operator', status: 'Status', work: 'Work done / remarks',
+    noMachine: 'No machine on this site.',
+    st: {
+      Working: 'Working', Partly: 'Working, partly stopped', Standby: 'Standby', Breakdown: 'Breakdown', Absent: 'Absent',
+      Holiday: 'Holiday', PendingToday: 'Not started yet', Pending: 'Not recorded',
+    },
+    kpi: { Breakdown: 'Breakdown', Standby: 'Standby', Absent: 'Absent' },
+    events: 'Breakdowns and stoppages', noEvents: 'No breakdowns or stoppages.', event: 'Event', reason: 'Reason',
+    ev: { Breakdown: 'Breakdown', Standby: 'Standby', Absent: 'Did not come' },
+    ext: { FullDay: 'Whole day', Resumed: 'Back to work', TillEnd: 'Until end of work' },
     deliveries: 'Deliveries', site: 'Site', item: 'Item / material', route: 'From - To', notes: 'Trips', qty: 'Quantity',
+    tripsToday: 'Trips today', tripsMtd: 'month to date',
     movements: 'Fleet movements', movement: 'Movement', Arrived: 'Arrived on site', Released: 'Released from site',
     info: 'Additional information', received: 'Received by', shiftDay: 'Day shift', shiftNight: 'Night shift', all: 'Day and night shifts',
     shiftLabel: 'Shift', page: 'Page', generated: 'Generated',
   },
   ar: {
     title: 'تقرير الآليات اليومي', date: 'التاريخ', to: 'إلى', issuedBy: 'صادر عن', asOf: 'الوضع حتى الساعة', reportNo: 'رقم التقرير',
-    endOfDay: 'نهاية اليوم', working: 'الآليات العاملة', sites: 'المواقع', types: 'أنواع الآليات', trips: 'نقلات التوريد',
-    byType: 'ملخص حسب نوع الآلية', type: 'نوع الآلية', total: 'المجموع', machine: 'الآلية', plate: 'رقم اللوحة',
-    operator: 'السائق', start: 'البدء', work: 'وصف العمل', noMachine: 'لا توجد آليات عاملة في هذا الموقع.',
+    endOfDay: 'نهاية اليوم', sites: 'المواقع', trips: 'نقلات التوريد',
+    onSite: 'الآليات في الموقع', working: 'العاملة', availability: 'نسبة الجاهزية',
+    byType: 'ملخص حسب نوع الآلية', type: 'نوع الآلية', total: 'المجموع', mtd: 'منذ بداية الشهر', mtdUnit: 'يوم عمل آلية',
+    machine: 'الآلية', plate: 'رقم اللوحة', operator: 'السائق', status: 'الحالة', work: 'العمل المنجز أو الملاحظات',
+    noMachine: 'لا توجد آليات في هذا الموقع.',
+    st: {
+      Working: 'عاملة', Partly: 'عاملة مع توقف جزئي', Standby: 'جاهزة دون تشغيل', Breakdown: 'معطلة', Absent: 'لم تحضر',
+      Holiday: 'عطلة', PendingToday: 'لم تباشر بعد', Pending: 'غير مسجلة',
+    },
+    kpi: { Breakdown: 'معطلة', Standby: 'جاهزة دون تشغيل', Absent: 'لم تحضر' },
+    events: 'الأعطال والتوقفات', noEvents: 'لا توجد أعطال أو توقفات.', event: 'الحدث', reason: 'السبب',
+    ev: { Breakdown: 'عطل', Standby: 'توقف دون تشغيل', Absent: 'لم تحضر' },
+    ext: { FullDay: 'طوال اليوم', Resumed: 'عادت للعمل', TillEnd: 'حتى نهاية العمل' },
     deliveries: 'التوريدات', site: 'الموقع', item: 'البند أو المادة', route: 'من إلى', notes: 'النقلات', qty: 'الكمية',
+    tripsToday: 'نقلات اليوم', tripsMtd: 'منذ بداية الشهر',
     movements: 'حركة الآليات', movement: 'الحركة', Arrived: 'وصلت إلى الموقع', Released: 'غادرت الموقع',
     info: 'معلومات إضافية', received: 'المستلم', shiftDay: 'الوردية النهارية', shiftNight: 'الوردية الليلية', all: 'الورديتان النهارية والليلية',
     shiftLabel: 'الوردية', page: 'صفحة', generated: 'تاريخ الإصدار',
@@ -83,6 +180,8 @@ function machineName(m, lang) {
   if (lang === 'ar') return `${m.type_name_ar || m.type_name}${m.type_seq ? ` ${m.type_seq}` : ''}`;
   return m.machine_label || m.type_name;
 }
+/** Make, model and capacity on one line: "CAT 320D 20 t" (empty when none is known). */
+const modelText = (m) => [m.make, m.model, m.capacity].map((x) => String(x ?? '').trim()).filter(Boolean).join(' ');
 const typeName = (m, lang) => (lang === 'ar' ? (m.type_name_ar || m.type_name) : m.type_name);
 const dateText = (d) => `${d.slice(8, 10)}/${d.slice(5, 7)}/${d.slice(0, 4)}`;
 /** "Quarry > Zone B" / "من Quarry إلى Zone B" (either side may be empty). */
@@ -137,7 +236,8 @@ function drawTable(doc, lay, w, y, cols, rows, opts = {}) {
   let yy = head(y);
   if (opts.noHead) doc.moveTo(L, yy).lineTo(L + total, yy).lineWidth(0.4).strokeColor(COLORS.grid).stroke();
   rows.forEach((r, i) => {
-    const h = Math.max(opts.rowHeight || 19, ...cols.filter((c) => c.wrap).map((c) => w.height(r[c.key], c.width - 10, size, c.bold || r._bold) + 9));
+    const cellH = (c) => w.height(r[c.key], c.width - 10, size, c.bold || r._bold) + (c.sub && r[c.sub] ? w.height(r[c.sub], c.width - 10, size - 1) + 1 : 0) + 9;
+    const h = Math.max(opts.rowHeight || 19, ...cols.filter((c) => c.wrap || (c.sub && r[c.sub])).map(cellH));
     if (yy + h > lay.bottom()) { doc.addPage(); yy = head(doc.page.margins.top); }
     if (r._fill) doc.rect(L, yy, total, h).fill(r._fill);
     else if (!opts.noHead && i % 2 === 1) doc.rect(L, yy, total, h).fill(COLORS.zebra);
@@ -145,11 +245,17 @@ function drawTable(doc, lay, w, y, cols, rows, opts = {}) {
     for (const c of ordered) {
       if (c.fill) doc.rect(x, yy, c.width, h).fill(c.fill);
       const val = r[c.key];
+      const sub = c.sub ? r[c.sub] : '';
       if (val !== undefined && val !== null && val !== '') {
-        w.tx(val, x + 5, yy + (c.wrap ? 4.5 : 0), {
-          size, bold: c.bold || r._bold, color: r._color || c.color, width: c.width - 10, height: c.wrap ? h - 6 : h,
-          valign: c.wrap ? 'top' : 'middle', align: c.align || lay.align, wrap: Boolean(c.wrap),
+        const top = c.wrap || sub;
+        const mainH = w.height(val, c.width - 10, size, c.bold || r._bold);
+        w.tx(val, x + 5, yy + (top ? 4.5 : 0), {
+          size, bold: c.bold || r._bold, color: r[`${c.key}_color`] || r._color || c.color, width: c.width - 10, height: top ? (sub ? mainH + 2 : h - 6) : h,
+          valign: top ? 'top' : 'middle', align: c.align || lay.align, wrap: Boolean(c.wrap),
         });
+        if (sub) {
+          w.tx(sub, x + 5, yy + 4.5 + mainH + 1, { size: size - 1, color: COLORS.muted, width: c.width - 10, align: c.align || lay.align, wrap: true });
+        }
       }
       x += c.width;
     }
@@ -203,12 +309,15 @@ async function renderPdf(conn, data, opts, user) {
   });
   y += ch * 2 + 14;
 
-  // ---- key figures
+  // ---- key figures: the whole fleet on site, not only the machines that worked
   const sitesShown = data.sites;
-  const trips = data.deliveries.reduce((a, d) => a + Number(d.notes), 0);
-  const typeSet = new Set(data.machines.map((m) => m.type_name));
-  const kpis = [[t.working, data.machines.length, true], [t.sites, sitesShown.length], [t.types, typeSet.size]];
-  if (trips) kpis.push([t.trips, trips]);
+  const count = (st) => data.fleet.filter((f) => f.state === st).length;
+  const nWork = count('Working'); const nStandby = count('Standby');
+  const base = data.fleet.length - count('Holiday') - count('Pending');
+  const avail = base > 0 ? `${Math.round(((nWork + nStandby) / base) * 100)}%` : '-';
+  const kpis = [[t.onSite, data.fleet.length, true], [t.working, nWork], [t.kpi.Breakdown, count('Breakdown')]];
+  if (opts.includeStandby) kpis.push([t.kpi.Standby, nStandby]);
+  kpis.push([t.kpi.Absent, count('Absent')], [t.availability, avail]);
   const kw = (W - (kpis.length - 1) * 8) / kpis.length;
   kpis.forEach(([label, value, main], i) => {
     const x = X(L + i * (kw + 8), kw);
@@ -219,30 +328,44 @@ async function renderPdf(conn, data, opts, user) {
   });
   y += 48 + 18;
 
-  // ---- summary by type (one column per site when there are few sites)
-  if (data.machines.length) {
+  // ---- summary by type: today's state + machine-days worked since the 1st of the month
+  const mtdTypes = Object.keys(data.mtd.byType);
+  if (data.fleet.length || mtdTypes.length) {
     y = sectionHeading(doc, lay, w, y, t.byType);
-    const types = [...new Set(data.machines.map((m) => m.type_name))].sort();
-    const perSite = sitesShown.length <= 5;
-    const siteCols = perSite ? sitesShown.map((s) => ({ key: `s${s.site_id}`, label: s.site_code, width: 0, align: 'center', headAlign: 'center' })) : [];
-    const typeW = perSite ? 180 : W - 70; const totalW = 70;
-    siteCols.forEach((c) => { c.width = (W - typeW - totalW) / siteCols.length; });
-    const cols = [{ key: 'type', label: t.type, width: typeW, bold: true }, ...siteCols, { key: 'total', label: t.total, width: totalW, align: 'center', headAlign: 'center', bold: true }];
-    const rows = types.map((ty) => {
-      const ms = data.machines.filter((m) => m.type_name === ty);
-      const r = { type: typeName(ms[0], lang), total: String(ms.length) };
-      for (const s of sitesShown) { const n = ms.filter((m) => m.site_id === s.site_id).length; r[`s${s.site_id}`] = n ? String(n) : '-'; }
+    const types = [...new Set([...data.fleet.map((m) => m.type_name), ...mtdTypes])].sort();
+    const states = ['Working', 'Breakdown', ...(opts.includeStandby ? ['Standby'] : []), 'Absent'];
+    const numW = 62; const mtdW = 92;
+    const typeW = W - numW * (states.length + 1) - mtdW;
+    const cols = [
+      { key: 'type', label: t.type, width: typeW, bold: true },
+      { key: 'onSite', label: t.onSite, width: numW, align: 'center', headAlign: 'center', bold: true },
+      ...states.map((st) => ({ key: st, label: st === 'Working' ? t.working : t.kpi[st], width: numW, align: 'center', headAlign: 'center' })),
+      { key: 'mtd', label: `${t.mtd}`, width: mtdW, align: 'center', headAlign: 'center' },
+    ];
+    const line = (list) => {
+      const r = { onSite: String(list.length) };
+      for (const st of states) { const n = list.filter((m) => m.state === st).length; r[st] = n ? String(n) : '-'; }
       return r;
+    };
+    const rows = types.map((ty) => {
+      const ms = data.fleet.filter((m) => m.type_name === ty);
+      const ref = ms[0] || data.mtd.byType[ty];
+      return { type: typeName(ref, lang), ...line(ms), mtd: String(data.mtd.byType[ty] ? data.mtd.byType[ty].days : 0) };
     });
-    const tot = { type: t.total, total: String(data.machines.length), _bold: true, _fill: COLORS.band };
-    for (const s of sitesShown) tot[`s${s.site_id}`] = String(data.machines.filter((m) => m.site_id === s.site_id).length);
+    const tot = { type: t.total, ...line(data.fleet), mtd: String(data.mtd.machineDays), _bold: true, _fill: COLORS.band };
     y = drawTable(doc, lay, w, y, cols, [...rows, tot]);
+    w.tx(`${t.mtd}: ${t.mtdUnit}`, X(L, W), y - 8, { size: 7, color: COLORS.muted, width: W, align: lay.align });
+    y += 6;
   }
 
-  // ---- one section per site
+  // ---- one section per site: every machine on site with its state and what it did
+  const STATE_COLOR = { Working: COLORS.green, Partly: COLORS.amber, Standby: COLORS.amber, Breakdown: COLORS.red, Absent: COLORS.red, Holiday: COLORS.muted, Pending: COLORS.muted };
+  const stateKey = (m) => (m.state === 'Working' && m.partlyStopped ? 'Partly' : m.state);
+  const stateText = (m) => { const k = stateKey(m); return k === 'Pending' ? (isToday ? t.st.PendingToday : t.st.Pending) : t.st[k]; };
   for (const s of sitesShown) {
-    const ms = data.machines.filter((m) => m.site_id === s.site_id);
-    y = sectionHeading(doc, lay, w, y, `${s.site_code} - ${s.site_name}`, `${t.working}: ${ms.length}`);
+    const ms = data.fleet.filter((m) => m.site_id === s.site_id);
+    const nw = ms.filter((m) => m.state === 'Working').length;
+    y = sectionHeading(doc, lay, w, y, `${s.site_code} - ${s.site_name}`, `${t.working}: ${nw} / ${ms.length}`);
     const sub = [s.project_name, s.location].filter(Boolean).join('  |  ');
     if (sub) { w.tx(sub, X(L + 10, W - 10), y - 5, { size: 8, color: COLORS.muted, width: W - 10, align: lay.align }); y += 10; }
     if (!ms.length) { w.tx(t.noMachine, X(L + 10, W - 10), y, { size: 8.5, color: COLORS.muted, width: W - 10, align: lay.align }); y += 22; continue; }
@@ -254,24 +377,44 @@ async function renderPdf(conn, data, opts, user) {
         y += 15;
       }
       const rows = ms.filter((m) => m.shift_type === sh).map((m, i) => ({
-        n: String(i + 1), m: machineName(m, lang), plate: m.plate_number || '-', op: m.operator_name || '-',
-        start: String(m.check_in_time).slice(11, 16), work: m.work_description || '',
+        n: String(i + 1), m: machineName(m, lang), model: modelText(m), plate: m.plate_number || '-', op: m.operator_name || '-',
+        st: stateText(m), st_color: STATE_COLOR[stateKey(m)],
+        work: (m.state === 'Working' ? m.work_description : m.remarks) || '',
       }));
       y = drawTable(doc, lay, w, y, [
-        { key: 'n', label: '#', width: 24, align: 'center', headAlign: 'center' },
-        { key: 'm', label: t.machine, width: 112, bold: true, wrap: true },
-        { key: 'plate', label: t.plate, width: 70 },
-        { key: 'op', label: t.operator, width: 110, wrap: true },
-        { key: 'start', label: t.start, width: 44, align: 'center', headAlign: 'center' },
-        { key: 'work', label: t.work, width: W - 360, wrap: true },
+        { key: 'n', label: '#', width: 22, align: 'center', headAlign: 'center' },
+        { key: 'm', label: t.machine, width: 112, bold: true, wrap: true, sub: 'model' },
+        { key: 'plate', label: t.plate, width: 64 },
+        { key: 'op', label: t.operator, width: 96, wrap: true },
+        { key: 'st', label: t.status, width: 82, bold: true, wrap: true },
+        { key: 'work', label: t.work, width: W - 376, wrap: true },
       ], rows);
     }
   }
 
-  // ---- deliveries of the day
+  // ---- breakdowns, stoppages and absences of the day (said explicitly when there is none)
   const code = Object.fromEntries(sitesShown.map((s) => [s.site_id, s.site_code]));
+  y = sectionHeading(doc, lay, w, y, t.events, data.events.length ? String(data.events.length) : '');
+  if (!data.events.length) {
+    w.tx(t.noEvents, X(L + 10, W - 10), y - 2, { size: 8.5, color: COLORS.green, width: W - 10, align: lay.align });
+    y += 22;
+  } else {
+    y = drawTable(doc, lay, w, y, [
+      { key: 'site', label: t.site, width: 50 },
+      { key: 'm', label: t.machine, width: 112, bold: true, wrap: true, sub: 'plate' },
+      { key: 'ev', label: t.event, width: 80, bold: true, wrap: true },
+      { key: 'ext', label: t.status, width: 84, wrap: true },
+      { key: 'reason', label: t.reason, width: W - 326, wrap: true },
+    ], data.events.map((e) => ({
+      site: code[e.site_id], m: machineName(e, lang), plate: e.plate_number || '', ev: t.ev[e.kind], ev_color: e.kind === 'Standby' ? COLORS.amber : COLORS.red,
+      ext: t.ext[e.extent], ext_color: e.extent === 'Resumed' ? COLORS.green : COLORS.ink, reason: e.reason || '-',
+    })));
+  }
+
+  // ---- deliveries of the day
+  const trips = data.deliveries.reduce((a, d) => a + Number(d.notes), 0);
   if (data.deliveries.length) {
-    y = sectionHeading(doc, lay, w, y, t.deliveries, `${t.trips}: ${trips}`);
+    y = sectionHeading(doc, lay, w, y, t.deliveries, `${t.tripsToday}: ${trips}  |  ${t.tripsMtd}: ${data.mtd.trips}`);
     y = drawTable(doc, lay, w, y, [
       { key: 'site', label: t.site, width: 60 },
       { key: 'item', label: t.item, width: 175, wrap: true },

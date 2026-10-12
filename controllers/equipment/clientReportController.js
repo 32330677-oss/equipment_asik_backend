@@ -1,6 +1,7 @@
 // Daily Equipment Report for an external party (sub-contractor / client): GET /api/equipment/reports/client-daily.pdf
 // Query: date (default today, not in the future), site_ids (comma list; empty = every active site), shift Day|Night|All,
-// lang en|ar, to, issued_by, issued_title, notes (JSON [{label, value}]). Read only: nothing is saved.
+// lang en|ar, to, issued_by, issued_title, notes (JSON [{label, value}]), include_standby (default false: Standby machines
+// and stoppages are left out of the report). Read only: nothing is saved.
 'use strict';
 
 const { pool } = require('../../config/db');
@@ -44,7 +45,7 @@ exports.clientDailyPdf = async (req, res) => {
   const q = validate(req.query, {
     date: v.date({ default: today }), shift: v.enumOf(['Day', 'Night', 'All'], { default: 'All' }), lang: v.enumOf(['en', 'ar'], { default: 'en' }),
     to: v.string({ max: 150 }), issued_by: v.string({ max: 120 }), issued_title: v.string({ max: 120 }),
-    site_ids: v.any(), notes: v.any(),
+    site_ids: v.any(), notes: v.any(), include_standby: v.bool({ default: false }),
   });
   if (q.date > today) throw AppError.validation({ date: 'cannot be in the future' });
   const notes = parseNotes(q.notes);
@@ -67,10 +68,11 @@ exports.clientDailyPdf = async (req, res) => {
     }
   }
 
-  const data = await R.loadData(pool, { date: q.date, siteIds, shift: q.shift });
+  const includeStandby = q.include_standby === true;
+  const data = await R.loadData(pool, { date: q.date, siteIds, shift: q.shift, includeStandby });
   if (siteIds.length && data.sites.length !== siteIds.length) throw AppError.notFound('Site');
   const out = await R.renderPdf(pool, data, {
-    lang: q.lang, date: q.date, shift: q.shift, to: q.to || '', issuedBy: q.issued_by || '', issuedTitle: q.issued_title || '', notes,
+    lang: q.lang, date: q.date, shift: q.shift, to: q.to || '', issuedBy: q.issued_by || '', issuedTitle: q.issued_title || '', notes, includeStandby,
   }, req.user);
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${out.fileName}"`);
