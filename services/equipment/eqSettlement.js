@@ -26,7 +26,7 @@ const METHODS = ['BankTransfer', 'Cheque', 'Cash', 'Other'];
 
 async function loadBatch(conn, id, lock = false) {
   const [[b]] = await conn.execute(`SELECT * FROM eq_payroll_batches WHERE eq_batch_id = ?${lock ? ' FOR UPDATE' : ''}`, [id]);
-  if (!b) throw AppError.notFound('Payroll batch');
+  if (!b) throw AppError.notFound('Invoice batch');
   return b;
 }
 

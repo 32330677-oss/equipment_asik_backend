@@ -89,7 +89,7 @@ function numberBlock(doc, b, no, cur, internal = false) {
     } else {
       P.text(doc, b.provisional ? 'PROVISIONAL - NO NUMBER' : 'DRAFT - NOT YET NUMBERED', xr - w, top + 2, { size: 7.5, bold: true, color: COLORS.red, width: w, align: 'right', lineBreak: false });
     }
-    P.text(doc, b.provisional ? 'Not a payroll batch' : `Batch #${b.eq_batch_id} | v${b.version_number}`, xr - w, top + 22, { size: 7, width: w, align: 'right', lineBreak: false });
+    P.text(doc, b.provisional ? 'Not an invoice batch' : `Batch #${b.eq_batch_id} | v${b.version_number}`, xr - w, top + 22, { size: 7, width: w, align: 'right', lineBreak: false });
     P.text(doc, `Currency ${cur}`, xr - w, top + 32, { size: 7, width: w, align: 'right', lineBreak: false });
   };
 }
@@ -581,7 +581,7 @@ function drawFuelDiff(doc, ctx, b, it) {
 // --------------------------------------------------------------- D4 summary
 function drawSummary(doc, ctx, b, items) {
   const cur = b.currency;
-  let y = P.header(doc, { title: 'RENTED EQUIPMENT PAYROLL SUMMARY', titleAr: 'ملخص مستحقات الآليات المستأجرة', subtitle: ctx.company, right: numberBlock(doc, b, null, cur, true) });
+  let y = P.header(doc, { title: 'RENTED EQUIPMENT INVOICES SUMMARY', titleAr: 'ملخص مستحقات الآليات المستأجرة', subtitle: ctx.company, right: numberBlock(doc, b, null, cur, true) });
   y = P.infoGrid(doc, [
     { label: 'Batch', labelAr: 'رقم الدفعة', value: b.provisional ? 'Provisional' : `#${b.eq_batch_id} | v${b.version_number}` },
     { label: 'Status', labelAr: 'الحالة', value: statusText(b) },
@@ -625,7 +625,7 @@ async function render(conn, model, opts, user) {
   const { batch: b } = model;
   const items = model.items;
   const landscape = opts.view === 'summary';
-  const doc = P.createDoc({ layout: landscape ? 'landscape' : 'portrait', info: { Title: `Equipment payroll ${opts.view}` } });
+  const doc = P.createDoc({ layout: landscape ? 'landscape' : 'portrait', info: { Title: `Equipment invoice ${opts.view}` } });
   let fileName;
   const tag = b.provisional ? `provisional-${b.start_date}_${b.end_date}` : `batch-${b.eq_batch_id}-v${b.version_number}`;
   if (opts.view === 'machine') {
@@ -645,7 +645,7 @@ async function render(conn, model, opts, user) {
     fileName = `${fdItems.length === 1 && fdItems[0].fuel_invoice_no ? fdItems[0].fuel_invoice_no : `fuel-difference-${tag}`}.pdf`;
   } else {
     drawSummary(doc, ctx, b, items);
-    fileName = `equipment-payroll-summary-${tag}.pdf`;
+    fileName = `equipment-invoices-summary-${tag}.pdf`;
   }
   if (b.provisional && b.unapproved_rows) watermark(doc, 'PROVISIONAL - INCLUDES ROWS NOT APPROVED');
   else if (b.provisional) watermark(doc, 'PROVISIONAL - NOT AN INVOICE');
@@ -690,7 +690,7 @@ async function batchXlsx(conn, detail) {
 
   const s = wb.addWorksheet('Summary');
   s.addRows([
-    ['Equipment payroll batch', `#${b.eq_batch_id} v${b.version_number}`], ['Status', statusText(b)], ['Period', `${b.start_date} to ${b.end_date}`],
+    ['Equipment invoice batch', `#${b.eq_batch_id} v${b.version_number}`], ['Status', statusText(b)], ['Period', `${b.start_date} to ${b.end_date}`],
     ['Scope', scopeText(b)], ['Currency', b.currency], ['Machines', Number(b.total_equipment)], ['Gross', n(b.total_gross)], ['Deductions', n(b.total_deductions)], ['Net', n(b.total_net)], [],
     ['Vendor', 'Machines', 'Gross', 'Deductions', 'Net'],
   ]);

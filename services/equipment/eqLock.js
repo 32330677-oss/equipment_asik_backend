@@ -39,7 +39,7 @@ async function assertEqEditable(executor, row) {
   const b = await findLock(executor, row);
   if (b) {
     throw AppError.conflict('PAYROLL_PERIOD_FINALIZED',
-      `${String(row.record_date).slice(0, 10)} was billed by equipment payroll batch #${b.eq_batch_id} (${b.start_date} to ${b.end_date}), which is ${b.status === 'Paid' ? 'Paid' : 'Finalized'}. Normal changes are locked; use an official Correction (reason required).`,
+      `${String(row.record_date).slice(0, 10)} was billed by equipment invoice batch #${b.eq_batch_id} (${b.start_date} to ${b.end_date}), which is ${b.status === 'Paid' ? 'Paid' : 'Finalized'}. Normal changes are locked; use an official Correction (reason required).`,
       { eq_batch_id: b.eq_batch_id });
   }
 }
@@ -106,7 +106,7 @@ async function finalizedOverlapForSite(executor, { siteId, from, to = null }) {
 function closedError(b, what, from, to) {
   const when = to && to !== from ? `${from} to ${to === OPEN_END ? 'open' : to}` : from;
   return AppError.conflict('PAYROLL_PERIOD_FINALIZED',
-    `${what} (${when}) falls inside payroll batch #${b.eq_batch_id} (${b.start_date} to ${b.end_date}), which is ${b.status === 'Paid' ? 'Paid' : 'Finalized'}. `
+    `${what} (${when}) falls inside invoice batch #${b.eq_batch_id} (${b.start_date} to ${b.end_date}), which is ${b.status === 'Paid' ? 'Paid' : 'Finalized'}. `
     + 'Use a date in an open period, or an official Correction for what that batch billed.',
     { eq_batch_id: b.eq_batch_id, start_date: b.start_date, end_date: b.end_date });
 }

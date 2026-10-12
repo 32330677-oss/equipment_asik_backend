@@ -79,7 +79,7 @@ exports.updateFuel = async (req, res) => {
     const before = await loadFuel(conn, id);
     if (before.is_cancelled) throw AppError.conflict('INVALID_STATE', 'This fuel issue is cancelled.');
     const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized payroll batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized invoice batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
     // never billed (even if dated in a finalized period): it is priced / changed normally and billed by the next batch
     const changesMoney = (d.liters !== undefined && Number(d.liters) !== Number(before.liters))
       || (d.price_per_liter !== undefined && before.price_per_liter !== null && Number(d.price_per_liter) !== Number(before.price_per_liter));
@@ -103,7 +103,7 @@ exports.cancelFuel = async (req, res) => {
     if (before.is_cancelled) return;
     // in a FINALIZED batch: official Correction. In a Generated batch: allowed, that batch turns stale (void and regenerate).
     const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized payroll batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized invoice batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
     const inBatch = await lock.sourceConsumed(conn, 'eq_fuel_issues', id);
     await conn.execute('UPDATE eq_fuel_issues SET is_cancelled = 1, cancel_reason = ? WHERE fuel_issue_id = ?', [reason, id]);
     await audit.log(conn, { table: 'eq_fuel_issues', id, action: 'cancel', oldValues: { is_cancelled: 0 }, newValues: { is_cancelled: 1 }, reason,
@@ -214,7 +214,7 @@ exports.cancelAdjustment = async (req, res) => {
         { correction_id: a.correction_id });
     }
     const used = await lock.sourceConsumed(conn, 'eq_adjustments', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This adjustment is in finalized payroll batch #${used.eq_batch_id}. Reverse it with an official Correction.`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This adjustment is in finalized invoice batch #${used.eq_batch_id}. Reverse it with an official Correction.`);
     const inBatch = await lock.sourceConsumed(conn, 'eq_adjustments', id);
     await conn.execute("UPDATE eq_adjustments SET status = 'Cancelled', cancelled_by_user_id = ?, cancelled_at = ? WHERE adjustment_id = ?", [req.user.user_id, businessNow(), id]);
     await audit.log(conn, { table: 'eq_adjustments', id, action: 'cancel', oldValues: { status: 'Active' }, newValues: { status: 'Cancelled' }, reason,

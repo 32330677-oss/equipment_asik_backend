@@ -139,8 +139,8 @@ async function rateCardInGeneratedBatch(conn, rateCardId) {
 function billedConflict(billed, hint) {
   const { date, eq_batch_id: batchId, state } = billed;
   const msg = state === 'draft'
-    ? `Draft payroll batch #${batchId} (not finalized, not paid) already bills this card up to ${date}. ${hint}, or void that draft batch first, change the card, then generate it again.`
-    : `${state === 'paid' ? 'Paid' : 'Finalized'} payroll batch #${batchId} bills this card up to ${date}. ${hint}. A price that was wrong on those days is fixed by an official Correction.`;
+    ? `Draft invoice batch #${batchId} (not finalized, not paid) already bills this card up to ${date}. ${hint}, or void that draft batch first, change the card, then generate it again.`
+    : `${state === 'paid' ? 'Paid' : 'Finalized'} invoice batch #${batchId} bills this card up to ${date}. ${hint}. A price that was wrong on those days is fixed by an official Correction.`;
   return AppError.conflict('RATE_CARD_LOCKED', msg, { eq_batch_id: batchId, billed_up_to: date, batch_state: state });
 }
 
@@ -151,11 +151,11 @@ exports.update = async (req, res) => {
   const updated = await withTransaction(async (conn) => {
     const before = await C.loadRateCard(conn, id, true);
     const lockedBy = await C.rateCardLocked(conn, id);
-    if (lockedBy) throw AppError.conflict('RATE_CARD_LOCKED', `This rate card is used by finalized payroll batch #${lockedBy}. Use "Change from a date" for the future; a wrong price already paid is fixed by an official Correction.`, { eq_batch_id: lockedBy });
+    if (lockedBy) throw AppError.conflict('RATE_CARD_LOCKED', `This rate card is used by finalized invoice batch #${lockedBy}. Use "Change from a date" for the future; a wrong price already paid is fixed by an official Correction.`, { eq_batch_id: lockedBy });
     const generated = await rateCardInGeneratedBatch(conn, id);
     if (generated) {
       // 12 Oct 2026: a price is never changed under a draft — the draft is voided first, then generated again
-      throw AppError.conflict('RATE_CARD_IN_DRAFT', `Draft payroll batch #${generated} uses this card. Void that draft first, change the card, then generate again.`, { eq_batch_id: generated });
+      throw AppError.conflict('RATE_CARD_IN_DRAFT', `Draft invoice batch #${generated} uses this card. Void that draft first, change the card, then generate again.`, { eq_batch_id: generated });
     }
     const card = checkCard({ ...before, overtime_enabled: Boolean(before.overtime_enabled), operator_included: Boolean(before.operator_included), ...d });
     const machine = await C.loadMachine(conn, before.equipment_id, true);

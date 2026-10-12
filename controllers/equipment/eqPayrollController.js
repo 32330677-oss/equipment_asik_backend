@@ -369,7 +369,7 @@ exports.generate = async (req, res) => {
 
 async function loadBatch(conn, id, lock = false) {
   const [rows] = await conn.execute(`SELECT * FROM eq_payroll_batches WHERE eq_batch_id = ?${lock ? ' FOR UPDATE' : ''}`, [id]);
-  if (!rows[0]) throw AppError.notFound('Payroll batch');
+  if (!rows[0]) throw AppError.notFound('Invoice batch');
   return rows[0];
 }
 
@@ -1188,7 +1188,7 @@ exports.exportXlsx = async (req, res) => {
   const detail = await batchDetail(pool, id);
   const buffer = await statements.batchXlsx(pool, detail);
   res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.set('Content-Disposition', `attachment; filename="equipment-payroll-batch-${id}-v${detail.version_number}.xlsx"`);
+  res.set('Content-Disposition', `attachment; filename="equipment-invoices-batch-${id}-v${detail.version_number}.xlsx"`);
   res.send(buffer);
 };
 
@@ -1216,7 +1216,7 @@ async function provisional(req, res, kind) {
       throw AppError.conflict('NOTHING_APPROVED', `Nothing approved yet in this period: ${sub} day(s) are waiting for the office's approval (${String(w.first_day).slice(0, 10)} to ${String(w.last_day).slice(0, 10)}). Approve them in Attendance review, or open the statement again with "Include days not approved yet".`, { submitted: sub, drafts: dr });
     }
     if (dr > 0) throw AppError.conflict('NOTHING_SUBMITTED', `Nothing to count yet: ${dr} day(s) are still Draft (not submitted by the supervisor).`, { drafts: dr });
-    throw AppError.conflict('NOTHING_TO_PAY', 'Nothing payable in this period (no recorded day, or already in a payroll batch).');
+    throw AppError.conflict('NOTHING_TO_PAY', 'Nothing payable in this period (no recorded day, or already in an invoice batch).');
   }
   const unapproved = q.include_unapproved ? chosen.reduce((a, it) => a + (it.per_row || []).filter((p) => p.row && p.row.status !== 'Approved').length, 0) : 0;
   const { buffer, fileName } = await statements.provisionalPdf(pool, { kind, scope, items: chosen, unapproved, hide: statements.hideOptions(q.hide) }, req.user);

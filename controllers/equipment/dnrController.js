@@ -296,7 +296,7 @@ exports.updateNote = async (req, res) => {
     const before = await loadNote(conn, id);
     if (before.status === 'Cancelled') throw AppError.conflict('INVALID_STATE', 'This delivery note is cancelled.');
     const used = await lock.sourceConsumed(conn, 'eq_delivery_notes', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This delivery note is in finalized payroll batch #${used.eq_batch_id}. Ask for an official Correction (open that batch, the machine, "Official correction").`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This delivery note is in finalized invoice batch #${used.eq_batch_id}. Ask for an official Correction (open that batch, the machine, "Official correction").`);
     const machine = await C.loadMachine(conn, before.equipment_id);
     const next = { ...before, note_date: day(before.note_date), ...d };
     const moneyKeys = ['quantity', 'dnr_rate_id', 'note_date', 'site_id'];
@@ -343,7 +343,7 @@ exports.cancelNote = async (req, res) => {
     const before = await loadNote(conn, id);
     if (before.status === 'Cancelled') return;
     const used = await lock.sourceConsumed(conn, 'eq_delivery_notes', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This delivery note is in finalized payroll batch #${used.eq_batch_id}. Reverse it with an official Correction.`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This delivery note is in finalized invoice batch #${used.eq_batch_id}. Reverse it with an official Correction.`);
     const inBatch = await lock.sourceConsumed(conn, 'eq_delivery_notes', id);
     await conn.execute("UPDATE eq_delivery_notes SET status = 'Cancelled', cancel_reason = ?, cancelled_by_user_id = ?, cancelled_at = ? WHERE delivery_note_id = ?",
       [reason, req.user.user_id, businessNow(), id]);

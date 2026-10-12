@@ -310,7 +310,7 @@ exports.approveChangeRequest = async (req, res) => {
     if (locked) {
       if (!d.convert_to_correction) {
         throw AppError.conflict('ROW_LOCKED_USE_CORRECTION',
-          `This row is in finalized payroll batch #${locked.eq_batch_id}. Approve with "convert to correction" to send it through the official Correction.`,
+          `This row is in finalized invoice batch #${locked.eq_batch_id}. Approve with "convert to correction" to send it through the official Correction.`,
           { eq_batch_id: locked.eq_batch_id });
       }
       if (!preDelta) throw AppError.conflict('INVALID_STATE', 'The row was locked meanwhile; try again.');
@@ -382,7 +382,7 @@ function assertMayApprove(c, user) {
 }
 const isAdmin = (req) => Boolean(req.user && req.user.role === 'Admin');
 const SENT_MSG = 'Sent to the Admin for approval.';
-const APPLIED_MSG = 'Correction applied. The finalized payroll was not changed; the difference is settled in the next open period.';
+const APPLIED_MSG = 'Correction applied. The finalized invoice was not changed; the difference is settled in the next open period.';
 
 /**
  * Creates an attendance correction request (inside the caller's transaction). Returns its id.
@@ -449,7 +449,7 @@ exports.financialCorrection = async (req, res) => {
       const [[it]] = await conn.execute(
         `SELECT i.*, b.status AS batch_status, b.is_finalized, b.currency FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
          WHERE i.eq_item_id = ?`, [d.eq_item_id]);
-      if (!it) throw AppError.notFound('Payroll item');
+      if (!it) throw AppError.notFound('Invoice item');
       if (!Number(it.is_finalized) || !['Generated', 'Paid'].includes(it.batch_status)) {
         throw AppError.conflict('NOT_LOCKED', 'This item is not in a finalized batch: void and regenerate the batch instead.');
       }
@@ -462,7 +462,7 @@ exports.financialCorrection = async (req, res) => {
       equipmentId = equipmentId || f.equipment_id; siteId = siteId || f.site_id;
       if (item) {
         const [[line]] = await conn.execute("SELECT * FROM eq_payroll_lines WHERE eq_item_id = ? AND source_table = 'eq_fuel_issues' AND source_id = ?", [item.eq_item_id, f.fuel_issue_id]);
-        if (!line) throw AppError.validation({ target_id: 'this fuel issue is not on that payroll item' });
+        if (!line) throw AppError.validation({ target_id: 'this fuel issue is not on that invoice item' });
         const oldValue = Number(f.liters) * Number(f.price_per_liter || 0);
         if (fuel && oldValue > 0) {
           const newValue = Number(fuel.liters ?? f.liters) * Number(fuel.price_per_liter ?? f.price_per_liter);
@@ -475,14 +475,14 @@ exports.financialCorrection = async (req, res) => {
         throw AppError.validation({ eq_item_id: `choose the item of finalized batch #${b.eq_batch_id} that billed this fuel issue` });
       }
     } else if (!item) {
-      throw AppError.validation({ eq_item_id: 'choose the finalized payroll item (machine invoice) that is corrected' });
+      throw AppError.validation({ eq_item_id: 'choose the finalized invoice item (machine invoice) that is corrected' });
     }
     if (d.target_type === 'adjustment') {
       const [[a]] = await conn.execute("SELECT * FROM eq_payroll_lines WHERE eq_item_id = ? AND source_table = 'eq_adjustments' AND source_id = ?", [item.eq_item_id, d.target_id]);
-      if (!a) throw AppError.validation({ target_id: 'this adjustment is not on that payroll item' });
+      if (!a) throw AppError.validation({ target_id: 'this adjustment is not on that invoice item' });
       original = { amount: a.amount, note: a.note };
     }
-    if (d.target_type === 'rate_card' && item.rate_card_id !== d.target_id) throw AppError.validation({ target_id: 'that payroll item was not billed with this rate card' });
+    if (d.target_type === 'rate_card' && item.rate_card_id !== d.target_id) throw AppError.validation({ target_id: 'that invoice item was not billed with this rate card' });
     const cents = d.amount !== undefined ? Math.round(d.amount * 100) : auto;
     if (cents === null || cents === undefined) throw AppError.validation({ amount: 'give the amount to settle (+ we pay the vendor more, - we deduct)' });
     if (cents === 0 && !fuel) throw AppError.validation({ amount: 'cannot be 0' });

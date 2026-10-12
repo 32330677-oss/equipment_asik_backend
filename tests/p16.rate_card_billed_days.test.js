@@ -57,7 +57,7 @@ test('monthly card: a draft batch locks the WHOLE period (not only up to the las
   assert.strictEqual(r.body.details.billed_up_to, '2026-09-30');
   assert.strictEqual(r.body.details.batch_state, 'draft');
   assert.strictEqual(r.body.details.eq_batch_id, septBatch.eq_batch_id);
-  assert.match(r.body.message, /Draft payroll batch/);
+  assert.match(r.body.message, /Draft invoice batch/);
   assert.match(r.body.message, /void that draft batch/);
   assert.doesNotMatch(r.body.message, /already paid/);
   const c = await close(craneCard.rate_card_id, '2026-09-26');
@@ -71,7 +71,7 @@ test('monthly card: after finalizing, the message points to an official Correcti
   const r = await revise(craneCard.rate_card_id, '2026-09-28');
   assert.strictEqual(r.status, 409);
   assert.strictEqual(r.body.details.batch_state, 'finalized');
-  assert.match(r.body.message, /Finalized payroll batch/);
+  assert.match(r.body.message, /Finalized invoice batch/);
   assert.match(r.body.message, /official Correction/);
   // the finalized month is no longer listed as days without rows
   const blk = await ok(h.api().get(`/api/equipment/payroll/blockers?start_date=2026-09-01&end_date=2026-09-30&equipment_id=${F.crane.equipment_id}`).set(ACC()));

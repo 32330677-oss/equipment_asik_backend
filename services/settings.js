@@ -4,7 +4,7 @@ const AppError = require('../utils/AppError');
 
 // Every known key, its type and allowed values. Unknown keys cannot be written.
 const DEFINITIONS = {
-  eq_payroll_requires_paper_match: { type: 'bool', description: 'Payroll includes only rows whose paper status is Matched' },
+  eq_payroll_requires_paper_match: { type: 'bool', description: 'Invoices include only rows whose paper status is Matched' },
   eq_paper_tolerance_minutes: { type: 'int', min: 0, max: 120, description: 'Max difference paper vs electronic (minutes) to allow Matched' },
   eq_meter_tolerance_pct: { type: 'int', min: 1, max: 100, description: 'Hour-meter vs working hours difference (%) that raises meter_mismatch' },
   eq_long_session_review_hours: { type: 'int', min: 4, max: 48, description: 'Session longer than this raises long_session / forgotten check-out' },
@@ -15,7 +15,7 @@ const DEFINITIONS = {
   week_gate_enabled: { type: 'bool', description: 'Block submitting a day while the previous week has Draft rows' },
   company_name: { type: 'string', max: 255, description: 'Company name printed on documents' },
   app_time_zone: { type: 'string', max: 64, readOnly: true, description: 'Business time zone (Syria time). Set on the server with APP_TIME_ZONE; shown here for information' },
-  payroll_finalize_admin_only: { type: 'bool', description: 'Only Admin may finalize / mark paid payroll batches' },
+  payroll_finalize_admin_only: { type: 'bool', description: 'Only Admin may finalize / mark paid invoice batches' },
   eq_weekly_off_day: { type: 'int', min: 0, max: 6, description: 'Weekly day off for monthly machines (0=Sunday ... 5=Friday ... 6=Saturday)' },
   eq_finalize_requires_scan: { type: 'bool', description: 'A batch can be finalized only when the signed monthly sheets are uploaded for all its rows' },
   eq_fuel_diff_allow_negative: { type: 'bool', description: 'Fuel price difference: deduct from the vendor when the official price falls below the base price' },

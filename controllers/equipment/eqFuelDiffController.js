@@ -37,7 +37,7 @@ exports.createPrice = async (req, res) => {
     const [[dup]] = await conn.execute('SELECT fuel_price_id FROM eq_fuel_prices WHERE currency = ? AND effective_from = ?', [d.currency, d.effective_from]);
     if (dup) throw AppError.conflict('FUEL_PRICE_EXISTS', 'There is already a price from this date. Delete it first or use another date.');
     const used = await priceUsedBy(conn, d);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `Finalized payroll batch #${used} already used fuel prices after this date.`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `Finalized invoice batch #${used} already used fuel prices after this date.`);
     const [r] = await conn.execute(
       'INSERT INTO eq_fuel_prices (currency, effective_from, price_per_liter, note, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
       [d.currency, d.effective_from, d.price_per_liter, d.note || null, req.user.user_id]);
@@ -64,10 +64,10 @@ exports.deletePrice = async (req, res) => {
     const [[p]] = await conn.execute('SELECT * FROM eq_fuel_prices WHERE fuel_price_id = ? FOR UPDATE', [id]);
     if (!p) throw AppError.notFound('Fuel price');
     const used = await priceUsedBy(conn, p);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This price is used by finalized payroll batch #${used}; it cannot be deleted. A wrong price already paid is fixed by an official Correction.`);
+    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This price is used by finalized invoice batch #${used}; it cannot be deleted. A wrong price already paid is fixed by an official Correction.`);
     const draft = await priceInDraftBatch(conn, p);
     if (draft && (!reason || reason.trim().length < 5)) {
-      throw AppError.validation({ reason: `draft payroll batch #${draft} uses fuel prices from this date: say why this price is deleted (at least 5 characters)` });
+      throw AppError.validation({ reason: `draft invoice batch #${draft} uses fuel prices from this date: say why this price is deleted (at least 5 characters)` });
     }
     await conn.execute('DELETE FROM eq_fuel_prices WHERE fuel_price_id = ?', [id]);
     await audit.log(conn, { table: 'eq_fuel_prices', id, action: 'delete', oldValues: p, reason: reason || null, payrollEffect: draft ? `stale:${draft}` : 'none', ...audit.ctx(req) });
