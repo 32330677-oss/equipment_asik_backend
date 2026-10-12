@@ -28,14 +28,15 @@ const firstOfMonth = (d) => `${d.slice(0, 7)}-01`;
  *           Standby machines are left out unless includeStandby.
  * machines = the fleet machines that worked (a check-in on a Working row).
  * events  = breakdowns / stoppages / absences of the day with their reason (no times).
- * mtd     = month to date: machine-days worked per type, delivery trips.
+ * mtd     = month to date: machine-days worked per type (a machine counts once a day, whatever its shifts),
+ *           shifts worked per type (day and night shift count apart), delivery trips.
  */
 async function loadData(conn, { date, siteIds, shift, includeStandby = false }) {
   const [sites] = siteIds && siteIds.length
     ? await conn.query('SELECT site_id, site_code, site_name, project_name, location FROM sites WHERE site_id IN (?) ORDER BY site_code', [siteIds])
     : await conn.query("SELECT site_id, site_code, site_name, project_name, location FROM sites WHERE status = 'Active' ORDER BY site_code");
   const ids = sites.map((s) => s.site_id);
-  if (!ids.length) return { sites: [], fleet: [], machines: [], events: [], deliveries: [], movements: [], mtd: { byType: {}, machineDays: 0, trips: 0 } };
+  if (!ids.length) return { sites: [], fleet: [], machines: [], events: [], deliveries: [], movements: [], mtd: { byType: {}, machineDays: 0, shifts: 0, trips: 0 } };
   const shiftSql = shift === 'Day' || shift === 'Night' ? ' AND ea.shift_type = ?' : '';
   const shiftA = shiftSql ? ' AND a.shift_type = ?' : '';
   const shiftParams = shiftSql ? [shift] : [];
@@ -112,15 +113,15 @@ async function loadData(conn, { date, siteIds, shift, includeStandby = false }) 
   // month to date (1st of the month .. the report date)
   const from = firstOfMonth(date);
   const [mtdTypes] = await conn.query(
-    `SELECT t.type_name, t.type_name_ar, COUNT(*) AS days
+    `SELECT t.type_name, t.type_name_ar, COUNT(DISTINCT ea.equipment_id, ea.record_date) AS days, COUNT(*) AS shifts
      FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id JOIN eq_types t ON t.type_id = e.type_id
      WHERE ea.record_date BETWEEN ? AND ? AND ea.site_id IN (?) AND ea.status <> 'Cancelled' AND ea.day_status = 'Working' AND ea.check_in_time IS NOT NULL${shiftSql}
      GROUP BY t.type_name, t.type_name_ar`, [from, date, ids, ...shiftParams]);
   const [[trips]] = await conn.query(
     "SELECT COUNT(*) AS n FROM eq_delivery_notes WHERE note_date BETWEEN ? AND ? AND status = 'Active' AND site_id IN (?)", [from, date, ids]);
   const byType = {};
-  for (const r of mtdTypes) byType[r.type_name] = { type_name: r.type_name, type_name_ar: r.type_name_ar, days: Number(r.days) };
-  const mtd = { byType, machineDays: mtdTypes.reduce((a, r) => a + Number(r.days), 0), trips: Number(trips.n) };
+  for (const r of mtdTypes) byType[r.type_name] = { type_name: r.type_name, type_name_ar: r.type_name_ar, days: Number(r.days), shifts: Number(r.shifts) };
+  const mtd = { byType, machineDays: mtdTypes.reduce((a, r) => a + Number(r.days), 0), shifts: mtdTypes.reduce((a, r) => a + Number(r.shifts), 0), trips: Number(trips.n) };
 
   return { sites, fleet, machines: fleet.filter((f) => f.state === 'Working'), events, deliveries, movements, mtd };
 }
@@ -131,7 +132,7 @@ const T = {
     title: 'DAILY EQUIPMENT REPORT', date: 'Date', to: 'To', issuedBy: 'Issued by', asOf: 'Status as of', reportNo: 'Report No.',
     endOfDay: 'End of day', sites: 'Sites', trips: 'Delivery trips',
     onSite: 'Machines on site', working: 'Working', availability: 'Availability',
-    byType: 'Summary by equipment type', type: 'Equipment type', total: 'Total', mtd: 'Month to date', mtdUnit: 'machine-days',
+    byType: 'Summary by equipment type', type: 'Equipment type', total: 'Total', mtd: 'Month to date', mtdUnit: 'machine-days', mtdShifts: 'in brackets: shifts worked (day and night shifts on the same date)',
     machine: 'Machine', plate: 'Plate No.', operator: 'Operator', status: 'Status', work: 'Work done / remarks',
     noMachine: 'No machine on this site.',
     st: {
@@ -152,7 +153,7 @@ const T = {
     title: 'تقرير الآليات اليومي', date: 'التاريخ', to: 'إلى', issuedBy: 'صادر عن', asOf: 'الوضع حتى الساعة', reportNo: 'رقم التقرير',
     endOfDay: 'نهاية اليوم', sites: 'المواقع', trips: 'نقلات التوريد',
     onSite: 'الآليات في الموقع', working: 'العاملة', availability: 'نسبة الجاهزية',
-    byType: 'ملخص حسب نوع الآلية', type: 'نوع الآلية', total: 'المجموع', mtd: 'منذ بداية الشهر', mtdUnit: 'يوم عمل آلية',
+    byType: 'ملخص حسب نوع الآلية', type: 'نوع الآلية', total: 'المجموع', mtd: 'منذ بداية الشهر', mtdUnit: 'يوم عمل آلية', mtdShifts: 'بين القوسين: عدد الورديات (نهارية وليلية في نفس اليوم)',
     machine: 'الآلية', plate: 'رقم اللوحة', operator: 'السائق', status: 'الحالة', work: 'العمل المنجز أو الملاحظات',
     noMachine: 'لا توجد آليات في هذا الموقع.',
     st: {
@@ -330,6 +331,7 @@ async function renderPdf(conn, data, opts, user) {
 
   // ---- summary by type: today's state + machine-days worked since the 1st of the month
   const mtdTypes = Object.keys(data.mtd.byType);
+  const mtdCell = (days, shifts) => (shifts > days ? `${days} (${shifts})` : String(days));
   if (data.fleet.length || mtdTypes.length) {
     y = sectionHeading(doc, lay, w, y, t.byType);
     const types = [...new Set([...data.fleet.map((m) => m.type_name), ...mtdTypes])].sort();
@@ -350,11 +352,14 @@ async function renderPdf(conn, data, opts, user) {
     const rows = types.map((ty) => {
       const ms = data.fleet.filter((m) => m.type_name === ty);
       const ref = ms[0] || data.mtd.byType[ty];
-      return { type: typeName(ref, lang), ...line(ms), mtd: String(data.mtd.byType[ty] ? data.mtd.byType[ty].days : 0) };
+      const m = data.mtd.byType[ty];
+      return { type: typeName(ref, lang), ...line(ms), mtd: mtdCell(m ? m.days : 0, m ? m.shifts : 0) };
     });
-    const tot = { type: t.total, ...line(data.fleet), mtd: String(data.mtd.machineDays), _bold: true, _fill: COLORS.band };
+    const tot = { type: t.total, ...line(data.fleet), mtd: mtdCell(data.mtd.machineDays, data.mtd.shifts), _bold: true, _fill: COLORS.band };
     y = drawTable(doc, lay, w, y, cols, [...rows, tot]);
-    w.tx(`${t.mtd}: ${t.mtdUnit}`, X(L, W), y - 8, { size: 7, color: COLORS.muted, width: W, align: lay.align });
+    // the shifts only show when they differ from the days (a machine worked day and night on the same date)
+    const note = data.mtd.shifts > data.mtd.machineDays ? `  |  ${t.mtdShifts}` : '';
+    w.tx(`${t.mtd}: ${t.mtdUnit}${note}`, X(L, W), y - 8, { size: 7, color: COLORS.muted, width: W, align: lay.align });
     y += 6;
   }
 

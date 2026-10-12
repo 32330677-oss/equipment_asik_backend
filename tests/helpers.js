@@ -37,6 +37,9 @@ async function resetDatabase() {
   await conn.query(fs.readFileSync(path.join(ROOT, 'database/schema.sql'), 'utf8'));
   await conn.query(fs.readFileSync(path.join(ROOT, 'database/seed.sql'), 'utf8'));
   await require('../database/applyMigrations').applyMigrations(conn);
+  // The demo fleet has a monthly crane deployed from 1 Sep with only some days recorded: most suites generate it
+  // without accept_blockers. Days without rows block only in p28 (which switches this back on).
+  await conn.query("UPDATE settings SET setting_value = 'false' WHERE setting_key = 'eq_block_monthly_days_without_rows'");
   const hash = bcrypt.hashSync(PASSWORD, 4);
   await conn.query(
     `INSERT INTO users (user_id, username, full_name, password_hash, role, must_change_password) VALUES

@@ -1,5 +1,6 @@
 // P16 — rate card close / "change from a date" after billing (monthly = whole batch period), clear message for a
-// draft vs a finalized batch, and the information-only list of monthly days without any attendance row.
+// draft vs a finalized batch, and the list of monthly days without any attendance row (information only here: the
+// harness turns eq_block_monthly_days_without_rows off; p28 tests it blocking).
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const h = require('./helpers');

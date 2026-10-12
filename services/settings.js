@@ -22,12 +22,13 @@ const DEFINITIONS = {
   eq_shift_continuity_minutes: { type: 'int', min: 0, max: 180, description: 'Shifts of one machine closer than this (minutes) are continuous: overtime starts after threshold x shifts' },
   eq_paid_undo_hours: { type: 'int', min: 0, max: 720, description: 'Hours during which an Admin may undo Mark Paid (only without a payment reference, reason required; 0 = never)' },
   eq_finalize_undo_hours: { type: 'int', min: 0, max: 720, description: 'Hours after Finalize during which the batch can go back to a draft with the same invoice numbers (0 = never; afterwards: official Correction)' },
+  eq_block_monthly_days_without_rows: { type: 'bool', description: 'Monthly machines: a deployed working day with no attendance row blocks generating (it is deducted in full as an absence); the batch can still be generated with a reason' },
   eq_late_entry_days: { type: 'int', min: 1, max: 60, description: 'A row created more than this many days after its date is flagged as a late entry (warning only; a reason is asked)' },
 };
 
 /** Settings that change amounts or switch a control: changing them needs a reason. */
 const CONTROL_KEYS = new Set(['eq_payroll_requires_paper_match', 'eq_weekly_off_day', 'eq_fuel_diff_allow_negative', 'eq_shift_continuity_minutes',
-  'payroll_finalize_admin_only', 'eq_finalize_requires_scan', 'eq_paid_undo_hours', 'eq_finalize_undo_hours']);
+  'payroll_finalize_admin_only', 'eq_finalize_requires_scan', 'eq_paid_undo_hours', 'eq_finalize_undo_hours', 'eq_block_monthly_days_without_rows']);
 
 const DEFAULTS = {
   eq_payroll_requires_paper_match: 'false', eq_paper_tolerance_minutes: '10', eq_meter_tolerance_pct: '15',
@@ -36,6 +37,7 @@ const DEFAULTS = {
   company_name: 'ASIK ENGINEERING CONSTRUCTION', app_time_zone: 'Asia/Damascus', payroll_finalize_admin_only: 'true',
   eq_finalize_requires_scan: 'true', eq_fuel_diff_allow_negative: 'true', eq_weekly_off_day: '5',
   eq_shift_continuity_minutes: '30', eq_paid_undo_hours: '168', eq_late_entry_days: '3', eq_finalize_undo_hours: '72',
+  eq_block_monthly_days_without_rows: 'true',
 };
 
 let cache = null;

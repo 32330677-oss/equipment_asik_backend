@@ -335,9 +335,10 @@ async function monthlyMultiSite(conn, scope) {
 
 /**
  * Monthly machines: deployed WORKING days of the scope (weekly day off excluded, inside a Monthly rate card) that have
- * no attendance row at all (any site, any status except Cancelled). Such a day counts in the hours due with 0 hours
- * done, so it is deducted as missing hours: usually right (the machine did not work), but also what happens when the
- * supervisor forgot the row. Information only: shown before generating, never blocks.
+ * no attendance row at all (any site, any status except Cancelled). Such a day is deducted IN FULL as an absence
+ * (AbsenceDeduction = hours per day x hourly price; extra hours on other days never make up for it): right when the
+ * machine did not come, wrong when the supervisor forgot the row. Blocking when eq_block_monthly_days_without_rows is on
+ * (default, 12 Oct 2026): the batch is generated only with accept_blockers and a reason.
  */
 async function monthlyDaysWithoutRows(conn, scope) {
   const ds = scopeSql(scope, 'a');
@@ -435,7 +436,7 @@ async function blockers(conn, scope) {
       monthlyRows.filter((r) => !dps.some((d) => d.equipment_id === r.equipment_id && covers(d.assigned_date, d.unassigned_date, String(r.record_date).slice(0, 10))))
         .map(({ standby_credit_minutes: _x, standby_minutes: _y, ...r }) => r));
   }
-  add('MONTHLY_DAYS_WITHOUT_ROWS', 'Monthly machines deployed on working days that have no attendance row: the hours due of those days are deducted as missing hours.',
+  add('MONTHLY_DAYS_WITHOUT_ROWS', 'Monthly machines deployed on working days that have no attendance row: each of these days is deducted in full as an absence (hours per day x hourly price), and extra hours on other days do not make up for it. Record the day (Working, Standby, Breakdown, Absent or Holiday) or generate with a reason.',
     await monthlyDaysWithoutRows(conn, scope));
   const fs = scopeSql(scope, 'f');
   const [fuel] = await conn.query(
@@ -459,12 +460,17 @@ async function blockers(conn, scope) {
   // signed monthly sheets: needed to FINALIZE (not to generate) — shown early as information
   const [toPay] = await conn.query(`SELECT ea.eq_attendance_id ${base} AND ea.status = 'Approved' AND ${notInActive}`, [...params, ...exParams]);
   add('SCAN_MISSING', 'Signed monthly sheets not uploaded yet (needed before finalizing).', await sheetsMissingScan(conn, toPay.map((r) => r.eq_attendance_id)));
-  return out;
+  const codes = await blockingCodes();
+  return out.map((b) => ({ ...b, blocking: codes.includes(b.code) }));
 }
 
 const BLOCKING = ['NOT_APPROVED', 'OPEN_SESSION', 'UNACK_ANOMALY', 'PAPER_NOT_MATCHED', 'NO_RATE_CARD', 'STANDBY_HOURS_NOT_SET', 'FUEL_UNPRICED', 'FUEL_PRICE_MISSING', 'MONTHLY_MULTI_SITE', 'MONTHLY_ROW_NOT_DEPLOYED'];
-/** Shown with the blockers but never prevent generating. */
+/** Shown with the blockers but never prevent generating (MONTHLY_DAYS_WITHOUT_ROWS only when its setting is off). */
 const INFO_ONLY = ['IN_OTHER_BATCH', 'SCAN_MISSING', 'MONTHLY_DAYS_WITHOUT_ROWS'];
+/** Codes that block generating NOW: BLOCKING, plus MONTHLY_DAYS_WITHOUT_ROWS while eq_block_monthly_days_without_rows is on. */
+async function blockingCodes() {
+  return (await settings.getBool('eq_block_monthly_days_without_rows')) ? [...BLOCKING, 'MONTHLY_DAYS_WITHOUT_ROWS'] : BLOCKING;
+}
 
 /* include_submitted (provisional statements ONLY, never preview / generate): Submitted rows not approved yet are counted too. */
 /**
@@ -808,4 +814,4 @@ async function batchDrift(conn, batch) {
   return reasons;
 }
 
-module.exports = { scopeMachines, batchScope, monthTerms, monthsFromDays, deployedDays, monthlyContext, loadMonthlyTerms, ACTIVE_BATCH, calcDetail, applyShiftRules, allocateBySite, monthlyMultiSite, batchDrift, billingSettings, BILLING_SETTINGS, calculate, blockers, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };
+module.exports = { scopeMachines, batchScope, monthTerms, monthsFromDays, deployedDays, monthlyContext, loadMonthlyTerms, ACTIVE_BATCH, calcDetail, applyShiftRules, allocateBySite, monthlyMultiSite, batchDrift, billingSettings, BILLING_SETTINGS, calculate, blockers, blockingCodes, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };

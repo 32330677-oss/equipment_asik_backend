@@ -78,6 +78,7 @@ test('the queries return exactly what the report shows', async () => {
   assert.deepStrictEqual(ev, ['P-002:Breakdown:TillEnd:pump']);
   // month to date: machine-days worked and delivery trips since the 1st
   assert.ok(d.mtd.machineDays >= 2);
+  assert.ok(d.mtd.shifts >= d.mtd.machineDays, 'shifts worked are never fewer than machine-days');
   assert.strictEqual(d.mtd.trips, 2);
 
   // shift filter and site filter

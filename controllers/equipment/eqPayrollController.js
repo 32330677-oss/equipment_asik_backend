@@ -167,7 +167,7 @@ exports.coverage = async (req, res) => {
        GROUP BY x.eq_batch_id, b.is_finalized, b.version_number, b.status ORDER BY x.eq_batch_id`,
       [m.equipment_id, q.start_date, q.end_date, m.equipment_id, q.start_date, q.end_date]);
     const blockers = {};
-    for (const b of await P.blockers(pool, scope)) if (P.BLOCKING.includes(b.code)) blockers[b.code.toLowerCase()] = b.count;
+    for (const b of await P.blockers(pool, scope)) if (b.blocking) blockers[b.code.toLowerCase()] = b.count;
     if (calcError) blockers[calcError.code.toLowerCase()] = 1;
     const isReady = ready.rows + ready.monthly_days + ready.fuel + ready.adjustments + ready.dnr > 0;
     out.push({
@@ -308,7 +308,7 @@ async function generateInTx(conn, req, scope, extraIn = {}) {
   let moved = [];
   if (scope.take_from_drafts && !extra.supersedes_batch_id) moved = await takeFromDrafts(conn, req, scope);
   const blockers = await P.blockers(conn, { ...scope, exclude_batch_id: extra.supersedes_batch_id });
-  const blocking = blockers.filter((b) => P.BLOCKING.includes(b.code));
+  const blocking = blockers.filter((b) => b.blocking);
   const hard = blocking.find((b) => b.code === 'MONTHLY_MULTI_SITE'); // wrong hours due: never accepted
   if (hard) throw AppError.conflict('MONTHLY_MULTI_SITE', hard.message, { blockers: [hard] });
   if (blocking.length && !scope.accept_blockers) {
