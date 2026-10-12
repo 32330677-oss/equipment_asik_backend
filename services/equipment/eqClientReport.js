@@ -384,7 +384,8 @@ async function renderPdf(conn, data, opts, user) {
       const rows = ms.filter((m) => m.shift_type === sh).map((m, i) => ({
         n: String(i + 1), m: machineName(m, lang), model: modelText(m), plate: m.plate_number || '-', op: m.operator_name || '-',
         st: stateText(m), st_color: STATE_COLOR[stateKey(m)],
-        work: (m.state === 'Working' ? m.work_description : m.remarks) || '',
+        // the supervisor's remarks are internal: printed only when the office asks (include_remarks, 12 Oct 2026)
+        work: (m.state === 'Working' ? m.work_description : (opts.includeRemarks ? m.remarks : '')) || '',
       }));
       y = drawTable(doc, lay, w, y, [
         { key: 'n', label: '#', width: 22, align: 'center', headAlign: 'center' },
@@ -412,7 +413,8 @@ async function renderPdf(conn, data, opts, user) {
       { key: 'reason', label: t.reason, width: W - 326, wrap: true },
     ], data.events.map((e) => ({
       site: code[e.site_id], m: machineName(e, lang), plate: e.plate_number || '', ev: t.ev[e.kind], ev_color: e.kind === 'Standby' ? COLORS.amber : COLORS.red,
-      ext: t.ext[e.extent], ext_color: e.extent === 'Resumed' ? COLORS.green : COLORS.ink, reason: e.reason || '-',
+      // a stoppage keeps its own reason; a whole day's reason is the row's remarks: only when asked
+      ext: t.ext[e.extent], ext_color: e.extent === 'Resumed' ? COLORS.green : COLORS.ink, reason: (e.extent === 'FullDay' && !opts.includeRemarks ? '' : e.reason) || '-',
     })));
   }
 

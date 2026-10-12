@@ -48,6 +48,7 @@ async function batchScope(conn, batch) {
     start_date: String(batch.start_date).slice(0, 10), end_date: String(batch.end_date).slice(0, 10),
     vendor_id: batch.scope_vendor_id, equipment_id: m.length ? null : batch.scope_equipment_id,
     equipment_ids: m.length ? m.map((x) => x.equipment_id) : null, site_id: batch.scope_site_id,
+    offsets: normalizeOffsets(parseJson(batch.offset_months) || []),
   };
 }
 
@@ -77,23 +78,33 @@ function workingDaysOfMonth(month, offDay) {
 }
 
 /**
- * Terms of the month of each machine (11 Oct 2026): divisor D and hourly price. D = typed for the month
- * (eq_monthly_terms), else the card (fixed number of days, or the working days of the calendar month).
+ * Terms of the month of each machine (12 Oct 2026). By default a normal month: the monthly price of the card divided
+ * by the working days of the calendar month. An EXCEPTION typed for one machine and month (eq_monthly_terms) may
+ * change the amount of the month, the days it is divided by and / or the hourly price (deductions, offset, overtime).
+ * The card no longer has a fixed divisor ("Fixed 26" was replaced by the exception).
  * termsOf(month) -> eq_monthly_terms row or null.
  */
 function monthTerms(month, card, offDay, termsOf = null) {
   const wd = workingDaysOfMonth(month, offDay);
   const t = termsOf ? termsOf(month) : null;
   const typedD = t && t.working_days !== null && t.working_days !== undefined ? Number(t.working_days) : null;
-  const fixed = card && card.monthly_divisor === 'Fixed' && Number(card.monthly_working_days) > 0;
   const typedH = t && t.hourly_rate !== null && t.hourly_rate !== undefined && Number(t.hourly_rate) > 0 ? Number(t.hourly_rate) : null;
+  const typedA = t && t.monthly_amount !== null && t.monthly_amount !== undefined && Number(t.monthly_amount) > 0 ? Number(t.monthly_amount) : null;
   return {
     workingDays: wd,
-    divisor: typedD ?? (fixed ? Number(card.monthly_working_days) : wd),
-    divisorSource: typedD ? 'manual' : fixed ? 'card' : 'calendar',
+    divisor: typedD ?? wd,
+    divisorSource: typedD ? 'manual' : 'calendar',
+    amountCents: typedA === null ? null : Math.round(typedA * 100),
+    amountSource: typedA === null ? 'card' : 'manual',
     hourlyCents: typedH === null ? null : Math.round(typedH * 1000000) / 10000,
     hourlySource: typedH === null ? 'auto' : 'manual',
   };
+}
+
+/** Months where the Admin decided that extra hours cover missing hours: ["<equipment_id>|YYYY-MM", ...]. */
+function normalizeOffsets(v) {
+  const list = Array.isArray(v) ? v : typeof v === 'string' && v.trim() ? v.split(',') : [];
+  return [...new Set(list.map((x) => String(x).trim()).filter((x) => /^\d+\|\d{4}-(0[1-9]|1[0-2])$/.test(x)))].sort();
 }
 
 /** Months context of a set of days (Monthly billing): deployed days, deployed WORKING days, official holidays, terms. */
@@ -436,7 +447,7 @@ async function blockers(conn, scope) {
       monthlyRows.filter((r) => !dps.some((d) => d.equipment_id === r.equipment_id && covers(d.assigned_date, d.unassigned_date, String(r.record_date).slice(0, 10))))
         .map(({ standby_credit_minutes: _x, standby_minutes: _y, ...r }) => r));
   }
-  add('MONTHLY_DAYS_WITHOUT_ROWS', 'Monthly machines deployed on working days that have no attendance row: each of these days is deducted in full as an absence (hours per day x hourly price), and extra hours on other days do not make up for it. Record the day (Working, Standby, Breakdown, Absent or Holiday) or generate with a reason.',
+  add('MONTHLY_DAYS_WITHOUT_ROWS', 'Monthly machines deployed on working days that have no attendance row: each of these days is deducted in full as an absence (hours per day x hourly price); extra hours of other days cover it only if the Admin decides so. Record the day (Working, Standby, Breakdown, Absent or Holiday) or generate with a reason.',
     await monthlyDaysWithoutRows(conn, scope));
   const fs = scopeSql(scope, 'f');
   const [fuel] = await conn.query(
@@ -557,16 +568,21 @@ async function calculate(conn, scope) {
   const monthTo = `${monthOf(scope.end_date)}-${String(daysInMonth(monthOf(scope.end_date))).padStart(2, '0')}`;
   const termsOf = await loadMonthlyTerms(conn, monthlyIds, monthOf(scope.start_date), monthOf(scope.end_date));
   const [heldDays] = monthlyIds.length ? await conn.query(
-    `SELECT md.equipment_id, md.day, md.eq_batch_id, i.rate_card_id FROM eq_payroll_monthly_days md
+    `SELECT md.equipment_id, md.day, md.eq_batch_id, md.eq_item_id, i.rate_card_id FROM eq_payroll_monthly_days md
      JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id JOIN eq_payroll_items i ON i.eq_item_id = md.eq_item_id
      WHERE md.equipment_id IN (?) AND md.day BETWEEN ? AND ? AND ${ACTIVE_BATCH} AND b.eq_batch_id <> ?`,
     [monthlyIds, monthFrom, monthTo, scope.exclude_batch_id || 0]) : [[]];
   const [prevRowsAll] = monthlyIds.length ? await conn.query(
-    `SELECT ea.*, i.rate_card_id AS held_rate_card_id FROM eq_payroll_attendance_snapshot ps JOIN eq_payroll_batches b ON b.eq_batch_id = ps.eq_batch_id
+    `SELECT ea.*, i.rate_card_id AS held_rate_card_id, ps.eq_item_id AS held_item_id FROM eq_payroll_attendance_snapshot ps JOIN eq_payroll_batches b ON b.eq_batch_id = ps.eq_batch_id
      JOIN eq_payroll_items i ON i.eq_item_id = ps.eq_item_id JOIN eq_attendance ea ON ea.eq_attendance_id = ps.eq_attendance_id
      WHERE i.equipment_id IN (?) AND i.billing_mode = 'Monthly' AND ps.record_date BETWEEN ? AND ? AND ${ACTIVE_BATCH} AND b.eq_batch_id <> ?
        AND ea.status <> 'Cancelled'`,
     [monthlyIds, monthFrom, monthTo, scope.exclude_batch_id || 0]) : [[]];
+  // what earlier invoices of the month already did with the extra hours (offset / overtime): from their snapshots
+  const prevItemIds = [...new Set([...heldDays.map((x) => x.eq_item_id), ...prevRowsAll.map((x) => x.held_item_id)].filter(Boolean))];
+  const [prevItems] = prevItemIds.length ? await conn.query('SELECT eq_item_id, rate_snapshot FROM eq_payroll_items WHERE eq_item_id IN (?)', [prevItemIds]) : [[]];
+  const prevCalc = new Map(prevItems.map((x) => [x.eq_item_id, (parseJson(x.rate_snapshot) || {}).monthly_calc || []]));
+  const offsets = new Set(normalizeOffsets(scope.offsets));
   const groups = new Map();
   // A MONTHLY card is one contract per machine: one group whatever the site (hours due settled once per month);
   // it is billed on the site where the machine spent most deployed days, with the cost split by site.
@@ -654,8 +670,8 @@ async function calculate(conn, scope) {
     let ctx = {};
     let monthly = null;
     if (rate.billing_mode === 'Monthly') {
-      monthly = monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf: (m) => termsOf(g.equipment_id, m), ownerSite });
-      ctx = monthly.ctx;
+      monthly = monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf: (m) => termsOf(g.equipment_id, m), ownerSite, prevCalc });
+      ctx = { ...monthly.ctx, offset: (monthly.ctx.months || []).filter((m) => offsets.has(`${g.equipment_id}|${m.month}`)).map((m) => m.month) };
     }
     if (rate.billing_mode !== 'Monthly' && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;
     if (rate.billing_mode === 'Monthly' && !ctx.months.length && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;
@@ -691,8 +707,10 @@ async function calculate(conn, scope) {
       lines: res.lines, per_row: perRow, months: ctx.months || null, site_allocation: siteAllocation,
       // monthly: the days this item bills (held once), the part already billed by other batches, the terms used
       monthly_days: monthly ? monthly.days : null,
-      monthly_prev: monthly && ctx.prev ? { months: ctx.prev.months, row_ids: monthly.prevRowIds } : null,
+      monthly_prev: monthly && ctx.prev ? { months: ctx.prev.months, row_ids: monthly.prevRowIds, used: ctx.prev.used || null } : null,
+      monthly_offset: monthly ? ctx.offset : null,
       monthly_terms: monthly ? (ctx.months || []).map((m) => ({ month: m.month, divisor: m.divisor, divisor_source: m.divisorSource,
+        amount: m.amountCents === null || m.amountCents === undefined ? null : m.amountCents / 100, amount_source: m.amountSource || 'card',
         hourly: m.hourlyCents === null || m.hourlyCents === undefined ? null : m.hourlyCents / 100, hourly_source: m.hourlySource })) : null,
     });
   }
@@ -705,7 +723,7 @@ async function calculate(conn, scope) {
  * F(days and rows of all parts) - F(days and rows already billed): the parts always add up to the whole month.
  * Returns { ctx, days: [{ day, site_id }], prevRowIds }.
  */
-function monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf, ownerSite }) {
+function monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf, ownerSite, prevCalc = new Map() }) {
   const ranges = g.deployRanges || [];
   const cardId = g.card.rate_card_id;
   const held = heldDays.filter((h) => h.equipment_id === g.equipment_id && h.rate_card_id === cardId).map((h) => String(h.day).slice(0, 10));
@@ -723,8 +741,21 @@ function monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf, owne
   if (!heldIn.length && !prevRows.length) return { ctx: { months }, days, prevRowIds: [] };
   const prevMonthsList = [...new Set(prevRows.map((r) => monthOf(String(r.record_date).slice(0, 10))))].filter((m) => withDays.has(m));
   const prevMonths = monthsFromDays(heldIn, g.card, offDay, holidayOf(prevRows), termsOf, prevMonthsList);
+  // ledger of the extra hours: what the earlier invoices of each month gave as offset / overtime (their snapshots)
+  const itemIds = new Set([...heldDays.filter((h) => h.equipment_id === g.equipment_id && h.rate_card_id === cardId && touched.has(monthOf(String(h.day).slice(0, 10)))).map((h) => h.eq_item_id),
+    ...prevRows.map((r) => r.held_item_id)].filter(Boolean));
+  const used = {};
+  let ledger = true;
+  for (const id of itemIds) {
+    for (const x of prevCalc.get(id) || []) {
+      if (!touched.has(x.month)) continue;
+      if (x.offset_minutes === undefined && x.overtime_minutes === undefined) { ledger = false; continue; } // snapshot older than 12 Oct
+      const u = (used[x.month] = used[x.month] || { offset_minutes: 0, overtime_minutes: 0 });
+      u.offset_minutes += Number(x.offset_minutes || 0); u.overtime_minutes += Number(x.overtime_minutes || 0);
+    }
+  }
   return {
-    ctx: { months, prev: { rows: prevRows.filter((r) => withDays.has(monthOf(String(r.record_date).slice(0, 10)))).map(engineRow), months: prevMonths } },
+    ctx: { months, prev: { rows: prevRows.filter((r) => withDays.has(monthOf(String(r.record_date).slice(0, 10)))).map(engineRow), months: prevMonths, ...(ledger ? { used } : {}) } },
     days,
     prevRowIds: prevRows.map((r) => r.eq_attendance_id),
   };
@@ -743,7 +774,7 @@ function allocateBySite(perRow, lines, rate) {
     hours.set(sid, (hours.get(sid) || 0) + min);
   }
   if (hours.size < 2) return null;
-  const cost = lines.filter((l) => ['MonthlyBase', 'BreakdownDeduction', 'AbsenceDeduction', 'Overtime', 'HoursShortfall', 'Operator'].includes(l.line_type)).reduce((a, l) => a + l.amount_cents, 0);
+  const cost = lines.filter((l) => ['MonthlyBase', 'BreakdownDeduction', 'AbsenceDeduction', 'ExtraHoursOffset', 'Overtime', 'HoursShortfall', 'Operator'].includes(l.line_type)).reduce((a, l) => a + l.amount_cents, 0);
   const total = [...hours.values()].reduce((a, x) => a + x, 0);
   const entries = [...hours.entries()].sort((a, b) => a[0] - b[0]);
   let left = cost;
@@ -789,7 +820,7 @@ async function batchDrift(conn, batch) {
   const key = (x) => `${x.equipment_id}|${x.site_id}|${x.rate_card_id || 'none'}|${x.billing_mode === 'DNR' ? 'DNR' : ''}`;
   const was = new Map(stored.map((x) => [key(x), Math.round(Number(x.net_amount) * 100)]));
   // the terms of a month (divisor / hourly price) changed since the batch was made: said on its own line
-  const termsText = (months) => (months || []).map((m) => `${m.month}: /${m.divisor ?? m.workingDays}${m.hourlyCents ? ` @${(m.hourlyCents / 100).toFixed(2)}` : ''}`).join(', ');
+  const termsText = (months) => (months || []).map((m) => `${m.month}: ${m.amountCents ? `${(m.amountCents / 100).toFixed(2)}` : ''}/${m.divisor ?? m.workingDays}${m.hourlyCents ? ` @${(m.hourlyCents / 100).toFixed(2)}` : ''}`).join(', ');
   for (const st of stored.filter((x) => x.billing_mode === 'Monthly')) {
     const now = items.find((i) => key(i) === key(st));
     if (!now) continue;
@@ -814,4 +845,4 @@ async function batchDrift(conn, batch) {
   return reasons;
 }
 
-module.exports = { scopeMachines, batchScope, monthTerms, monthsFromDays, deployedDays, monthlyContext, loadMonthlyTerms, ACTIVE_BATCH, calcDetail, applyShiftRules, allocateBySite, monthlyMultiSite, batchDrift, billingSettings, BILLING_SETTINGS, calculate, blockers, blockingCodes, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };
+module.exports = { scopeMachines, batchScope, monthTerms, normalizeOffsets, monthsFromDays, deployedDays, monthlyContext, loadMonthlyTerms, ACTIVE_BATCH, calcDetail, applyShiftRules, allocateBySite, monthlyMultiSite, batchDrift, billingSettings, BILLING_SETTINGS, calculate, blockers, blockingCodes, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };

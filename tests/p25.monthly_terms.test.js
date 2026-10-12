@@ -1,5 +1,6 @@
-// P25 — terms of the month of monthly machines (11 Oct 2026): divisor D (calendar, fixed on the card, or typed per
-// machine and month), hourly price typed per month, and overtime only when the card pays it.
+// P25 — terms of the month of monthly machines: a normal month by default (price / working days of the calendar month);
+// an EXCEPTION per machine and month (12 Oct 2026: amount, days, hourly price), locked while any batch bills the month;
+// overtime only when the card pays it. The card no longer has a "Fixed" divisor.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const QRCode = require('qrcode');
@@ -35,7 +36,7 @@ before(async () => {
   F = await standardFleet();
   M2 = await monthlyMachine('M-002', { overtime_enabled: true });
   M3 = await monthlyMachine('M-003', {});
-  M4 = await monthlyMachine('M-004', { monthly_divisor: 'Fixed', monthly_working_days: 26 });
+  M4 = await monthlyMachine('M-004', {});
   // October 2026: 26 working days (5 Fridays off); 10 h every working day = 260 h
   for (let i = 1; i <= 31; i += 1) {
     const d = `2026-10-${String(i).padStart(2, '0')}`;
@@ -58,7 +59,10 @@ test('the examples of the plan (2000 per month, 10 h per day)', () => {
   assert.strictEqual(net(days(24, 10, '2026-02'), card, feb({})), 2000.00);
   assert.strictEqual(net(days(24, 10, '2026-02'), card, feb({ divisor: 26 })), 1846.15);
   assert.strictEqual(net(days(13, 10), card, mo({ divisor: 26, assignedWorkingDays: 13 })), 1000.00);
-  assert.strictEqual(net(days(27, 10), card, mo({ divisor: 26, hourlyCents: 800, hourlySource: 'manual' })), 2160.00);
+  // 12 Oct 2026: a typed hourly price prices the deductions / offset / overtime, never the base: 2000 + 10 h x 8
+  assert.strictEqual(net(days(27, 10), card, mo({ divisor: 26, hourlyCents: 800, hourlySource: 'manual' })), 2080.00);
+  // the vendor who is paid the 27th day: amount of the month typed (2000 x 27 / 26), divided by the 27 days
+  assert.strictEqual(net(days(27, 10), card, mo({ amountCents: 207692, amountSource: 'manual' })), 2076.92);
   const off = engine.billItem(days(27, 10), { ...card, overtime_enabled: false }, mo({ divisor: 26 }));
   assert.strictEqual(off.monthly_details[0].overtime_paid, false);
   assert.strictEqual(off.monthly_details[0].unpaid_extra_hours, 10);
@@ -74,24 +78,31 @@ test('a card without terms gives exactly the old amount; a new monthly card pays
   const mc = draft.items[0].rate_snapshot.monthly_calc[0];
   assert.strictEqual(mc.divisor, 26);
   assert.strictEqual(mc.divisor_source, 'calendar');
-  assert.deepStrictEqual(draft.items[0].rate_snapshot.monthly_terms, [{ month: '2026-10', divisor: 26, divisor_source: 'calendar', hourly: null, hourly_source: 'auto' }]);
+  assert.deepStrictEqual(draft.items[0].rate_snapshot.monthly_terms, [{ month: '2026-10', divisor: 26, divisor_source: 'calendar', amount: null, amount_source: 'card', hourly: null, hourly_source: 'auto' }]);
 });
 
-test('typed terms make the draft stale; Recalculate gives the new amount', async () => {
+test('an exception cannot change under a draft: void the draft, type it, generate again', async () => {
+  const locked = await terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 25, hourly_rate: null });
+  assert.strictEqual(locked.status, 409);
+  assert.strictEqual(locked.body.code, 'MONTHLY_TERMS_LOCKED');
+  assert.strictEqual(locked.body.details.finalized, false);
+  assert.match(locked.body.message, /Void that draft first/);
+  const list = await ok(h.api().get(`/api/equipment/payroll/monthly-terms?start_date=2026-10-01&end_date=2026-10-31&equipment_ids=${M2.equipment_id}`).set(ACC()));
+  assert.strictEqual(list[0].locked, true);
+  assert.strictEqual(list[0].locked_by_finalized, false);
+  await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/void`).set(ACC()).send({}));
   const t = await ok(terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 25, hourly_rate: null }));
   assert.strictEqual(t.divisor, 25);
   assert.strictEqual(t.divisor_source, 'manual');
+  assert.strictEqual(t.is_exception, true);
   assert.strictEqual(t.hourly, 8); // 2000 / 25 / 10
-  const d = await ok(h.api().get(`/api/equipment/payroll/batches/${draft.eq_batch_id}`).set(ACC()));
-  assert.strictEqual(d.stale, true);
-  assert.ok(d.stale_reasons.find((r) => r.code === 'MONTHLY_TERMS_CHANGED'));
-  const v2 = await ok(h.api().post(`/api/equipment/payroll/batches/${draft.eq_batch_id}/supersede`).set(ACC()).send({}));
-  // D = 25: base = full month (26 deployed days, 25 paid as base), 250 h due, 260 h done -> 10 h x 8 overtime
+  const v2 = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send(OCT()));
+  // D = 25: base = full month (26 deployed days, 25 paid as base); the 26th day's 10 h are extra hours -> overtime x 8
   assert.strictEqual(v2.total_net, '2080.00');
   draft = v2;
 });
 
-test('after the Finalize the terms are locked (409); after the undo they can change again', async () => {
+test('after the Finalize the exception is locked (409); after the undo the batch is a draft: still locked until voided', async () => {
   const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-10&equipment_id=${M2.equipment_id}`).set(ACC()));
   await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
   await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
@@ -101,8 +112,15 @@ test('after the Finalize the terms are locked (409); after the undo they can cha
   const list = await ok(h.api().get(`/api/equipment/payroll/monthly-terms?start_date=2026-10-01&end_date=2026-10-31&equipment_ids=${M2.equipment_id}`).set(ACC()));
   assert.strictEqual(list[0].locked, true);
   assert.strictEqual(list[0].locked_by_batch_id, draft.eq_batch_id);
+  assert.strictEqual(list[0].locked_by_finalized, true);
+  assert.match(r.body.message, /Undo its Finalize/);
   await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/unfinalize`).set(A()).send({ reason: 'check the terms' }));
-  await ok(terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 25, note: 'agreed 25 days' }));
+  const still = await terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 25, note: 'agreed 25 days' });
+  assert.strictEqual(still.body.code, 'MONTHLY_TERMS_LOCKED');
+  assert.strictEqual(still.body.details.finalized, false);
+  // the Finalize review lists the exception of the month
+  const review = await ok(h.api().get(`/api/equipment/payroll/batches/${draft.eq_batch_id}/review-summary`).set(A()));
+  assert.ok(review.items.find((i) => i.kind === 'monthly_exception' && /divided by 25 days/.test(i.ref)));
   await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
 });
 
@@ -131,15 +149,27 @@ test('a batch over two months: one line per month, each with its own terms', asy
   assert.strictEqual(Number(left.n), 0);
 });
 
-test('a card "Fixed 26" without typed terms divides by 26 (December has 27 working days)', async () => {
-  const list = await ok(h.api().get(`/api/equipment/payroll/monthly-terms?start_date=2026-12-01&end_date=2026-12-31&equipment_ids=${M4.equipment_id}`).set(ACC()));
+test('no "Fixed" divisor on the card any more: December is a normal month of 27 days; an exception pays the 27th day', async () => {
+  const dec = `/api/equipment/payroll/monthly-terms?start_date=2026-12-01&end_date=2026-12-31&equipment_ids=${M4.equipment_id}`;
+  let list = await ok(h.api().get(dec).set(ACC()));
   assert.strictEqual(list[0].calendar_days, 27);
-  assert.strictEqual(list[0].divisor, 26);
-  assert.strictEqual(list[0].divisor_source, 'card');
-  assert.strictEqual(list[0].card_divisor_mode, 'Fixed');
-  // a fixed divisor needs its number of days
+  assert.strictEqual(list[0].divisor, 27);
+  assert.strictEqual(list[0].divisor_source, 'calendar');
+  assert.strictEqual(list[0].amount, 2000);
+  assert.strictEqual(list[0].is_exception, false);
   const bad = await h.api().post(`/api/equipment/machines/${M4.equipment_id}/rate-cards`).set(A())
-    .send({ vendor_contract_id: F.contract.vendor_contract_id, effective_from: '2027-01-01', billing_mode: 'Monthly', monthly_rate: 2000, monthly_divisor: 'Fixed', monthly_working_days: 0 });
+    .send({ vendor_contract_id: F.contract.vendor_contract_id, effective_from: '2027-01-01', billing_mode: 'Monthly', monthly_rate: 2000, monthly_divisor: 'Fixed', monthly_working_days: 26 });
   assert.strictEqual(bad.body.code, 'VALIDATION_ERROR');
+  // the vendor who is paid per working day (2000 / 26): December = 27 x 76.92 = 2076.92
+  await ok(terms({ equipment_id: M4.equipment_id, month: '2026-12', monthly_amount: 2076.92, working_days: 27, note: 'paid per working day' }));
+  list = await ok(h.api().get(dec).set(ACC()));
+  assert.strictEqual(list[0].amount, 2076.92);
+  assert.strictEqual(list[0].amount_source, 'manual');
+  assert.strictEqual(list[0].typed_amount, 2076.92);
+  assert.strictEqual(list[0].hourly, 7.6923); // 2076.92 / 27 / 10
+  assert.strictEqual(list[0].is_exception, true);
+  // all empty = a normal month again
+  await ok(terms({ equipment_id: M4.equipment_id, month: '2026-12', monthly_amount: null, working_days: null, hourly_rate: null }));
+  assert.strictEqual((await ok(h.api().get(dec).set(ACC())))[0].is_exception, false);
   assert.strictEqual(await code(terms({ equipment_id: F.exc.equipment_id, month: '2026-10', working_days: 25 })), 'NOT_MONTHLY');
 });

@@ -32,8 +32,9 @@ const FIELDS = {
   daily_partial_rule: v.enumOf(['ProRata', 'FullDayIfWorked', 'HalfDayThreshold']),
   half_day_threshold_hours: HOURS(),
   monthly_working_days: v.int({ min: 1, max: 31 }),
-  // Monthly: divide the price by the working days of the calendar month, or by a fixed number (monthly_working_days)
-  monthly_divisor: v.enumOf(['MonthDays', 'Fixed']),
+  // Monthly: always a normal month (price / working days of the calendar month). 12 Oct 2026: "Fixed" is gone; a month
+  // that is billed differently gets an exception for that machine and month (amount, days, hourly price).
+  monthly_divisor: v.enumOf(['MonthDays']),
   operator_included: v.bool(),
   operator_daily_rate: MONEY(),
   fuel_policy: v.enumOf(['VendorSupplies', 'CompanySuppliesDeducted', 'CompanySuppliesFree']),
@@ -64,10 +65,7 @@ function checkCard(card) {
     f.half_day_threshold_hours = 'is required with HalfDayThreshold';
   }
   if (mode !== 'Daily' && Number(card.second_shift_pct || 0) > 0) f.second_shift_pct = 'only for Daily billing';
-  if (mode === 'Monthly' && card.monthly_divisor === 'Fixed') {
-    const n = Number(card.monthly_working_days);
-    if (!Number.isInteger(n) || n < 1 || n > 31) f.monthly_working_days = 'give the fixed number of days (1 to 31) the monthly price is divided by';
-  }
+  if (mode === 'Monthly') card.monthly_divisor = 'MonthDays';
   if (card.second_shift_pct === null || card.second_shift_pct === undefined) card.second_shift_pct = 0;
   if (card.operator_included && card.operator_daily_rate != null) f.operator_daily_rate = 'only allowed when operator_included is false';
   if (card.effective_to && card.effective_from && card.effective_to < card.effective_from) f.effective_to = 'must be on or after effective_from';
@@ -155,8 +153,9 @@ exports.update = async (req, res) => {
     const lockedBy = await C.rateCardLocked(conn, id);
     if (lockedBy) throw AppError.conflict('RATE_CARD_LOCKED', `This rate card is used by finalized payroll batch #${lockedBy}. Use "Change from a date" for the future; a wrong price already paid is fixed by an official Correction.`, { eq_batch_id: lockedBy });
     const generated = await rateCardInGeneratedBatch(conn, id);
-    if (generated && reason.length < 5) {
-      throw AppError.validation({ reason: `draft payroll batch #${generated} uses this card: say why it changes (at least 5 characters); that batch will need to be regenerated` });
+    if (generated) {
+      // 12 Oct 2026: a price is never changed under a draft — the draft is voided first, then generated again
+      throw AppError.conflict('RATE_CARD_IN_DRAFT', `Draft payroll batch #${generated} uses this card. Void that draft first, change the card, then generate again.`, { eq_batch_id: generated });
     }
     const card = checkCard({ ...before, overtime_enabled: Boolean(before.overtime_enabled), operator_included: Boolean(before.operator_included), ...d });
     const machine = await C.loadMachine(conn, before.equipment_id, true);
@@ -210,12 +209,13 @@ exports.preview = async (req, res) => {
   const month = /^\d{4}-\d{2}$/.test(String(body.month || '')) ? String(body.month) : businessToday().slice(0, 7);
   const wd = P.workingDaysOfMonth(month, await settings.getInt('eq_weekly_off_day'));
   const assigned = Math.min(wd, Number(body.assigned_working_days) || wd);
-  // divisor D and hourly price of the test month: typed in the test, else the card (fixed days or calendar)
+  // exception of the test month (amount, days, hourly price): typed in the test, else a normal month
   const typedD = Number.isInteger(Number(body.divisor)) && Number(body.divisor) >= 1 && Number(body.divisor) <= 31 ? Number(body.divisor) : null;
   const typedH = Number(body.hourly_rate) > 0 ? Math.round(Number(body.hourly_rate) * 10000) / 100 : null;
-  const divisor = typedD ?? (card.monthly_divisor === 'Fixed' ? Number(card.monthly_working_days) : wd);
+  const typedA = Number(body.monthly_amount) > 0 ? Math.round(Number(body.monthly_amount) * 100) : null;
   const ctx = { months: [{ month, daysInMonth: daysInMonth(month), assignedDays: assigned, workingDays: wd, assignedWorkingDays: assigned, holidayDays: Math.min(assigned, Number(body.holiday_days) || 0),
-    divisor, divisorSource: typedD ? 'manual' : card.monthly_divisor === 'Fixed' ? 'card' : 'calendar', hourlyCents: typedH, hourlySource: typedH ? 'manual' : 'auto' }] };
+    divisor: typedD ?? wd, divisorSource: typedD ? 'manual' : 'calendar', amountCents: typedA, amountSource: typedA ? 'manual' : 'card', hourlyCents: typedH, hourlySource: typedH ? 'manual' : 'auto' }],
+    offset: body.offset === true };
   const result = engine.billItem(engineRows, card, ctx, { fuel: body.fuel || [], adjustments: body.adjustments || [] });
   res.json({
     status: 'success',

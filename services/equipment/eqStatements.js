@@ -10,8 +10,22 @@ const LINE_LABEL = {
   MinimumTopUp: 'Minimum guarantee top-up', MonthlyBase: 'Monthly base', AbsenceDeduction: 'Absence deduction',
   BreakdownDeduction: 'Breakdown deduction', Operator: 'Operator (not included in rate)', Fuel: 'Fuel issued by us', Adjustment: 'Adjustment',
   FuelPriceDifference: 'Fuel price difference (compensation)', HoursShortfall: 'Hours below the monthly hours due', SecondShift: 'Second shift the same day',
-  DeliveryNote: 'Delivery note (DNR)',
+  DeliveryNote: 'Delivery note (DNR)', ExtraHoursOffset: 'Extra hours covering missing hours',
 };
+
+/**
+ * What the office leaves out of a statement / invoice PDF for the vendor (12 Oct 2026). The money lines and the totals
+ * always stay (they must add up); only explanations and internal details can be hidden.
+ *   days      daily attendance table          monthly   monthly hours calculation (with the day-by-day list)
+ *   notes     notes under each money line     reasons   reasons of additions / deductions (the type stays)
+ *   sites     cost split by site              terms     pricing terms line
+ *   operator  operator column                 paper     sheet row and paper columns
+ */
+const HIDE_KEYS = ['days', 'monthly', 'notes', 'reasons', 'sites', 'terms', 'operator', 'paper'];
+function hideOptions(v) {
+  const list = Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : [];
+  return new Set(list.map((x) => String(x).trim()).filter((x) => HIDE_KEYS.includes(x)));
+}
 const UNIT_TEXT = { trip: 'trip', t: 'ton', m3: 'm3', km: 'km', pc: 'piece', load: 'load' };
 const METHOD_TEXT = { BankTransfer: 'Bank transfer', Cheque: 'Cheque', Cash: 'Cash', Other: 'Other' };
 
@@ -134,14 +148,14 @@ function totalsBox(doc, y, { gross, deductions, net, currency }) {
   return y + 72;
 }
 
-function lineDesc(l, rate) {
+function lineDesc(l, rate, hide = new Set()) {
   let s = LINE_LABEL[l.line_type] || l.line_type;
   if (l.line_type === 'Standby' && rate) s += ` @ ${n(rate.standby_billable_pct)}%`;
   if (l.line_type === 'Breakdown' && rate) s += ` @ ${n(rate.breakdown_billable_pct)}%`;
   if (l.line_type === 'Overtime' && rate && rate.billing_mode !== 'Monthly') s += ` (> ${n(rate.overtime_threshold_hours ?? rate.standard_hours_per_day)} h/shift)`;
   if (l.line_type === 'Overtime' && rate && rate.billing_mode === 'Monthly') s += ' (hours above the monthly hours due)';
   if (l.line_type === 'MinimumTopUp' && rate) s += ` (${n(rate.min_billable_hours_per_day)} h/day)`;
-  if (l.note) s += ` - ${l.note}`;
+  if (l.note && !hide.has('notes')) s += ` - ${l.note}`;
   return s;
 }
 
@@ -153,7 +167,8 @@ function rateSummary(r) {
   }
   if (r.billing_mode === 'Monthly') {
     const parts = [`Monthly ${fmt.num(r.monthly_rate)}`, `${n(r.standard_hours_per_day)} h per working day`,
-      `hourly price = monthly / ${r.monthly_divisor === 'Fixed' ? `${n(r.monthly_working_days)} days` : 'working days of the month'} / hours per day (unless typed for the month)`,
+      'hourly price = monthly / working days of the month / hours per day (unless an exception is typed for the month)',
+      'each working day is due its hours: missing hours deducted, extra hours paid as overtime or used to cover missing hours',
       n(r.overtime_enabled) === 0 && r.overtime_enabled !== undefined && r.overtime_enabled !== null ? 'overtime not paid'
         : `overtime ${r.overtime_rate !== null && r.overtime_rate !== undefined ? `at ${fmt.num(r.overtime_rate)}/h` : 'at the hourly price'}`,
       'standby: hours given per day by the accountant', `breakdown ${n(r.breakdown_billable_pct)}%`, `breaks ${r.break_policy === 'Paid' ? 'paid' : 'deducted'}`];
@@ -174,7 +189,7 @@ function drawMonthlyCalc(doc, y, it, cur) {
   const mc = (it.rate && it.rate.monthly_calc) || it.monthly_calc;
   if (!mc || !mc.length) return y;
   y = sectionTitle(doc, y, 'Monthly hours', 'احتساب الساعات الشهرية');
-  return P.table(doc, {
+  y = P.table(doc, {
     y, rowHeight: 15, headHeight: 26, fontSize: 7, onNewPage: () => doc.page.margins.top + 4,
     columns: [
       { key: 'm', en: 'Month', ar: 'الشهر', width: 50 }, { key: 'wd', en: 'Divided by', ar: 'القسمة على', width: 52 },
@@ -185,33 +200,50 @@ function drawMonthlyCalc(doc, y, it, cur) {
     ],
     rows: mc.map((x) => ({
       // D: typed for the month (manual), fixed on the card, or the calendar working days (terms of 11 Oct 2026)
-      m: x.month, wd: `${x.divisor ?? x.working_days}${x.divisor_source && x.divisor_source !== 'calendar' ? ` (${x.divisor_source})` : ''}`,
+      m: x.month, wd: `${x.divisor ?? x.working_days}${x.divisor_source && x.divisor_source !== 'calendar' ? ' (typed)' : ''}`,
       dep: x.deployed_working_days, hol: x.holiday_days || '', hpd: fmt.num(x.hours_per_day), req: fmt.num(x.required_hours),
       done: fmt.num(x.billable_hours), hp: `${fmt.num(x.hourly_price, 3)}${x.hourly_source === 'manual' ? ' (manual)' : ''}`,
       res: monthlyResult(x),
-      _color: x.missing_hours > 0 ? COLORS.red : undefined,
+      _color: x.missing_hours > 0 || x.absence_deducted_hours > 0 ? COLORS.red : undefined,
     })),
   }) + 6;
-}
-
-/** Result column of a month: overtime paid (hours x price), extra hours not paid (overtime off), missing hours. */
-function monthlyResult(x) {
-  const part = x.part ? ' (month settlement)' : '';
-  const bd = x.breakdown_deducted_hours > 0 ? `breakdown -${fmt.num(x.breakdown_deducted_hours)} h; ` : '';
-  const ab = x.absence_deducted_hours > 0 ? `absent ${fmt.num(x.absent_days)} day(s) -${fmt.num(x.absence_deducted_hours)} h; ` : '';
-  return bd + ab + monthlyHours(x, part);
-}
-
-function monthlyHours(x, part) {
-  if (x.overtime_hours > 0) {
-    const price = x.overtime_price ?? x.hourly_price;
-    return `+${fmt.num(x.overtime_hours)} h x ${fmt.num(price, 2)} = ${fmt.num(Math.round(x.overtime_hours * price * 100) / 100)}${part}`;
+  // the days behind the result, so the vendor can check them against the signed sheet
+  for (const x of mc) {
+    const text = monthlyDaysText(x);
+    if (!text) continue;
+    P.text(doc, `${x.month} day by day (${fmt.num(x.hours_per_day)} h due per working day): ${text}`, doc.page.margins.left, y, { size: 6.8, color: COLORS.muted, width: doc.page.width - 48 });
+    y = doc.y + 4;
   }
-  if (x.overtime_hours < 0) return `${fmt.num(x.overtime_hours)} h overtime${part}`;
-  if (x.unpaid_extra_hours > 0) return `+${fmt.num(x.unpaid_extra_hours)} h not paid (overtime off)${part}`;
-  if (x.missing_hours > 0) return `-${fmt.num(x.missing_hours)} h missing${part}`;
-  if (x.missing_hours < 0) return `${fmt.num(-x.missing_hours)} h missing given back${part}`;
-  return `hours complete${part}`;
+  return y;
+}
+
+/**
+ * Result column of a month (rules of 12 Oct 2026): what is deducted (breakdown, absent days, days below the hours due)
+ * and what the extra hours did (covered missing hours, overtime, or kept unpaid).
+ */
+function monthlyResult(x) {
+  const part = x.part ? ' (this part of the month)' : '';
+  const out = [];
+  if (x.breakdown_deducted_hours) out.push(`breakdown -${fmt.num(x.breakdown_deducted_hours)} h`);
+  if (x.absence_deducted_hours) out.push(`absent ${x.absent_days} day(s) -${fmt.num(x.absence_deducted_hours)} h`);
+  if (x.missing_hours) out.push(`days below the hours due -${fmt.num(x.missing_hours)} h`);
+  if (x.offset_hours) out.push(`extra hours covering missing hours +${fmt.num(x.offset_hours)} h`);
+  if (x.overtime_hours) {
+    const price = x.overtime_price ?? x.hourly_price;
+    out.push(`overtime ${fmt.num(x.overtime_hours)} h x ${fmt.num(price, 2)}`);
+  }
+  if (x.unpaid_extra_hours > 0) out.push(`${fmt.num(x.unpaid_extra_hours)} extra h not paid (overtime off)`);
+  return `${out.length ? out.join('; ') : 'hours complete'}${part}`;
+}
+
+/** Days of the month that are not a plain full day (missing, extra, breakdown, absent, worked on a day off). */
+function monthlyDaysText(x) {
+  const KIND = { absent: 'absent', short: 'below', extra: 'extra', off: 'day off worked', breakdown: 'breakdown' };
+  return (x.days || []).filter((d) => d.date).map((d) => {
+    const v = d.kind === 'absent' ? `-${fmt.num(d.missing)} h` : d.kind === 'off' || d.kind === 'extra' ? `+${fmt.num(d.extra)} h`
+      : d.kind === 'breakdown' ? `-${fmt.num(d.breakdown_deducted)} h${d.missing ? `, -${fmt.num(d.missing)} h` : ''}${d.extra ? `, +${fmt.num(d.extra)} h` : ''}` : `-${fmt.num(d.missing)} h`;
+    return `${fmt.date(d.date).slice(0, 5)} ${KIND[d.kind] || d.kind} ${v}`;
+  }).join('  |  ');
 }
 
 /** Monthly machine at several sites: its cost split between the sites by the hours each got. */
@@ -297,6 +329,7 @@ const mshort = (it) => { const k = /#\d+$/.exec(it.machine_label || ''); return 
 const fuelDiffOf = (it) => it.lines.filter((l) => l.line_type === 'FuelPriceDifference').reduce((a, l) => a + n(l.amount), 0);
 
 function drawMachine(doc, ctx, b, items) {
+  const hide = ctx.hide || new Set();
   const first = items[0];
   const cur = b.currency;
   const final = isFinal(b);
@@ -315,13 +348,15 @@ function drawMachine(doc, ctx, b, items) {
   ], y, 2);
   for (const it of items) {
     y = sectionTitle(doc, y, `${it.site_code} - ${it.site_name || ''} | ${it.billing_mode} billing`, 'شروط التسعير');
-    P.text(doc, rateSummary(it.rate), doc.page.margins.left, y, { size: 7.2, color: COLORS.muted, width: doc.page.width - 48 });
-    y = doc.y + 4;
-    y = drawMonthlyCalc(doc, y, it, cur);
-    y = drawSiteAllocation(doc, y, it, cur);
+    if (!hide.has('terms')) {
+      P.text(doc, rateSummary(it.rate), doc.page.margins.left, y, { size: 7.2, color: COLORS.muted, width: doc.page.width - 48 });
+      y = doc.y + 4;
+    }
+    if (!hide.has('monthly')) y = drawMonthlyCalc(doc, y, it, cur);
+    if (!hide.has('sites')) y = drawSiteAllocation(doc, y, it, cur);
     if (it.billing_mode === 'DNR') {
       y = drawDeliveryNotes(doc, y, it, cur);
-      y = drawLines(doc, y + 2, [{ ...it, lines: it.lines.filter((l) => l.line_type !== 'DeliveryNote') }], cur, false);
+      y = drawLines(doc, y + 2, [{ ...it, lines: it.lines.filter((l) => l.line_type !== 'DeliveryNote') }], cur, false, hide);
       y = totalsBox(doc, y + 4, { gross: it.gross_amount, deductions: it.deductions_amount, net: it.net_amount, currency: cur });
       continue;
     }
@@ -332,21 +367,24 @@ function drawMachine(doc, ctx, b, items) {
       meter: r.meter_start !== null && r.meter_end !== null && r.meter_start !== undefined ? fmt.num(n(r.meter_end) - n(r.meter_start), 1) : '',
       row: r.sheet_row_no, paper: r.paper_status,
     }));
-    y = P.table(doc, {
-      y, rows, rowHeight: 15, headHeight: 24, fontSize: 7,
-      columns: [
+    if (!hide.has('days')) {
+      // columns hidden on request give their width to the date / status columns
+      const cols = [
         { key: 'date', en: 'Date', ar: 'التاريخ', width: 50 }, { key: 'status', en: 'Status', ar: 'الحالة', width: 48 },
-        { key: 'op', en: 'Operator', ar: 'المشغل', width: 70, align: 'left' }, { key: 'in', en: 'Start', ar: 'البدء', width: 30 },
+        ...(hide.has('operator') ? [] : [{ key: 'op', en: 'Operator', ar: 'المشغل', width: 70, align: 'left' }]),
+        { key: 'in', en: 'Start', ar: 'البدء', width: 30 },
         { key: 'out', en: 'End', ar: 'الانتهاء', width: 30 }, { key: 'work', en: 'Work h', ar: 'ساعات العمل', width: 34, bold: true },
         { key: 'ot', en: 'OT h', ar: 'إضافي', width: 30 }, { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 36 },
         { key: 'bd', en: 'Breakdown h', ar: 'أعطال', width: 36 }, { key: 'tu', en: 'Min. top-up', ar: 'حد أدنى', width: 34 },
-        { key: 'meter', en: 'Meter diff', ar: 'فرق العداد', width: 34 }, { key: 'row', en: 'Sheet row', ar: 'السطر', width: 28 },
-        { key: 'paper', en: 'Paper', ar: 'الورقة', width: 37 },
-      ],
-      onNewPage: () => doc.page.margins.top + 4,
-    });
-    y += 6;
-    y = drawLines(doc, y, [it], cur, false);
+        { key: 'meter', en: 'Meter diff', ar: 'فرق العداد', width: 34 },
+        ...(hide.has('paper') ? [] : [{ key: 'row', en: 'Sheet row', ar: 'السطر', width: 28 }, { key: 'paper', en: 'Paper', ar: 'الورقة', width: 37 }]),
+      ];
+      const spare = 497 - cols.reduce((a, c) => a + c.width, 0);
+      if (spare > 0) { cols[0].width += Math.floor(spare / 2); cols[1].width += spare - Math.floor(spare / 2); }
+      y = P.table(doc, { y, rows, rowHeight: 15, headHeight: 24, fontSize: 7, columns: cols, onNewPage: () => doc.page.margins.top + 4 });
+      y += 6;
+    }
+    y = drawLines(doc, y, [it], cur, false, hide);
     y = totalsBox(doc, y + 4, { gross: it.gross_amount, deductions: it.deductions_amount, net: it.net_amount, currency: cur });
     if (fuelDiffOf(it)) {
       P.text(doc, `Includes a fuel price difference of ${money(fuelDiffOf(it), cur)} ${cur}, detailed in the attached statement${it.fuel_invoice_no ? ` ${it.fuel_invoice_no}` : ''}.`,
@@ -386,12 +424,12 @@ function drawDeliveryNotes(doc, y, it, cur) {
   }) + 6;
 }
 
-function drawLines(doc, y, items, cur, withMachine = true) {
+function drawLines(doc, y, items, cur, withMachine = true, hide = new Set()) {
   const rows = [];
   for (const it of items) {
     for (const l of it.lines) {
       rows.push({
-        m: mshort(it), desc: lineDesc(l, it.rate), qty: fmt.num(l.quantity, l.unit === 'day' || l.unit === 'month' ? 3 : 2).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)),
+        m: mshort(it), desc: hide.has('reasons') && l.line_type === 'Adjustment' ? `Adjustment: ${String(l.note || '').split(':')[0]}` : lineDesc(l, it.rate, hide), qty: fmt.num(l.quantity, l.unit === 'day' || l.unit === 'month' ? 3 : 2).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)),
         unit: UNIT_TEXT[l.unit] || l.unit, price: fmt.num(l.unit_price, ['FuelPriceDifference', 'Fuel', 'DeliveryNote'].includes(l.line_type) ? 3 : 2), amount: money(l.amount, cur),
         _color: n(l.amount) < 0 ? COLORS.red : undefined,
       });
@@ -408,6 +446,7 @@ function drawLines(doc, y, items, cur, withMachine = true) {
 
 // --------------------------------------------------------------- D3 vendor invoice / statement
 function drawVendor(doc, ctx, b, items) {
+  const hide = ctx.hide || new Set();
   const cur = b.currency;
   const v = items[0];
   const final = isFinal(b);
@@ -452,7 +491,7 @@ function drawVendor(doc, ctx, b, items) {
   });
   let sec = 2;
   y = sectionTitle(doc, y + 6, `${sec++}. Invoice lines`, 'تفاصيل البنود');
-  y = drawLines(doc, y, items, cur, true);
+  y = drawLines(doc, y, items, cur, true, hide);
   const fdItems = items.filter((it) => fuelDiffOf(it));
   if (fdItems.length) {
     y = sectionTitle(doc, y + 4, `${sec++}. Fuel price difference (attached statements)`, 'فروقات أسعار المحروقات');
@@ -478,7 +517,7 @@ function drawVendor(doc, ctx, b, items) {
     y = sectionTitle(doc, y + 4, `${sec++}. Additions and deductions`, 'الإضافات والحسومات');
     y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
       columns: [{ key: 'm', en: 'Machine', ar: 'الآلية', width: 70 }, { key: 'note', en: 'Type: reason', ar: 'النوع والسبب', width: 380, align: 'left' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 97, align: 'right' }],
-      rows: adjLines.map((l) => ({ m: l.m, note: l.note || '', amount: money(l.amount, cur), _color: n(l.amount) < 0 ? COLORS.red : undefined })) }) + 4;
+      rows: adjLines.map((l) => ({ m: l.m, note: hide.has('reasons') ? String(l.note || '').split(':')[0] : l.note || '', amount: money(l.amount, cur), _color: n(l.amount) < 0 ? COLORS.red : undefined })) }) + 4;
   }
   const sum = (k) => items.reduce((a, i) => a + n(i[k]), 0);
   y = totalsBox(doc, y + 6, { gross: sum('gross_amount'), deductions: sum('deductions_amount'), net: sum('net_amount'), currency: cur });
@@ -581,7 +620,8 @@ function drawSummary(doc, ctx, b, items) {
 
 // --------------------------------------------------------------- entry points
 async function render(conn, model, opts, user) {
-  const ctx = { company: await settings.getString('company_name'), printedAt: businessNow().slice(0, 16), printedBy: user.full_name, requirePaper: await settings.getBool('eq_payroll_requires_paper_match') };
+  const ctx = { company: await settings.getString('company_name'), printedAt: businessNow().slice(0, 16), printedBy: user.full_name, requirePaper: await settings.getBool('eq_payroll_requires_paper_match'),
+    hide: opts.hide || new Set() };
   const { batch: b } = model;
   const items = model.items;
   const landscape = opts.view === 'summary';
@@ -628,7 +668,7 @@ async function batchPdf(conn, detail, opts, user) {
 async function provisionalPdf(conn, calc, user) {
   const model = await modelFromCalc(conn, calc);
   model.batch.unapproved_rows = calc.unapproved || 0;
-  return render(conn, model, { view: calc.kind === 'machine' ? 'machine' : 'vendor' }, user);
+  return render(conn, model, { view: calc.kind === 'machine' ? 'machine' : 'vendor', hide: calc.hide }, user);
 }
 
 // --------------------------------------------------------------- Excel
@@ -864,4 +904,4 @@ async function accountStatementPdf(conn, { batch: b, vendor: x }, user) {
 }
 
 // invoice register sheet + fuel difference days are added by batchXlsx below
-module.exports = { batchPdf, provisionalPdf, batchXlsx, amountInWords, voucherPdf, accountStatementPdf };
+module.exports = { batchPdf, provisionalPdf, batchXlsx, amountInWords, voucherPdf, accountStatementPdf, hideOptions, HIDE_KEYS, monthlyResult, monthlyDaysText };

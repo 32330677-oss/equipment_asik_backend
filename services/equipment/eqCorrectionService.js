@@ -217,7 +217,7 @@ async function computeDelta(rowId, changes, userId) {
       const ids = (m.snap.monthly_prev && m.snap.monthly_prev.row_ids) || [];
       if (!ids.length && !(m.snap.monthly_prev && (m.snap.monthly_prev.months || []).length)) continue;
       const [prev] = ids.length ? await conn.query("SELECT * FROM eq_attendance WHERE eq_attendance_id IN (?) AND status <> 'Cancelled'", [ids]) : [[]];
-      m.prev = { rows: prev.map(P.engineRow), months: m.snap.monthly_prev.months || [] };
+      m.prev = { rows: prev.map(P.engineRow), months: m.snap.monthly_prev.months || [], ...(m.snap.monthly_prev.used ? { used: m.snap.monthly_prev.used } : {}) };
     }
     const [srows] = await conn.query(
       `SELECT s.*, a.shift_type FROM eq_payroll_attendance_snapshot s LEFT JOIN eq_attendance a ON a.eq_attendance_id = s.eq_attendance_id
@@ -236,7 +236,8 @@ async function computeDelta(rowId, changes, userId) {
         const rows = entries.filter((e) => e.itemId === itemId).map((e) => e.row);
         if (!rows.length) continue;
         // the months frozen in the item carry its terms (divisor D, hourly price) — never today's eq_monthly_terms
-        const ctx = m.rate.billing_mode === 'Monthly' ? { months: m.snap.months || [], ...(m.prev ? { prev: m.prev } : {}) } : {};
+        // and the Admin's decision on the extra hours of each month (offset), frozen in the item too
+        const ctx = m.rate.billing_mode === 'Monthly' ? { months: m.snap.months || [], offset: m.snap.monthly_offset || [], ...(m.prev ? { prev: m.prev } : {}) } : {};
         const fdInput = m.snap.fuel_diff ? { equipmentId: item.equipment_id, currency: item.currency, terms: m.snap.fuel_diff.terms || [],
           prices: m.snap.fuel_diff.prices || [], allowNegative } : null;
         const r = billWith(rows, m.rate, ctx, fdInput);

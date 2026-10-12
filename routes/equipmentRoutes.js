@@ -194,6 +194,7 @@ router.patch('/payroll/batches/:id/payment-reference', AC, pay.setPaymentReferen
 router.get('/payroll/batches/:id/review-summary', AC, pay.reviewSummary);
 router.patch('/payroll/batches/:id/void', AC, pay.void);
 router.post('/payroll/batches/:id/supersede', AC, pay.supersede);
+router.patch('/payroll/batches/:id/offsets', AC, pay.setOffsets); // Admin: extra hours cover missing hours (monthly, 12 Oct 2026)
 router.post('/payroll/batches/:id/payments', AC, pay.recordPayment);
 router.get('/payroll/batches/:id/statement.pdf', AC, pay.accountStatementPdf);
 router.patch('/payroll/payments/:id/reverse', AC, pay.reversePayment);

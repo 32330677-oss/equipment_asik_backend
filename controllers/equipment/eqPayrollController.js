@@ -21,12 +21,15 @@ const SCOPE = {
   accept_blockers: v.bool({ default: false }), accept_reason: v.string({ max: 500 }),
   // "Add previous balances": the unpaid balance of older finalized batches of the same vendors moves into this batch
   carry_forward: v.bool({ default: false }),
+  // 12 Oct 2026: monthly machines whose extra hours cover their missing hours, decided by the Admin: ["<equipment_id>|YYYY-MM"]
+  offsets: v.any(),
 };
 
 /** "1,2,3" in a query string -> [1,2,3] (GET routes). */
 function queryIds(q) {
   const out = { ...q };
   if (typeof out.equipment_ids === 'string') out.equipment_ids = out.equipment_ids.split(',').map((x) => x.trim()).filter(Boolean);
+  if (typeof out.offsets === 'string') out.offsets = out.offsets.split(',');
   if (Array.isArray(out.equipment_ids) && !out.equipment_ids.length) delete out.equipment_ids;
   return out;
 }
@@ -37,6 +40,7 @@ function queryIds(q) {
  */
 async function checkScope(conn, input) {
   const scope = validate(input, SCOPE);
+  scope.offsets = P.normalizeOffsets(scope.offsets);
   if (scope.equipment_id && !scope.equipment_ids) scope.equipment_ids = [scope.equipment_id];
   if (scope.equipment_ids) {
     scope.equipment_ids = [...new Set(scope.equipment_ids)].sort((a, b) => a - b);
@@ -222,6 +226,10 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
       req.user.user_id, JSON.stringify(await P.billingSettings())]);
   if (extra.accept_reason) await conn.execute('UPDATE eq_payroll_batches SET accept_blockers_reason = ? WHERE eq_batch_id = ?', [extra.accept_reason, b.insertId]);
   const batchId = b.insertId;
+  // the Admin's offset decisions that apply to this batch (a month of a monthly machine it bills)
+  const billed = new Set(items.filter((i) => i.billing_mode === 'Monthly').flatMap((i) => (i.months || []).map((m) => `${i.equipment_id}|${m.month}`)));
+  const offsets = P.normalizeOffsets(scope.offsets).filter((k) => billed.has(k));
+  if (offsets.length) await conn.execute('UPDATE eq_payroll_batches SET offset_months = ? WHERE eq_batch_id = ?', [JSON.stringify(offsets), batchId]);
   // machines chosen by hand (11 Oct 2026); empty = the whole scope
   for (const eid of machineList(scope) || []) await conn.execute('INSERT INTO eq_payroll_batch_machines (eq_batch_id, equipment_id) VALUES (?, ?)', [batchId, eid]);
   const labels = await labelsFor(conn, items);
@@ -232,6 +240,7 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [batchId, it.equipment_id, it.vendor_id, it.site_id, it.rate_card_id,
         JSON.stringify({ ...it.rate_snapshot, months: it.months, monthly_calc: it.monthly_calc || null, monthly_prev: it.monthly_prev || null, monthly_terms: it.monthly_terms || null,
+          monthly_offset: it.monthly_offset || null,
           fuel_diff: it.fuel_diff || null, site_allocation: it.site_allocation || null, labels: labels(it) }), it.billing_mode,
         it.days_recorded, it.worked_days, hoursOf(it.work_minutes), hoursOf(it.overtime_minutes), hoursOf(it.standby_minutes),
         hoursOf(it.breakdown_minutes), hoursOf(it.topup_minutes), toDecimalString(it.gross_cents), toDecimalString(it.deductions_cents), toDecimalString(it.net_cents)]);
@@ -339,8 +348,16 @@ async function generateInTx(conn, req, scope, extraIn = {}) {
   return { id, warnings, accepted_blockers: blocking.map((b) => b.code), carried: carried.map(({ amount_cents: _c, ...x }) => x) };
 }
 
+/** Only the Admin decides that extra hours cover missing hours (12 Oct 2026). */
+function assertOffsetsAllowed(req, offsets) {
+  if (offsets && offsets.length && req.user.role !== 'Admin') {
+    throw AppError.forbidden('OFFSET_ADMIN_ONLY', 'Only the Admin decides that extra hours cover missing hours. Generate without it; the Admin can decide on the draft before finalizing.');
+  }
+}
+
 exports.generate = async (req, res) => {
   const scope = await checkScope(pool, req.body);
+  assertOffsetsAllowed(req, scope.offsets);
   const out = await withTransaction(async (conn) => {
     const r = await generateInTx(conn, req, scope);
     await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'generate', newValues: { scope, accepted_blockers: r.accepted_blockers, carried_forward: r.carried },
@@ -493,6 +510,7 @@ async function batchDetail(conn, id) {
      WHERE m.eq_batch_id = ? ORDER BY e.equipment_code`, [id]);
   return {
     ...batch, settings_snapshot: P.parseJson(batch.settings_snapshot) || null, is_finalized: Boolean(Number(batch.is_finalized)),
+    offset_months: P.normalizeOffsets(P.parseJson(batch.offset_months) || []),
     scope_machines: chosen,
     finalize_admin_only: await settings.getBool('payroll_finalize_admin_only'), paid_undo: undo, finalize_undo: finalizeUndo, reserved_numbers: reserved,
     settlement: { vendors: money.vendors, totals: money.totals, payment_status: money.payment_status, legacy_paid: money.legacy_paid, payable: money.payable },
@@ -899,6 +917,29 @@ async function reviewSummaryOf(conn, batch) {
     items.push({ kind: r.from_batch_id ? 'previous_balance' : 'opening_balance', ref: `${r.vendor_name}: ${Number(r.amount).toFixed(2)} ${r.currency} ${from}`, by: r.by_name, at: r.created_at });
   }
   if (batch.accept_blockers_reason) items.push({ kind: 'accepted_blockers', ref: batch.accept_blockers_reason });
+  // monthly machines (12 Oct 2026): the exceptions typed for a month, and what was done with the extra hours
+  const [monthly] = await conn.query(
+    `SELECT i.rate_snapshot, e.equipment_code FROM eq_payroll_items i JOIN eq_equipment e ON e.equipment_id = i.equipment_id
+     WHERE i.eq_batch_id = ? AND i.billing_mode = 'Monthly' ORDER BY e.equipment_code`, [id]);
+  for (const m of monthly) {
+    const snap = P.parseJson(m.rate_snapshot) || {};
+    for (const t of snap.monthly_terms || []) {
+      const parts = [];
+      if (t.amount_source === 'manual') parts.push(`amount ${Number(t.amount).toFixed(2)}`);
+      if (t.divisor_source === 'manual') parts.push(`divided by ${t.divisor} days`);
+      if (t.hourly_source === 'manual') parts.push(`hourly price ${Number(t.hourly).toFixed(2)}`);
+      if (parts.length) items.push({ kind: 'monthly_exception', ref: `${m.equipment_code} ${t.month}: ${parts.join(', ')}` });
+    }
+    for (const x of snap.monthly_calc || []) {
+      const h = (v) => Number(v || 0).toFixed(2);
+      if (Number(x.offset_hours) !== 0) {
+        items.push({ kind: 'monthly_offset', ref: `${m.equipment_code} ${x.month}: ${h(x.offset_hours)} h of extra hours cover missing hours (${h(x.month_missing_hours)} h missing in the month)` });
+      } else if (Number(x.offset_possible_hours) > 0) {
+        items.push({ kind: 'monthly_offset_not_used', ref: `${m.equipment_code} ${x.month}: ${h(x.offset_possible_hours)} h of extra hours could cover missing hours and are NOT used`
+          + `${x.overtime_paid ? ' (paid as overtime instead)' : ' (kept unpaid for a later invoice of the month)'}` });
+      }
+    }
+  }
   return { eq_batch_id: id, items };
 }
 
@@ -1008,6 +1049,28 @@ async function reasonFor(id, reason) {
   return text || null;
 }
 
+/**
+ * Admin: decide on a DRAFT which monthly machines use their extra hours to cover missing hours (12 Oct 2026). The draft
+ * is recalculated as a new version with the decision; body { offsets: ["<equipment_id>|YYYY-MM", ...], reason? }.
+ */
+exports.setOffsets = async (req, res) => {
+  const id = parseId(req.params.id);
+  if (req.user.role !== 'Admin') throw AppError.forbidden('OFFSET_ADMIN_ONLY', 'Only the Admin decides that extra hours cover missing hours.');
+  const d = validate(req.body || {}, { offsets: v.any(), reason: v.string({ max: 500 }) });
+  const offsets = P.normalizeOffsets(d.offsets);
+  const out = await withTransaction(async (conn) => {
+    const b = await loadBatch(conn, id, true);
+    if (b.status !== 'Generated' || Number(b.is_finalized)) throw AppError.conflict('BATCH_STATE', 'The decision can change on a draft only. Undo the Finalize first, or use an official Correction.');
+    const was = P.normalizeOffsets(P.parseJson(b.offset_months) || []);
+    if (JSON.stringify(was) === JSON.stringify(offsets)) throw AppError.validation({ offsets: 'nothing changed' });
+    const why = (d.reason || '').trim() || `extra hours ${offsets.length ? `cover missing hours: ${offsets.join(', ')}` : 'no longer cover missing hours'}`;
+    const r = await doSupersede(conn, req, id, why, Boolean(b.accept_blockers_reason), { offsets });
+    await audit.log(conn, { table: 'eq_payroll_batches', id: r.id, action: 'offset_decision', oldValues: { offsets: was }, newValues: { offsets }, reason: why, ...audit.ctx(req) });
+    return r;
+  });
+  res.status(201).json({ status: 'success', data: await batchDetail(pool, out.id), warnings: out.warnings });
+};
+
 exports.void = async (req, res) => {
   const id = parseId(req.params.id);
   const d = validate(req.body || {}, { reason: v.string({ max: 500 }) });
@@ -1112,7 +1175,8 @@ exports.exportPdf = async (req, res) => {
   const id = parseId(req.params.id);
   const view = ['summary', 'vendor', 'machine', 'fueldiff'].includes(req.query.view) ? req.query.view : 'summary';
   const detail = await batchDetail(pool, id);
-  const opts = { view, vendorId: req.query.vendor_id ? Number(req.query.vendor_id) : null, equipmentId: req.query.equipment_id ? Number(req.query.equipment_id) : null };
+  const opts = { view, vendorId: req.query.vendor_id ? Number(req.query.vendor_id) : null, equipmentId: req.query.equipment_id ? Number(req.query.equipment_id) : null,
+    hide: statements.hideOptions(req.query.hide) };
   const { buffer, fileName } = await statements.batchPdf(pool, detail, opts, req.user);
   res.set('Content-Type', 'application/pdf');
   res.set('Content-Disposition', `inline; filename="${fileName}"`);
@@ -1135,6 +1199,7 @@ async function provisional(req, res, kind) {
     from: v.date({ required: true }), to: v.date({ required: true }), currency: v.currency(),
     // to see the amounts before the office approves: Submitted days are counted too, and marked on the PDF
     include_unapproved: v.bool({ default: false }),
+    hide: v.any(),
   });
   const scope = { start_date: q.from, end_date: q.to, [kind === 'machine' ? 'equipment_id' : 'vendor_id']: id, include_submitted: q.include_unapproved };
   const { items } = await P.calculate(pool, scope);
@@ -1154,7 +1219,7 @@ async function provisional(req, res, kind) {
     throw AppError.conflict('NOTHING_TO_PAY', 'Nothing payable in this period (no recorded day, or already in a payroll batch).');
   }
   const unapproved = q.include_unapproved ? chosen.reduce((a, it) => a + (it.per_row || []).filter((p) => p.row && p.row.status !== 'Approved').length, 0) : 0;
-  const { buffer, fileName } = await statements.provisionalPdf(pool, { kind, scope, items: chosen, unapproved }, req.user);
+  const { buffer, fileName } = await statements.provisionalPdf(pool, { kind, scope, items: chosen, unapproved, hide: statements.hideOptions(q.hide) }, req.user);
   res.set('Content-Type', 'application/pdf');
   res.set('Content-Disposition', `inline; filename="${fileName}"`);
   res.send(buffer);

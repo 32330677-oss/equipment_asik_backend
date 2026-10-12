@@ -102,13 +102,17 @@ test('preview reproduces examples A, B (incl. operator) and C (monthly on hours 
   const net = (code) => p.items.filter((i) => i.equipment_code === code).reduce((a, i) => a + Number(i.net), 0);
   assert.strictEqual(net('EQ-0001'), 1460);
   assert.strictEqual(net('EQ-0002'), 1087.5);
-  assert.strictEqual(net('EQ-0003'), 5687.5); // 208 h due (26 working days x 8), 182 h done -> 26 h x 31.25 missing
-  assert.strictEqual(p.totals[0].net, '8235.00');
+  // example C (rules of 12 Oct 2026, each day on its own, hourly price 6500 / 26 / 8 = 31.25):
+  //   absent 01 and 31 (no row): -16 h x 31.25 = -500; breakdown 06 (8 h) and 07 (4 h): -12 h = -375;
+  //   standby 08 given 4 h of 8: -4 h = -125; extra hours 03, 04, 05 (+1, +2, +3): 6 h paid as overtime x 40 = +240
+  //   (the Admin did not decide to use them for the missing hours) -> 6500 - 500 - 375 - 125 + 240
+  assert.strictEqual(net('EQ-0003'), 5740);
+  assert.strictEqual(p.totals[0].net, '8287.50');
 });
 
 test('generate, rows never paid twice, export PDFs and Excel', async () => {
   batch = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ ...SCOPE, vendor_id: F.vendor.vendor_id }));
-  assert.strictEqual(batch.total_net, '8235.00');
+  assert.strictEqual(batch.total_net, '8287.50');
   assert.strictEqual(batch.items.length, 3);
   const again = await h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ ...SCOPE, vendor_id: F.vendor.vendor_id });
   assert.ok(['NOTHING_TO_PAY', 'OVERLAPPING_BATCH'].includes(again.body.code), again.body.code);
@@ -143,7 +147,7 @@ test('finalize locks; supersede creates v2; void rules; accountant finalize sett
   // the old numbers are withdrawn (reserved for the new version), and cancelled if that version is voided
   const sup = await ok(h.api().post(`/api/equipment/payroll/batches/${batch.eq_batch_id}/supersede`).set(A()).send({ reason: 'rate correction' }));
   assert.strictEqual(sup.version_number, 2);
-  assert.strictEqual(sup.total_net, '8235.00');
+  assert.strictEqual(sup.total_net, '8287.50');
   assert.ok(sup.reserved_numbers.length > 0, 'the draft keeps the numbers of the version it replaces');
   const old = await ok(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}`).set(ACC()));
   assert.ok(old.invoices.length > 0 && old.invoices.every((i) => i.status === 'Withdrawn' && !i.cancelled), 'superseded numbers are reserved, not cancelled');
@@ -154,7 +158,7 @@ test('finalize locks; supersede creates v2; void rules; accountant finalize sett
   const oldAfter = await ok(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}`).set(ACC()));
   assert.ok(oldAfter.invoices.every((i) => i.cancelled), 'voiding the new version cancels the reserved numbers');
   const again = await ok(h.api().post('/api/equipment/payroll/preview').set(ACC()).send(SCOPE));
-  assert.strictEqual(again.totals[0].net, '8235.00', 'void frees rows');
+  assert.strictEqual(again.totals[0].net, '8287.50', 'void frees rows');
 });
 
 test('stale batch cannot be finalized', async () => {
