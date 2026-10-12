@@ -197,6 +197,12 @@ function drawMonthlyCalc(doc, y, it, cur) {
 /** Result column of a month: overtime paid (hours x price), extra hours not paid (overtime off), missing hours. */
 function monthlyResult(x) {
   const part = x.part ? ' (month settlement)' : '';
+  const bd = x.breakdown_deducted_hours > 0 ? `breakdown -${fmt.num(x.breakdown_deducted_hours)} h; ` : '';
+  const ab = x.absence_deducted_hours > 0 ? `absent ${fmt.num(x.absent_days)} day(s) -${fmt.num(x.absence_deducted_hours)} h; ` : '';
+  return bd + ab + monthlyHours(x, part);
+}
+
+function monthlyHours(x, part) {
   if (x.overtime_hours > 0) {
     const price = x.overtime_price ?? x.hourly_price;
     return `+${fmt.num(x.overtime_hours)} h x ${fmt.num(price, 2)} = ${fmt.num(Math.round(x.overtime_hours * price * 100) / 100)}${part}`;

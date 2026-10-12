@@ -4,7 +4,7 @@ const assert = require('node:assert');
 const h = require('./helpers');
 const { ok, standardFleet } = require('./fixtures');
 const engine = require('../services/equipment/equipmentBillingEngine');
-const { workingDaysOfMonth } = require('../services/equipment/eqPayrollService');
+const { workingDaysOfMonth, monthsFromDays } = require('../services/equipment/eqPayrollService');
 
 require('../utils/businessDate').setClock(() => new Date(Date.UTC(2026, 9, 5, 9, 0, 0)));
 const ACC = () => h.auth(h.T.accountant());
@@ -41,8 +41,36 @@ test('missing hours are deducted; standby = hours given, breakdown 0%; official 
     { record_date: '2026-10-28', day_status: 'Breakdown', gross_minutes: 600, break_minutes: 0, breakdown_minutes: 0, standby_minutes: 0 }, // 0 h
   ];
   const r = engine.billItem(rows, card, ctx);
-  assert.strictEqual(r.lines.find((l) => l.line_type === 'HoursShortfall').quantity, 15); // 250 - 235
+  // the 10 h breakdown (vendor fault) is its own deduction; the rest is missing hours: 250 - 10 - 235
+  assert.strictEqual(r.lines.find((l) => l.line_type === 'BreakdownDeduction').quantity, 10);
+  assert.strictEqual(r.lines.find((l) => l.line_type === 'HoursShortfall').quantity, 5);
   assert.strictEqual(r.net_cents, 650000 - 15 * 2500);
+});
+
+test('breakdown is never made up by extra hours on other days (overtime off)', () => {
+  const offCard = { ...card, overtime_enabled: false };
+  const ctx = { months: [{ month: '2026-10', workingDays: 26, assignedWorkingDays: 3, holidayDays: 0 }] }; // 30 h due
+  const rows = [day('2026-10-01', 12), day('2026-10-03', 12),
+    { record_date: '2026-10-04', day_status: 'Breakdown', gross_minutes: 0, break_minutes: 0, breakdown_minutes: 0, standby_minutes: 0 }]; // 24 h + 10 h breakdown
+  const r = engine.billItem(rows, offCard, ctx);
+  assert.strictEqual(r.lines.find((l) => l.line_type === 'BreakdownDeduction').quantity, 10);
+  assert.strictEqual(r.lines.find((l) => l.line_type === 'HoursShortfall'), undefined);
+  assert.strictEqual(r.net_cents, 75000 - 10 * 2500); // 3 base days - the breakdown day; the 4 extra hours are not paid
+});
+
+test('absent or unrecorded deployed days are deducted in full; extra hours never make up for them', () => {
+  const offCard = { ...card, overtime_enabled: false };
+  const days = ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05']; // Fri 02 = day off -> 4 working days
+  const ctx = { months: monthsFromDays(days, offCard, 5) }; // 40 h due
+  const rows = [day('2026-10-01', 12), day('2026-10-03', 12),
+    { record_date: '2026-10-04', day_status: 'Absent', gross_minutes: 0, break_minutes: 0, breakdown_minutes: 0, standby_minutes: 0 }]; // 05: no row
+  const r = engine.billItem(rows, offCard, ctx);
+  assert.strictEqual(r.lines.find((l) => l.line_type === 'AbsenceDeduction').quantity, 20); // 2 days x 10 h
+  assert.strictEqual(r.lines.find((l) => l.line_type === 'HoursShortfall'), undefined); // 24 h done >= 20 h due
+  assert.strictEqual(r.net_cents, 100000 - 20 * 2500); // 4 base days - 2 absent days; the 4 extra hours are not paid
+  // a Standby day (company side) is not an absence
+  const sb = engine.billItem([...rows.slice(0, 2), { record_date: '2026-10-04', day_status: 'Standby', gross_minutes: 0, break_minutes: 0, breakdown_minutes: 0, standby_minutes: 0, standby_credit_minutes: 600 }], offCard, ctx);
+  assert.strictEqual(sb.lines.find((l) => l.line_type === 'AbsenceDeduction').quantity, 10); // only the 5th
 });
 
 test('rate card changed from a date: old card closed the day before, new card starts', async () => {

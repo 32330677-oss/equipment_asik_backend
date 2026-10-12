@@ -71,6 +71,6 @@ test('a monthly machine at two sites: site-scoped runs are refused; one item wit
   assert.ok(it.site_allocation && it.site_allocation.length === 2);
   const shares = it.site_allocation.map((a) => a.share_pct).sort();
   assert.deepStrictEqual(shares, [33.33, 66.67]);
-  const cost = ['MonthlyBase', 'Overtime', 'HoursShortfall'].reduce((a, t) => a + amount(it, t), 0);
+  const cost = ['MonthlyBase', 'BreakdownDeduction', 'AbsenceDeduction', 'Overtime', 'HoursShortfall'].reduce((a, t) => a + amount(it, t), 0);
   assert.strictEqual(Math.round(it.site_allocation.reduce((a, x) => a + Number(x.amount), 0) * 100), Math.round(cost * 100));
 });

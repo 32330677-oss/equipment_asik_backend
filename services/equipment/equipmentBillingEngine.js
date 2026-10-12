@@ -242,6 +242,13 @@ function standbyCredit(row, maxCredit) {
 //   required hours = (base days - official holidays recorded) x hours per day
 //   billable hours = work + standby hours GIVEN by the Admin/Accountant per row (standby_credit_minutes, max hours per day)
 //                    + breakdown x breakdown%   (breaks deducted per break_policy). No standby % for monthly machines.
+// Breakdown (vendor fault): its unpaid part (breakdown x (100% - breakdown%)) is deducted on its own line
+//                         (BreakdownDeduction = hours x H) and taken out of the hours due, so extra hours worked on
+//                         other days NEVER make up for it. Stoppages caused by the company are recorded as Standby.
+// Absence: a deployed working day (not an official holiday) with no Working / Standby / Breakdown row — Absent or not
+//                         recorded at all — is deducted in full (AbsenceDeduction = hours per day x H) and taken out of
+//                         the hours due: extra hours on other days NEVER make up for it. Needs ctx month.workingDates
+//                         (old snapshots without it keep the old rule).
 // Billable >  required -> overtime ONLY when the card has overtime_enabled: extra hours x overtime_rate (or H when empty).
 //                         Overtime off: the extra hours are not paid (shown as unpaid_extra_hours).
 // Billable <  required -> base - missing hours x H.
@@ -280,23 +287,40 @@ function billMonthly(rows, rate, ctx) {
     const baseC = manualH ? roundCents(hourlyC * hpd * baseDays) : roundCents(monthly * baseDays / D);
     const requiredMin = Math.max(0, Math.round((baseDays - (mo.holidayDays || 0)) * hpd * 60));
     const billableMin = Math.round(work + credit + breakdown * bdPct);
+    // vendor-fault breakdown: deducted directly, never covered by extra hours (never more than the hours due)
+    const bdDeductMin = Math.min(requiredMin, Math.round(breakdown * (1 - bdPct)));
+    // deployed working days with no presence at all (Absent, or no row): deducted in full, never covered by extra hours
+    const present = new Set(mRows.filter((r) => ['Working', 'Standby', 'Breakdown'].includes(r.day_status)).map((r) => String(r.record_date).slice(0, 10)));
+    const absentDates = Array.isArray(mo.workingDates) ? mo.workingDates.filter((d) => !present.has(d)) : [];
+    // deployed days above the divisor are not paid as base: their absences cost nothing
+    const absentDays = Math.max(0, absentDates.length - Math.max(0, Number(mo.assignedWorkingDays) - baseDays));
+    const absentMin = Math.min(requiredMin - bdDeductMin, Math.round(absentDays * hpd * 60));
+    const dueMin = requiredMin - bdDeductMin - absentMin; // hours due from the days the machine was there and not broken down
     const label = `${mo.month}: ${mo.assignedWorkingDays} deployed working days, divisor ${D} (${divisorSource}), ${baseDays} paid as base`
       + `${manualH ? `, hourly price ${(hourlyC / 100).toFixed(2)} (manual)` : ''}`;
     lines.push({ line_type: 'MonthlyBase', quantity: round4(baseDays / D), unit: 'month', unit_price_cents: manualH ? roundCents(hourlyC * hpd * D) : monthly,
       amount_cents: baseC, note: label, month: mo.month });
+    if (bdDeductMin > 0) {
+      lines.push({ line_type: 'BreakdownDeduction', quantity: round4(bdDeductMin / 60), unit: 'h', unit_price_cents: -roundCents(hourlyC), unit_price_exact: -Math.round(hourlyC * 10) / 1000,
+        amount_cents: -roundCents((bdDeductMin / 60) * hourlyC), note: `${mo.month}: breakdown (vendor fault) not paid${bdPct > 0 ? ` (${Math.round(bdPct * 10000) / 100}% paid)` : ''}`, month: mo.month });
+    }
+    if (absentMin > 0) {
+      lines.push({ line_type: 'AbsenceDeduction', quantity: round4(absentMin / 60), unit: 'h', unit_price_cents: -roundCents(hourlyC), unit_price_exact: -Math.round(hourlyC * 10) / 1000,
+        amount_cents: -roundCents((absentMin / 60) * hourlyC), note: `${mo.month}: ${absentDays} deployed day(s) absent or not recorded (${absentDates.map((d) => d.slice(8, 10) + '/' + d.slice(5, 7)).join(', ')})`, month: mo.month });
+    }
     let otMin = 0; let shortMin = 0; let unpaidMin = 0;
-    const done = `${mo.month}: ${(billableMin / 60).toFixed(2)} h done, ${(requiredMin / 60).toFixed(2)} h due`;
-    if (billableMin > requiredMin) {
+    const done = `${mo.month}: ${(billableMin / 60).toFixed(2)} h done, ${(dueMin / 60).toFixed(2)} h due after breakdown and absence`;
+    if (billableMin > dueMin) {
       if (otPaid) {
-        otMin = billableMin - requiredMin;
+        otMin = billableMin - dueMin;
         const otC = rate.overtime_rate !== null && rate.overtime_rate !== undefined ? toCents(rate.overtime_rate) : hourlyC;
         lines.push({ line_type: 'Overtime', quantity: round4(otMin / 60), unit: 'h', unit_price_cents: roundCents(otC), unit_price_exact: Math.round(otC * 10) / 1000,
           amount_cents: roundCents((otMin / 60) * otC), note: done, month: mo.month });
       } else {
-        unpaidMin = billableMin - requiredMin;
+        unpaidMin = billableMin - dueMin;
       }
-    } else if (billableMin < requiredMin) {
-      shortMin = requiredMin - billableMin;
+    } else if (billableMin < dueMin) {
+      shortMin = dueMin - billableMin;
       lines.push({ line_type: 'HoursShortfall', quantity: round4(shortMin / 60), unit: 'h', unit_price_cents: -roundCents(hourlyC), unit_price_exact: -Math.round(hourlyC * 10) / 1000,
         amount_cents: -roundCents((shortMin / 60) * hourlyC), note: done, month: mo.month });
     }
@@ -308,7 +332,8 @@ function billMonthly(rows, rate, ctx) {
       required_hours: requiredMin / 60, billable_hours: billableMin / 60, overtime_hours: otMin / 60, missing_hours: shortMin / 60,
       overtime_paid: otPaid, unpaid_extra_hours: unpaidMin / 60,
       overtime_price: otPaid ? Math.round((rate.overtime_rate !== null && rate.overtime_rate !== undefined ? toCents(rate.overtime_rate) : hourlyC) * 10) / 1000 : null,
-      work_hours: work / 60, standby_hours: standby / 60, standby_paid_hours: credit / 60, breakdown_hours: breakdown / 60 });
+      work_hours: work / 60, standby_hours: standby / 60, standby_paid_hours: credit / 60, breakdown_hours: breakdown / 60,
+      breakdown_deducted_hours: bdDeductMin / 60, absent_days: absentDays, absence_deducted_hours: absentMin / 60 });
   }
   return { totals: t, lines: lines.filter((l) => l.quantity !== 0 || l.line_type === 'MonthlyBase'), monthly_details: details };
 }
@@ -338,7 +363,7 @@ function billMonthlySplit(rows, rate, ctx) {
   for (const mo of ctx.months || []) {
     const b = before.monthly_details.find((x) => x.month === mo.month) || null;
     const a = all.monthly_details.find((x) => x.month === mo.month);
-    for (const type of ['MonthlyBase', 'Overtime', 'HoursShortfall']) {
+    for (const type of ['MonthlyBase', 'BreakdownDeduction', 'AbsenceDeduction', 'Overtime', 'HoursShortfall']) {
       const amount = sum(all, type, mo.month, 'amount_cents') - sum(before, type, mo.month, 'amount_cents');
       const qty = round4(sum(all, type, mo.month, 'quantity') - sum(before, type, mo.month, 'quantity'));
       if (amount === 0 && qty === 0 && type !== 'MonthlyBase') continue;
@@ -353,6 +378,7 @@ function billMonthlySplit(rows, rate, ctx) {
     t.ot += Math.round(d('overtime_hours') * 60); t.shortMinutes += Math.round(d('missing_hours') * 60); t.unpaidExtraMinutes += Math.round(d('unpaid_extra_hours') * 60);
     t.requiredMinutes += Math.round(d('required_hours') * 60); t.billableMinutes += Math.round(d('billable_hours') * 60);
     details.push({ ...a, part: Boolean(b), overtime_hours: d('overtime_hours'), missing_hours: d('missing_hours'), unpaid_extra_hours: d('unpaid_extra_hours'),
+      breakdown_deducted_hours: d('breakdown_deducted_hours'), absent_days: d('absent_days'), absence_deducted_hours: d('absence_deducted_hours'),
       billed_before: b ? { base_days: b.base_days, deployed_working_days: b.deployed_working_days, required_hours: b.required_hours, billable_hours: b.billable_hours } : null });
   }
   t.baseCents = lines.filter((l) => l.line_type === 'MonthlyBase').reduce((x, l) => x + l.amount_cents, 0);

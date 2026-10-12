@@ -99,14 +99,15 @@ function monthTerms(month, card, offDay, termsOf = null) {
 /** Months context of a set of days (Monthly billing): deployed days, deployed WORKING days, official holidays, terms. */
 function monthsFromDays(days, card, offDay = 5, holidayDates = new Set(), termsOf = null, extraMonths = []) {
   const months = {};
-  for (const m of extraMonths) months[m] = months[m] || { assignedDays: 0, assignedWorkingDays: 0, holidayDays: 0 };
+  for (const m of extraMonths) months[m] = months[m] || { assignedDays: 0, assignedWorkingDays: 0, holidayDays: 0, workingDates: [] };
   for (const d of [...new Set(days)].sort()) {
     const m = monthOf(d);
-    const mo = (months[m] = months[m] || { assignedDays: 0, assignedWorkingDays: 0, holidayDays: 0 });
+    const mo = (months[m] = months[m] || { assignedDays: 0, assignedWorkingDays: 0, holidayDays: 0, workingDates: [] });
     mo.assignedDays += 1;
     if (weekday(d) !== offDay) {
       mo.assignedWorkingDays += 1;
       if (holidayDates.has(d)) mo.holidayDays += 1;
+      else mo.workingDates.push(d); // deployed working day that is not an official holiday: must be worked or excused
     }
   }
   return Object.keys(months).sort().map((month) => ({ month, daysInMonth: daysInMonth(month), ...months[month], ...monthTerms(month, card, offDay, termsOf) }));
@@ -736,7 +737,7 @@ function allocateBySite(perRow, lines, rate) {
     hours.set(sid, (hours.get(sid) || 0) + min);
   }
   if (hours.size < 2) return null;
-  const cost = lines.filter((l) => ['MonthlyBase', 'Overtime', 'HoursShortfall', 'Operator'].includes(l.line_type)).reduce((a, l) => a + l.amount_cents, 0);
+  const cost = lines.filter((l) => ['MonthlyBase', 'BreakdownDeduction', 'AbsenceDeduction', 'Overtime', 'HoursShortfall', 'Operator'].includes(l.line_type)).reduce((a, l) => a + l.amount_cents, 0);
   const total = [...hours.values()].reduce((a, x) => a + x, 0);
   const entries = [...hours.entries()].sort((a, b) => a[0] - b[0]);
   let left = cost;
