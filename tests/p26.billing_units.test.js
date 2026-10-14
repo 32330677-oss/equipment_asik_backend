@@ -1,6 +1,6 @@
-// P26 — every unit is billed once (11 Oct 2026): machines chosen by hand, a monthly machine billed alone then with its
-// vendor (no OVERLAPPING_BATCH), the month split exactly (F-difference), late rows paid by the next batch, the lock
-// follows what was billed, machines taken out of drafts, printing holds nothing, backfill of the monthly days.
+// P26 — every unit is billed once: machines chosen by hand, a monthly machine billed alone then with its vendor, the
+// month split exactly (F-difference), rows not approved block the issue (14 Oct 2026), a handed-over invoice locks the
+// period of its machines, machines taken out of drafts, printing holds nothing, backfill of the monthly days.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const QRCode = require('qrcode');
@@ -85,29 +85,40 @@ test('a monthly machine alone, then the vendor for the same month: no error, the
   assert.deepStrictEqual(await rowsOf(b3.eq_batch_id), [R.m5a]);
 });
 
-test('vendor batch finalized, two Submitted days approved later: the next batch takes only those two days', async () => {
-  await scans('2026-10');
-  await finalize(b3.eq_batch_id);
+test('rows not approved block the issue (14 Oct 2026): approved, the draft is recalculated and takes them', async () => {
+  const no = await h.api().patch(`/api/equipment/payroll/batches/${b3.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true });
+  assert.strictEqual(no.body.code, 'ROWS_NOT_APPROVED');
+  const ids = no.body.details.blockers[0].items.map((i) => i.eq_attendance_id).sort((a, b) => a - b);
+  assert.deepStrictEqual(ids, [R.m5b, R.m5c].sort((a, b) => a - b), 'the rows to approve or reject are listed');
   const ap = await ok(h.api().post('/api/equipment/admin/attendance/approve').set(A()).send({ ids: [R.m5b, R.m5c] }));
-  assert.strictEqual(ap.approved.length, 2, 'not locked: no finalized batch billed them');
-  const b4 = (await gen({ ...OCT, vendor_id: F.vendor.vendor_id })).body.data;
-  assert.deepStrictEqual(await rowsOf(b4.eq_batch_id), [R.m5b, R.m5c].sort((a, b) => a - b));
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${b4.eq_batch_id}/void`).set(ACC()).send({}));
+  assert.strictEqual(ap.approved.length, 2);
+  assert.strictEqual((await ok(h.api().get(`/api/equipment/payroll/batches/${b3.eq_batch_id}`).set(ACC()))).stale, true);
+  const v2 = await ok(h.api().post(`/api/equipment/payroll/batches/${b3.eq_batch_id}/supersede`).set(ACC()).send({}));
+  assert.deepStrictEqual(await rowsOf(v2.eq_batch_id), [R.m5a, R.m5b, R.m5c].sort((a, b) => a - b));
+  await scans('2026-10');
+  b3 = await finalize(v2.eq_batch_id);
+  assert.strictEqual(b3.state, 'issued');
+  assert.ok(['NOTHING_TO_PAY', 'PERIOD_OVERLAP'].includes(await code(gen({ ...OCT, vendor_id: F.vendor.vendor_id }))), 'never twice');
 });
 
-test('the lock follows what was billed: a billed day is locked, a day nobody billed in the same period is not', async () => {
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${R.exc}`).set(A()).send({ check_out_time: '2026-10-05 16:00' })), 'PAYROLL_PERIOD_FINALIZED');
-  const n = await day(F.exc, '2026-10-08', '07:00', '15:00');
-  await ok(h.api().patch(`/api/equipment/admin/attendance/${n}`).set(A()).send({ check_out_time: '2026-10-08 16:00' }));
-  // fuel and adjustments dated in the finalized period are allowed and billed once
-  const fu = await ok(h.api().post('/api/equipment/fuel-issues').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, issue_date: '2026-10-10', liters: 20, price_per_liter: 1 }));
-  await ok(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.loader.equipment_id, site_id: 8, adjustment_date: '2026-10-12', adjustment_type: 'Bonus', amount: 25, reason: 'extra trip' }));
-  const b = (await gen({ ...OCT, vendor_id: F.vendor.vendor_id, equipment_ids: [F.exc.equipment_id, F.loader.equipment_id] })).body.data;
-  assert.deepStrictEqual(await rowsOf(b.eq_batch_id), [n]);
-  const loader = b.items.find((i) => i.equipment_id === F.loader.equipment_id);
-  assert.ok(loader.lines.find((l) => l.line_type === 'Adjustment'));
-  assert.ok(b.items.find((i) => i.equipment_id === F.exc.equipment_id).lines.find((l) => l.line_type === 'Fuel' && l.source_id === fu.fuel_issue_id));
-  assert.strictEqual(await code(gen({ ...OCT, vendor_id: F.vendor.vendor_id, equipment_ids: [F.exc.equipment_id, F.loader.equipment_id] })), 'NOTHING_TO_PAY', 'never twice');
+test('handed over to finance: the whole period of its machines is locked; before that the office edits with the same number', async () => {
+  b1 = await ok(h.api().get(`/api/equipment/payroll/batches/${b1.eq_batch_id}`).set(ACC()));
+  const no = b1.vendor_invoice_no;
+  assert.ok(no, 'issued in the first test');
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${R.exc}`).set(A()).send({ check_out_time: '2026-10-05 16:00' }));
+  b1 = await ok(h.api().post(`/api/equipment/payroll/batches/${b1.eq_batch_id}/refresh`).set(ACC()).send({}));
+  assert.strictEqual(b1.vendor_invoice_no, no, 'same number');
+  await h.handOver(b1.eq_batch_id);
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/attendance/${R.exc}`).set(A()).send({ check_out_time: '2026-10-05 17:00' })), 'INVOICE_LOCKED');
+  // a day nobody recorded inside its period, fuel and adjustments dated inside: refused too (the period is the invoice's)
+  assert.strictEqual(await code(h.api().post('/api/equipment/attendance/check-in').set(S8()).send({ equipment_id: F.exc.equipment_id, site_id: 8, check_in_time: '2026-10-08 07:00', check_out_time: '2026-10-08 15:00', late_reason: 'paper sheet typed late' })), 'INVOICE_LOCKED');
+  assert.strictEqual(await code(h.api().post('/api/equipment/fuel-issues').set(ACC()).send({ equipment_id: F.exc.equipment_id, site_id: 8, issue_date: '2026-10-10', liters: 20, price_per_liter: 1 })), 'INVOICE_LOCKED');
+  assert.strictEqual(await code(h.api().post('/api/equipment/adjustments').set(ACC()).send({ equipment_id: F.loader.equipment_id, site_id: 8, adjustment_date: '2026-10-12', adjustment_type: 'Bonus', amount: 25, reason: 'extra trip' })), 'INVOICE_LOCKED');
+  // the machines it does not cover stay free in the same period
+  await ok(h.api().post('/api/equipment/fuel-issues').set(ACC()).send({ equipment_id: F.crane.equipment_id, site_id: 8, issue_date: '2026-10-10', liters: 20, price_per_liter: 1 }));
+  const ov = await gen({ ...OCT, vendor_id: F.vendor.vendor_id, equipment_ids: [F.exc.equipment_id, F.loader.equipment_id] });
+  assert.strictEqual(ov.body.code, 'PERIOD_OVERLAP');
+  assert.ok(ov.body.details.overlaps.every((m) => m.free.length === 0), 'nothing of October is free for them');
 });
 
 test('a monthly month split in two batches adds up to the whole month (overtime empty, at 9, off)', async () => {
@@ -117,7 +128,7 @@ test('a monthly month split in two batches adds up to the whole month (overtime 
     for (const d of ['2026-10-17', '2026-10-18', '2026-10-19']) await day(m, d, '07:00', '15:00'); // 8 h
     const whole = await ok(h.api().post('/api/equipment/payroll/preview').set(ACC()).send({ ...OCT, equipment_id: m.equipment_id }));
     const first = (await gen({ start_date: '2026-10-01', end_date: '2026-10-15', equipment_id: m.equipment_id })).body.data;
-    const second = (await gen({ ...OCT, equipment_id: m.equipment_id })).body.data;
+    const second = (await gen({ start_date: '2026-10-16', end_date: '2026-10-31', equipment_id: m.equipment_id })).body.data; // the next period (no overlap)
     const sum = Math.round(Number(first.total_net) * 100) + Math.round(Number(second.total_net) * 100);
     assert.strictEqual(sum, Math.round(Number(whole.totals[0].net) * 100), `${plate}: ${first.total_net} + ${second.total_net} = ${whole.totals[0].net}`);
     const mc = second.items[0].rate_snapshot.monthly_calc[0];
@@ -132,7 +143,7 @@ test('take_from_drafts: a draft with two machines keeps the other one; a draft w
   const NOV = { start_date: '2026-11-01', end_date: '2026-11-15', vendor_id: F.vendor.vendor_id };
   const d1 = (await gen({ ...NOV, equipment_ids: [F.exc.equipment_id, F.loader.equipment_id] })).body.data;
   // without take_from_drafts the machine in the draft is simply skipped
-  assert.strictEqual(await code(gen({ ...NOV, equipment_ids: [F.exc.equipment_id] })), 'NOTHING_TO_PAY');
+  assert.ok(['NOTHING_TO_PAY', 'PERIOD_OVERLAP'].includes(await code(gen({ ...NOV, equipment_ids: [F.exc.equipment_id] }))));
   const cov = await ok(h.api().get(`/api/equipment/payroll/coverage?vendor_id=${F.vendor.vendor_id}&start_date=2026-11-01&end_date=2026-11-15`).set(ACC()));
   const excCov = cov.find((c) => c.equipment_id === F.exc.equipment_id);
   assert.deepStrictEqual(excCov.in_draft, [d1.eq_batch_id]);

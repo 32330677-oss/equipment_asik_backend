@@ -62,7 +62,7 @@ before(async () => {
 });
 after(h.closePool);
 
-test('scenario: review, fuel, adjustments, preview numbers, finalize, invoices', async () => {
+test('scenario: review, fuel, adjustments, preview numbers, issue, hand-over', async () => {
   const e27 = (await h.query('SELECT anomaly_code FROM eq_attendance WHERE eq_attendance_id = ?', [ids.e27]))[0];
   assert.strictEqual(e27.anomaly_code, 'meter_backwards');
   await ok(h.api().post(`/api/equipment/admin/attendance/${ids.e27}/ack-anomaly`).set(A()).send({ note: 'meter replaced' }));
@@ -86,10 +86,13 @@ test('scenario: review, fuel, adjustments, preview numbers, finalize, invoices',
   assert.strictEqual(net(F.crane), '593.75'); // 208 h due, 19 h done (8 + 7 + standby 4 h given) -> 189 h x 31.25 missing
   assert.strictEqual(p.totals[0].net, '2330.75');
   const batch = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send(SC));
-  const no = await h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A());
+  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
+  assert.strictEqual(fin.invoices.filter((i) => i.kind === 'Machine').length, 3);
+  // the signed sheets are needed before the hand-over to finance (14 Oct 2026)
+  const no = await h.api().post('/api/equipment/payroll/handovers').set(A()).send({ batch_ids: [batch.eq_batch_id], receiver_name: 'Finance' });
   assert.strictEqual(no.body.code, 'SCAN_MISSING');
   const sheets = await ok(h.api().get('/api/equipment/timesheets?month=2026-09').set(ACC()));
   for (const s of sheets) await ok(h.api().post(`/api/equipment/timesheets/${s.timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer(`signed ${s.sheet_code}`), 'scan.png'));
-  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
-  assert.strictEqual(fin.invoices.filter((i) => i.kind === 'Machine').length, 3);
+  const ho = await ok(h.api().post('/api/equipment/payroll/handovers').set(A()).send({ batch_ids: [batch.eq_batch_id], receiver_name: 'Finance' }));
+  assert.strictEqual(ho.lines.length, 1);
 });

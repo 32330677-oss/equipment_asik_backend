@@ -91,11 +91,11 @@ test('the Admin turns the offset on for a draft: a new version; the accountant c
   draft = v3;
 });
 
-test('a rate card is not edited under a draft: void the draft first', async () => {
+test('a rate card is edited under a draft (14 Oct 2026): the draft asks to be recalculated', async () => {
   const [card] = await ok(h.api().get(`/api/equipment/machines/${OT.equipment_id}/rate-cards`).set(ACC()));
-  const r = await h.api().put(`/api/equipment/rate-cards/${card.rate_card_id}`).set(ACC()).send({ overtime_rate: 45, reason: 'new price agreed' });
-  assert.strictEqual(r.body.code, 'RATE_CARD_IN_DRAFT');
-  assert.strictEqual(r.body.details.eq_batch_id, draft.eq_batch_id);
+  await ok(h.api().put(`/api/equipment/rate-cards/${card.rate_card_id}`).set(ACC()).send({ overtime_rate: 45, reason: 'new price agreed' }));
+  assert.strictEqual((await ok(h.api().get(`/api/equipment/payroll/batches/${draft.eq_batch_id}`).set(ACC()))).stale, true);
+  await ok(h.api().put(`/api/equipment/rate-cards/${card.rate_card_id}`).set(ACC()).send({ overtime_rate: 40, reason: 'back to the agreed price' }));
   await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/void`).set(ACC()).send({}));
 });
 

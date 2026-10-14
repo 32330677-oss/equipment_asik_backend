@@ -80,4 +80,36 @@ async function query(sql, params = []) {
   return rows;
 }
 
-module.exports = { resetDatabase, api, token, T, auth, closePool, query, PASSWORD };
+/** Issues a draft invoice batch (official numbers), as the Admin. Returns the batch detail. */
+async function issue(batchId, ack = true) {
+  const r = await api().patch(`/api/equipment/payroll/batches/${batchId}/finalize`).set(auth(T.admin())).send({ acknowledge_changes: ack });
+  if (r.status !== 200) throw new Error(`issue #${batchId}: ${r.status} ${JSON.stringify(r.body)}`);
+  return r.body.data;
+}
+
+/**
+ * Hands invoice batches over to finance (14 Oct 2026), as the Admin: from then on nobody changes what they cover.
+ * Returns the hand-over. The signed-sheet check is switched off for the call when `scan` is false (default).
+ */
+async function handOver(batchIds, { scan = false } = {}) {
+  if (!scan) {
+    await query("UPDATE settings SET setting_value = 'false' WHERE setting_key = 'eq_finalize_requires_scan'");
+    require('../services/settings').invalidate();
+  }
+  const r = await api().post('/api/equipment/payroll/handovers').set(auth(T.admin()))
+    .send({ batch_ids: [].concat(batchIds), receiver_name: 'Finance clerk' });
+  if (r.status !== 201) throw new Error(`hand-over ${batchIds}: ${r.status} ${JSON.stringify(r.body)}`);
+  return r.body.data;
+}
+
+/** The current (not superseded) batch of a version chain: an issued invoice brought up to date gets a new id. */
+async function currentBatch(batchId) {
+  let id = batchId;
+  for (;;) {
+    const [next] = await query('SELECT eq_batch_id FROM eq_payroll_batches WHERE supersedes_batch_id = ?', [id]);
+    if (!next) return id;
+    id = next.eq_batch_id;
+  }
+}
+
+module.exports = { resetDatabase, api, token, T, auth, closePool, query, PASSWORD, issue, handOver, currentBatch };

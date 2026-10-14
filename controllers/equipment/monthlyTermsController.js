@@ -2,14 +2,15 @@
 // month: the price of its card, divided by the working days of the calendar month. For one machine and one month the
 // office may type an exception (eq_monthly_terms): the AMOUNT of the month, the DAYS it is divided by and / or the HOURLY
 // PRICE used for deductions, offset and overtime. Kept on the machine and the month, not on a batch.
-// Locked while ANY active batch (draft or finalized) bills a day of that month for the machine: void the draft first
-// (or undo the Finalize); once finalized and kept, a difference goes through an official Correction.
+// 14 Oct 2026: changing the exception is refused only while an invoice handed over to finance (or withdrawn, for a
+// non-Admin) bills a day of that month; a draft or issued invoice follows the change (recalculated / brought up to date).
 const { pool, withTransaction } = require('../../config/db');
 const AppError = require('../../utils/AppError');
 const { v, validate } = require('../../utils/validate');
 const audit = require('../../services/audit');
 const settings = require('../../services/settings');
 const { businessNow, daysInMonth, monthOf } = require('../../utils/businessDate');
+const lock = require('../../services/equipment/eqLock');
 const { toDecimalString } = require('../../utils/money');
 const P = require('../../services/equipment/eqPayrollService');
 
@@ -27,13 +28,17 @@ function monthsBetween(start, end) {
 const firstDay = (m) => `${m}-01`;
 const lastDay = (m) => `${m}-${String(daysInMonth(m)).padStart(2, '0')}`;
 
-/** The active batch (draft or finalized) that bills a day of this month for this machine: { id, finalized } or null. */
+/**
+ * The invoice that bills a day of this month for this machine and stops the current user (handed over; withdrawn for a
+ * non-Admin): { id, finalized, state } or null. Draft and issued invoices do not stop the change.
+ */
 async function lockOf(conn, equipmentId, month) {
-  const [[b]] = await conn.execute(
-    `SELECT b.eq_batch_id, b.is_finalized FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id
-     WHERE md.equipment_id = ? AND md.day BETWEEN ? AND ? AND b.status IN ('Generated','Paid')
-     ORDER BY b.is_finalized DESC, b.eq_batch_id DESC LIMIT 1`, [equipmentId, firstDay(month), lastDay(month)]);
-  return b ? { id: b.eq_batch_id, finalized: Number(b.is_finalized) === 1 } : null;
+  const [rows] = await conn.execute(
+    `SELECT DISTINCT b.eq_batch_id, b.status, b.is_finalized FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id
+     WHERE md.equipment_id = ? AND md.day BETWEEN ? AND ? AND b.status IN ('Generated','HandedOver','Returned')
+     ORDER BY b.eq_batch_id DESC`, [equipmentId, firstDay(month), lastDay(month)]);
+  const b = rows.find((x) => lock.denies(x));
+  return b ? { id: b.eq_batch_id, finalized: true, state: lock.stateOf(b) } : null;
 }
 
 /** Monthly rate cards of these machines over [start, end]. */
@@ -91,7 +96,7 @@ async function termsRows(conn, { start, end, vendorId = null, equipmentIds = nul
         deployed_working_days: det ? det.deployed_working_days : null, holiday_days: det ? det.holiday_days : null,
         required_hours: det ? det.required_hours : null, billable_hours_so_far: det ? det.billable_hours : null,
         estimated_amount: estimate === null ? null : toDecimalString(estimate), already_billed: det && det.billed_before ? det.billed_before : null,
-        locked: Boolean(locked), locked_by_batch_id: locked ? locked.id : null, locked_by_finalized: locked ? locked.finalized : null,
+        locked: Boolean(locked), locked_by_batch_id: locked ? locked.id : null, locked_by_finalized: locked ? locked.finalized : null, locked_state: locked ? locked.state : null,
         set_by: t ? who[t.set_by_user_id] || null : null, set_at: t ? t.set_at : null, note: t ? t.note : null,
         typed_working_days: t ? t.working_days : null, typed_hourly_rate: t && t.hourly_rate !== null ? Number(t.hourly_rate) : null,
         typed_amount: t && t.monthly_amount !== null && t.monthly_amount !== undefined ? Number(t.monthly_amount) : null,
@@ -114,8 +119,8 @@ exports.list = async (req, res) => {
 /**
  * Set (or clear) the exception of one machine and month:
  *   { equipment_id, month, monthly_amount|null, working_days|null, hourly_rate|null, note? }
- * All null = a normal month again. Reason optional; the audit keeps before / after. 409 MONTHLY_TERMS_LOCKED while a
- * batch (draft or finalized) bills the month: void the draft first; a finalized one: undo its Finalize, or a Correction.
+ * All null = a normal month again. Reason optional; the audit keeps before / after. 409 MONTHLY_TERMS_LOCKED while an
+ * invoice handed over to finance bills the month (withdraw it first, or a debit / credit note).
  */
 exports.put = async (req, res) => {
   const body = req.body || {};
@@ -135,10 +140,8 @@ exports.put = async (req, res) => {
     if (!cards.length) throw new AppError(422, 'NOT_MONTHLY', 'This machine has no monthly rate card in that month.');
     const locked = await lockOf(conn, d.equipment_id, d.month);
     if (locked) {
-      throw AppError.conflict('MONTHLY_TERMS_LOCKED', locked.finalized
-        ? `Finalized batch #${locked.id} bills this month for this machine. Undo its Finalize (then void it) to change the exception, or settle the difference with an official Correction.`
-        : `Draft batch #${locked.id} bills this month for this machine. Void that draft first, change the exception, then generate again.`,
-      { eq_batch_id: locked.id, finalized: locked.finalized });
+      throw AppError.conflict('MONTHLY_TERMS_LOCKED', `Invoice batch #${locked.id} bills this month for this machine and is ${locked.state === 'returned' ? 'withdrawn from finance (the Admin changes it)' : 'handed over to finance'}. `
+        + 'Withdraw it from finance first, or make a debit / credit note.', { eq_batch_id: locked.id, finalized: true, state: locked.state });
     }
     const [[before]] = await conn.execute('SELECT * FROM eq_monthly_terms WHERE equipment_id = ? AND month = ? FOR UPDATE', [d.equipment_id, d.month]);
     if (days === null && hourly === null && amount === null) {

@@ -27,7 +27,6 @@ function hideOptions(v) {
   return new Set(list.map((x) => String(x).trim()).filter((x) => HIDE_KEYS.includes(x)));
 }
 const UNIT_TEXT = { trip: 'trip', t: 'ton', m3: 'm3', km: 'km', pc: 'piece', load: 'load' };
-const METHOD_TEXT = { BankTransfer: 'Bank transfer', Cheque: 'Cheque', Cash: 'Cash', Other: 'Other' };
 
 const n = (v) => Number(v || 0);
 const cents = (v) => Math.round(n(v) * 100);
@@ -71,10 +70,11 @@ function scopeText(b) {
 
 function statusText(b) {
   if (b.provisional) return 'PROVISIONAL';
-  if (b.status === 'Generated') return b.is_finalized ? 'Final' : 'Draft (not final)';
-  return b.status;
+  if (b.status === 'Generated') return b.is_finalized ? 'Issued' : 'Draft (not final)';
+  return { HandedOver: 'Handed over to finance', Returned: 'Withdrawn from finance', Voided: 'Cancelled', Replaced: 'Cancelled (re-issued)', Superseded: 'Old calculation' }[b.status] || b.status;
 }
-const isFinal = (b) => !b.provisional && b.is_finalized && (b.status === 'Generated' || b.status === 'Paid');
+// an invoice that stands (issued, handed over or withdrawn): printed as an invoice with its numbers
+const isFinal = (b) => !b.provisional && b.is_finalized && ['Generated', 'HandedOver', 'Returned'].includes(b.status);
 
 /** Right block of the header: document number (or DRAFT) + batch + currency. */
 function numberBlock(doc, b, no, cur, internal = false) {
@@ -89,7 +89,8 @@ function numberBlock(doc, b, no, cur, internal = false) {
     } else {
       P.text(doc, b.provisional ? 'PROVISIONAL - NO NUMBER' : 'DRAFT - NOT YET NUMBERED', xr - w, top + 2, { size: 7.5, bold: true, color: COLORS.red, width: w, align: 'right', lineBreak: false });
     }
-    P.text(doc, b.provisional ? 'Not an invoice batch' : `Batch #${b.eq_batch_id} | v${b.version_number}`, xr - w, top + 22, { size: 7, width: w, align: 'right', lineBreak: false });
+    // an issued invoice shows only its number (it may be brought up to date with the same number: no batch / version printed)
+    if (b.provisional || !isFinal(b)) P.text(doc, b.provisional ? 'Not an invoice batch' : `Draft #${b.eq_batch_id}`, xr - w, top + 22, { size: 7, width: w, align: 'right', lineBreak: false });
     P.text(doc, `Currency ${cur}`, xr - w, top + 32, { size: 7, width: w, align: 'right', lineBreak: false });
   };
 }
@@ -649,7 +650,8 @@ async function render(conn, model, opts, user) {
   }
   if (b.provisional && b.unapproved_rows) watermark(doc, 'PROVISIONAL - INCLUDES ROWS NOT APPROVED');
   else if (b.provisional) watermark(doc, 'PROVISIONAL - NOT AN INVOICE');
-  else if (b.status === 'Voided' || b.status === 'Superseded') watermark(doc, b.status.toUpperCase());
+  else if (b.status === 'Voided' || b.status === 'Replaced') watermark(doc, 'CANCELLED');
+  else if (b.status === 'Superseded') watermark(doc, 'OLD CALCULATION - NOT VALID');
   else if (!b.is_finalized) watermark(doc, 'DRAFT - NOT FINAL');
   const unapprovedNote = b.provisional && b.unapproved_rows ? ` | * ${b.unapproved_rows} attendance row(s) not approved yet` : '';
   P.footers(doc, `${ctx.company} | Equipment Flow | printed ${ctx.printedAt} by ${ctx.printedBy}${unapprovedNote}`);
@@ -784,124 +786,4 @@ async function batchXlsx(conn, detail) {
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
-// --------------------------------------------------------------- D6 payment voucher (أمر صرف)
-async function voucherPdf(conn, p, user) {
-  const company = await settings.getString('company_name');
-  const printedAt = businessNow().slice(0, 16);
-  const doc = P.createDoc({ info: { Title: `Payment voucher ${p.voucher_no}` } });
-  const cur = p.currency;
-  const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
-  let y = P.header(doc, {
-    title: 'PAYMENT VOUCHER', titleAr: 'أمر صرف', subtitle: company,
-    right: (xr, top) => {
-      P.text(doc, 'No.', xr - 190, top, { size: 7, color: COLORS.muted, width: 120, align: 'right', lineBreak: false });
-      P.text(doc, p.voucher_no, xr - 66, top, { size: 9, bold: true, color: COLORS.navy, width: 66, align: 'right', lineBreak: false });
-      P.text(doc, `Batch #${p.eq_batch_id} | v${p.version_number}`, xr - 190, top + 22, { size: 7, width: 190, align: 'right', lineBreak: false });
-      P.text(doc, `Currency ${cur}`, xr - 190, top + 32, { size: 7, width: 190, align: 'right', lineBreak: false });
-    },
-  });
-  y = P.infoGrid(doc, [
-    { label: 'Pay to (vendor)', labelAr: 'يصرف إلى', value: `${p.vendor_name}${p.vendor_code ? ` (${p.vendor_code})` : ''}` },
-    { label: 'Payment date', labelAr: 'تاريخ الدفع', value: fmt.date(String(p.paid_on).slice(0, 10)) },
-    { label: 'For invoice', labelAr: 'عن الفاتورة', value: p.invoice_no || '-' },
-    { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(p.start_date)} - ${fmt.date(p.end_date)}` },
-    { label: 'Method', labelAr: 'طريقة الدفع', value: METHOD_TEXT[p.method] || p.method },
-    { label: 'Reference', labelAr: 'المرجع', value: p.reference || '-' },
-    // an individual (no company) is identified by the ID card, a company by its tax number
-    p.vendor_type === 'Individual'
-      ? { label: 'National ID', labelAr: 'رقم الهوية', value: p.national_id || '-' }
-      : { label: 'Tax number', labelAr: 'الرقم الضريبي', value: p.tax_number || '-' },
-    { label: 'Recorded by', labelAr: 'نظم بواسطة', value: `${p.created_by} ${String(p.created_at).slice(0, 16)}` },
-  ], y, 4);
-  y += 6;
-  const row = (en, ar, val, opts = {}) => {
-    const h = opts.big ? 26 : 20;
-    if (opts.fill) doc.rect(L, y, W, h).fill(opts.fill); else doc.rect(L, y, W, h).lineWidth(0.5).strokeColor(COLORS.grid).stroke();
-    P.text(doc, en, L + 8, y, { size: opts.big ? 10 : 8.5, bold: opts.big, color: opts.color, width: W * 0.4, height: h, valign: 'middle', lineBreak: false });
-    P.text(doc, ar, L + W * 0.38, y, { size: opts.big ? 10 : 8.5, color: opts.arColor || opts.color || COLORS.muted, width: W * 0.3, height: h, valign: 'middle', align: 'right', lineBreak: false });
-    P.text(doc, val, L + W * 0.7, y, { size: opts.big ? 11 : 9, bold: true, color: opts.color, width: W * 0.3 - 8, height: h, valign: 'middle', align: 'right', lineBreak: false });
-    y += h;
-  };
-  row('Balance before this payment', 'الرصيد قبل الدفعة', `${money(p.balance_before, cur)} ${cur}`);
-  row(`AMOUNT PAID (${cur})`, 'المبلغ المدفوع', money(p.amount, cur), { big: true, fill: COLORS.navy, color: COLORS.white, arColor: '#E9DDBE' });
-  row('Balance after this payment', 'الرصيد المتبقي بعد الدفعة', `${money(p.balance_after, cur)} ${cur}`, { color: n(p.balance_after) > 0 ? COLORS.red : COLORS.green });
-  y += 6;
-  P.text(doc, `Amount in words: ${amountInWords(n(p.amount), cur)}`, L, y, { size: 8.5, width: W });
-  y = doc.y + 6;
-  if (p.note) { P.text(doc, `Note: ${p.note}`, L, y, { size: 8, color: COLORS.muted, width: W }); y = doc.y + 4; }
-  if (p.source === 'MarkPaid') { P.text(doc, 'Remaining balance of the invoice paid in full (Mark paid).', L, y, { size: 7.5, color: COLORS.muted, width: W }); y = doc.y + 4; }
-  P.text(doc, 'The original invoice is not changed by this payment; the statement of account of the batch shows every payment and the balance.', L, y, { size: 7, color: COLORS.muted, width: W });
-  y = doc.y + 4;
-  if (p.status === 'Reversed') {
-    P.text(doc, `REVERSED on ${String(p.reversed_at).slice(0, 16)} by ${p.reversed_by || '-'}: ${p.reverse_reason || ''}`, L, y, { size: 8.5, bold: true, color: COLORS.red, width: W });
-    y = doc.y + 4;
-  }
-  signatureRow(doc, y + 14, [['Prepared by (Accountant)', 'إعداد: المحاسب'], ['Approved by', 'اعتماد'], ['Received by (vendor)', 'المستلم: الجهة المؤجرة']]);
-  if (p.status === 'Reversed') watermark(doc, 'REVERSED');
-  P.footers(doc, `${company} | Equipment Flow | printed ${printedAt} by ${user.full_name}`);
-  return { buffer: await P.toBuffer(doc), fileName: `${p.voucher_no}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
-}
-
-// --------------------------------------------------------------- D7 statement of account of one vendor on a batch
-const PAY_STATE_TEXT = { Unpaid: 'Not paid yet', PartiallyPaid: 'Partly paid', Paid: 'Paid in full', CarriedForward: 'Balance carried to a later batch', NothingDue: 'Nothing due' };
-
-async function accountStatementPdf(conn, { batch: b, vendor: x }, user) {
-  const company = await settings.getString('company_name');
-  const printedAt = businessNow().slice(0, 16);
-  const doc = P.createDoc({ info: { Title: `Statement of account ${x.invoice_no || ''}` } });
-  const cur = b.currency;
-  const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
-  let y = P.header(doc, {
-    title: 'STATEMENT OF ACCOUNT', titleAr: 'كشف حساب الفاتورة', subtitle: company,
-    right: (xr, top) => {
-      P.text(doc, 'Invoice', xr - 190, top, { size: 7, color: COLORS.muted, width: 120, align: 'right', lineBreak: false });
-      P.text(doc, x.invoice_no || '-', xr - 66, top, { size: 9, bold: true, color: COLORS.navy, width: 66, align: 'right', lineBreak: false });
-      P.text(doc, `Batch #${b.eq_batch_id} | v${b.version_number}`, xr - 190, top + 22, { size: 7, width: 190, align: 'right', lineBreak: false });
-      P.text(doc, `Currency ${cur}`, xr - 190, top + 32, { size: 7, width: 190, align: 'right', lineBreak: false });
-    },
-  });
-  y = P.infoGrid(doc, [
-    { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${x.vendor_name}${x.vendor_code ? ` (${x.vendor_code})` : ''}` },
-    { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
-    { label: 'Status', labelAr: 'الحالة', value: PAY_STATE_TEXT[x.payment_status] || x.payment_status },
-    { label: 'Printed', labelAr: 'تاريخ الطباعة', value: printedAt },
-  ], y, 4);
-  const rows = [{ d: fmt.date(String(b.finalized_at || '').slice(0, 10)), what: `Invoice ${x.invoice_no || ''} (this period)`, ref: '', debit: money(x.invoice_amount, cur), credit: '' }];
-  for (const c of x.carried_in_detail) {
-    const what = c.kind === 'opening'
-      ? `Opening balance (before the system)${c.start_date && c.end_date ? ` ${fmt.date(c.start_date)} - ${fmt.date(c.end_date)}` : ''}${c.equipment_code ? ` | ${c.equipment_code}` : ''}: ${c.description || ''}`
-      : `Unpaid balance brought from batch #${c.from_batch_id} (${fmt.date(c.start_date)} - ${fmt.date(c.end_date)})`;
-    rows.push({ d: c.kind === 'opening' ? fmt.date(c.as_of_date) : '', what, ref: c.invoice_no || '', debit: money(c.amount, cur), credit: '' });
-  }
-  for (const p of x.payments) {
-    rows.push({ d: fmt.date(p.paid_on), what: `Payment ${METHOD_TEXT[p.method] || p.method}${p.status === 'Reversed' ? ' - REVERSED' : ''}${p.note ? ` - ${p.note}` : ''}`, ref: `${p.voucher_no}${p.reference ? ` / ${p.reference}` : ''}`,
-      debit: '', credit: p.status === 'Reversed' ? `(${money(p.amount, cur)})` : money(p.amount, cur), _color: p.status === 'Reversed' ? COLORS.light : undefined });
-  }
-  for (const c of x.carried_out_detail) {
-    rows.push({ d: '', what: `Balance carried to batch #${c.to_batch_id} (${fmt.date(c.start_date)} - ${fmt.date(c.end_date)})`, ref: '', debit: '', credit: money(c.amount, cur), _color: COLORS.amber });
-  }
-  rows.push({ what: 'Totals', debit: money(x.total_due, cur), credit: money(n(x.paid) + n(x.carried_out), cur), _bold: true, _fill: COLORS.soft });
-  y = sectionTitle(doc, y, 'Movements', 'الحركات');
-  y = P.table(doc, {
-    y, rows, rowHeight: 16, headHeight: 24, fontSize: 7.4, onNewPage: () => doc.page.margins.top + 4,
-    columns: [
-      { key: 'd', en: 'Date', ar: 'التاريخ', width: 58 }, { key: 'what', en: 'Description', ar: 'البيان', width: 239, align: 'left' },
-      { key: 'ref', en: 'Voucher / ref.', ar: 'رقم السند', width: 100 }, { key: 'debit', en: 'Due', ar: 'مستحق', width: 75, align: 'right' },
-      { key: 'credit', en: 'Paid / moved', ar: 'مدفوع', width: 75, align: 'right' },
-    ],
-  }) + 10;
-  const bw = 290; const bx = L + W - bw;
-  doc.rect(bx, y, bw, 24).fill(n(x.balance) > 0 ? COLORS.navy : COLORS.green);
-  P.text(doc, `BALANCE STILL DUE (${cur})`, bx + 6, y, { size: 9.5, bold: true, color: COLORS.white, width: 160, height: 24, valign: 'middle', lineBreak: false });
-  P.text(doc, money(Math.max(0, n(x.balance)), cur), bx + 150, y, { size: 10, bold: true, color: COLORS.white, width: bw - 156, height: 24, valign: 'middle', align: 'right', lineBreak: false });
-  y += 30;
-  P.text(doc, amountInWords(Math.max(0, n(x.balance)), cur), L, y, { size: 7.5, color: COLORS.muted, width: W, align: 'right' });
-  y = doc.y + 6;
-  P.text(doc, 'This statement does not replace the invoice: the invoice keeps its number and amount; payments are separate vouchers.', L, y, { size: 7, color: COLORS.muted, width: W });
-  signatureRow(doc, doc.y + 12, [['Prepared by (Finance)', 'إعداد: الإدارة المالية'], ['Approved by', 'اعتماد'], ['Acknowledged by the lessor', 'إقرار الجهة المؤجرة']]);
-  P.footers(doc, `${company} | Equipment Flow | printed ${printedAt} by ${user.full_name}`);
-  return { buffer: await P.toBuffer(doc), fileName: `statement-${x.invoice_no || `batch-${b.eq_batch_id}-vendor-${x.vendor_id}`}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
-}
-
-// invoice register sheet + fuel difference days are added by batchXlsx below
-module.exports = { batchPdf, provisionalPdf, batchXlsx, amountInWords, voucherPdf, accountStatementPdf, hideOptions, HIDE_KEYS, monthlyResult, monthlyDaysText };
+module.exports = { batchPdf, provisionalPdf, batchXlsx, amountInWords, lineDesc, LINE_LABEL, hideOptions, HIDE_KEYS, monthlyResult, monthlyDaysText };

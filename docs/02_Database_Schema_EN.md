@@ -1128,3 +1128,30 @@ Money still owed to a vendor from **before the system was used** (no batch, no i
 | `eq_payment_carryovers` | `from_batch_id` now NULL-able + new `opening_balance_id`; exactly one of the two is set (`chk_eqco_source`) |
 
 Rules: an open opening balance is offered by "Add previous balances" on New payroll when its balance date is before the batch start and the vendor is in the batch (same currency). Once carried it is paid in that batch with normal payment vouchers; the vendor invoice of the new period is not changed (the statement of account shows it on its own line "Opening balance (before the system) …"). Voiding the batch releases it (open again); a new version takes it along. It can be changed or cancelled only while it is not carried into an active batch.
+
+## 5.8 Migration 022 — invoice life, hand-over to finance, debit / credit notes (14 Oct 2026)
+
+The app records attendance and issues invoices; **it records no payment**. Migration
+`022_invoice_lifecycle.sql` (rollback: `rollback/022_invoice_lifecycle.down.sql`, only before new data exists):
+
+- **Dropped**: `eq_payments`, `eq_payment_carryovers`, `eq_opening_balances` (no data existed). §5.6 (payments) and
+  §5.7 (opening balances) are history only.
+- **`eq_payroll_batches.status`** = `Generated` (draft when `is_finalized = 0`, issued when 1), `HandedOver`, `Returned`,
+  `Superseded`, `Voided` (cancelled), `Replaced` (re-issued with new numbers); `Paid` rows became `Generated`. New columns
+  `handed_over_at`, `handover_id`, `returned_at`, `withdrawal_id`, `replaced_by_batch_id`.
+- **`eq_invoice_coverage`** (`eq_batch_id`, `equipment_id`, `site_id` NULL = every site, `start_date`, `end_date`): the
+  period of each machine an invoice covers. Two ACTIVE invoices (Generated / HandedOver / Returned) never overlap for a
+  machine; the lock of §4.7 is now "a date inside the coverage of an invoice that stops the user" (handed over:
+  everybody; returned: everybody but the Admin; issued: the Supervisor).
+- **`eq_notes`**: debit / credit notes (`note_no` DN- / CN-, unique, given when issued), `kind`, vendor, optional
+  machine, currency, `amount > 0`, `reason`, `note_date`, optional period, optional `ref_batch_id` (the invoice it belongs
+  to, shown in the app, never printed), `status` Draft / Issued / HandedOver / Returned / Cancelled.
+- **`eq_handovers`** (HO-…) + **`eq_handover_items`** (one line per vendor invoice or note, signed amount; credit notes
+  negative): what was handed to finance, who received it, when.
+- **`eq_withdrawals`** (WD-…): signed acknowledgement that an invoice / note came back from finance: reason, finance
+  person, date, `was_paid`, `paid_amount`.
+- `eq_invoice_counters.kind` adds `Handover` and `Withdrawal`.
+- Settings: `eq_paid_undo_hours` and `eq_finalize_undo_hours` removed; `payroll_finalize_admin_only` = `false` (the
+  Accountant issues too); `eq_finalize_requires_scan` now applies at the hand-over.
+- Append-only for the app user (database/grants.js): `eq_invoice_coverage`, `eq_handovers`, `eq_handover_items`,
+  `eq_withdrawals` added.

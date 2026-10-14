@@ -19,12 +19,12 @@ exports.listPrices = async (req, res) => {
   res.json({ status: 'success', data: rows.map((r) => ({ ...r, effective_to: r.next_from ? addDays(r.next_from, -1) : null })) });
 };
 
-/** A price is "used" when a finalized batch of that currency covers dates on or after it and has fuel-difference lines. */
+/** A price is "used" when an invoice handed over to finance (that currency) covers dates on or after it with fuel-difference lines. */
 async function priceUsedBy(conn, p) {
   const [[r]] = await conn.execute(
     `SELECT b.eq_batch_id FROM eq_payroll_batches b JOIN eq_payroll_items i ON i.eq_batch_id = b.eq_batch_id
      JOIN eq_payroll_lines l ON l.eq_item_id = i.eq_item_id AND l.line_type = 'FuelPriceDifference'
-     WHERE b.currency = ? AND b.is_finalized = 1 AND b.status IN ('Generated','Paid') AND b.end_date >= ? LIMIT 1`, [p.currency, p.effective_from]);
+     WHERE b.currency = ? AND b.status = 'HandedOver' AND b.end_date >= ? LIMIT 1`, [p.currency, p.effective_from]);
   return r ? r.eq_batch_id : null;
 }
 
@@ -37,7 +37,7 @@ exports.createPrice = async (req, res) => {
     const [[dup]] = await conn.execute('SELECT fuel_price_id FROM eq_fuel_prices WHERE currency = ? AND effective_from = ?', [d.currency, d.effective_from]);
     if (dup) throw AppError.conflict('FUEL_PRICE_EXISTS', 'There is already a price from this date. Delete it first or use another date.');
     const used = await priceUsedBy(conn, d);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `Finalized invoice batch #${used} already used fuel prices after this date.`);
+    if (used) throw AppError.conflict('INVOICE_LOCKED', `Invoice batch #${used}, handed over to finance, already used fuel prices after this date. Withdraw it first, or make a debit / credit note.`);
     const [r] = await conn.execute(
       'INSERT INTO eq_fuel_prices (currency, effective_from, price_per_liter, note, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
       [d.currency, d.effective_from, d.price_per_liter, d.note || null, req.user.user_id]);
@@ -64,7 +64,7 @@ exports.deletePrice = async (req, res) => {
     const [[p]] = await conn.execute('SELECT * FROM eq_fuel_prices WHERE fuel_price_id = ? FOR UPDATE', [id]);
     if (!p) throw AppError.notFound('Fuel price');
     const used = await priceUsedBy(conn, p);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This price is used by finalized invoice batch #${used}; it cannot be deleted. A wrong price already paid is fixed by an official Correction.`);
+    if (used) throw AppError.conflict('INVOICE_LOCKED', `This price is used by invoice batch #${used}, handed over to finance; it cannot be deleted. Withdraw the invoice first, or make a debit / credit note.`);
     const draft = await priceInDraftBatch(conn, p);
     if (draft && (!reason || reason.trim().length < 5)) {
       throw AppError.validation({ reason: `draft invoice batch #${draft} uses fuel prices from this date: say why this price is deleted (at least 5 characters)` });
@@ -85,12 +85,12 @@ exports.listTerms = async (req, res) => {
   res.json({ status: 'success', data: rows });
 };
 
-/** Last date already paid in a finalized batch with a fuel difference for this machine. */
+/** Last date with a fuel difference in an invoice handed over to finance for this machine. */
 async function lastFinalizedFuelDay(conn, equipmentId) {
   const [[r]] = await conn.execute(
     `SELECT MAX(s.record_date) AS d FROM eq_payroll_attendance_snapshot s JOIN eq_payroll_items i ON i.eq_item_id = s.eq_item_id
      JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-     WHERE i.equipment_id = ? AND b.is_finalized = 1 AND b.status IN ('Generated','Paid')
+     WHERE i.equipment_id = ? AND b.status = 'HandedOver'
        AND EXISTS (SELECT 1 FROM eq_payroll_lines l WHERE l.eq_item_id = i.eq_item_id AND l.line_type = 'FuelPriceDifference')`, [equipmentId]);
   return r && r.d ? String(r.d) : null;
 }
@@ -105,7 +105,7 @@ exports.createTerms = async (req, res) => {
   const row = await withTransaction(async (conn) => {
     await C.loadMachine(conn, equipmentId, true);
     const last = await lastFinalizedFuelDay(conn, equipmentId);
-    if (last && d.effective_from <= last) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `The fuel difference is already finalized up to ${last}. New terms must start after it.`);
+    if (last && d.effective_from <= last) throw AppError.conflict('INVOICE_LOCKED', `The fuel difference is handed over to finance up to ${last}. New terms must start after it.`);
     const [later] = await conn.execute('SELECT fuel_terms_id FROM eq_fuel_terms WHERE equipment_id = ? AND effective_from >= ?', [equipmentId, d.effective_from]);
     if (later.length) throw AppError.conflict('FUEL_TERMS_OVERLAP', 'Terms already start on or after this date. Choose a later date.');
     const [open] = await conn.execute(
@@ -134,7 +134,7 @@ exports.endTerms = async (req, res) => {
     if (effective_to < addDays(t.effective_from, -1)) throw AppError.validation({ effective_to: 'cannot be before the start date' });
     if (t.effective_to && effective_to > t.effective_to) throw AppError.validation({ effective_to: 'can only shorten the terms' });
     const last = await lastFinalizedFuelDay(conn, t.equipment_id);
-    if (last && effective_to < last) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `The fuel difference is already finalized up to ${last}.`);
+    if (last && effective_to < last) throw AppError.conflict('INVOICE_LOCKED', `The fuel difference is handed over to finance up to ${last}.`);
     await conn.execute('UPDATE eq_fuel_terms SET effective_to = ? WHERE fuel_terms_id = ?', [effective_to, id]);
     await audit.log(conn, { table: 'eq_fuel_terms', id, action: 'end', oldValues: { effective_to: t.effective_to }, newValues: { effective_to }, ...audit.ctx(req) });
     const [[out]] = await conn.execute('SELECT * FROM eq_fuel_terms WHERE fuel_terms_id = ?', [id]);

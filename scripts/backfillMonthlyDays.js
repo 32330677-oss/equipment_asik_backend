@@ -16,7 +16,7 @@ async function backfill(conn, { dry = false, log = () => {} } = {}) {
     `SELECT i.eq_item_id, i.eq_batch_id, i.equipment_id, i.site_id, i.rate_card_id, b.start_date, b.end_date, rc.effective_from, rc.effective_to
      FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
      JOIN eq_rate_cards rc ON rc.rate_card_id = i.rate_card_id
-     WHERE i.billing_mode = 'Monthly' AND b.status IN ('Generated','Paid')
+     WHERE i.billing_mode = 'Monthly' AND b.status IN ('Generated','HandedOver','Returned')
      ORDER BY b.eq_batch_id, i.eq_item_id`);
   let added = 0; let seen = 0; let skipped = 0;
   for (const it of items) {
@@ -36,7 +36,7 @@ async function backfill(conn, { dry = false, log = () => {} } = {}) {
       // one batch per machine-day: a day another active batch already holds is never taken twice
       const [[taken]] = await conn.query(
         `SELECT COUNT(*) AS n FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id
-         WHERE md.equipment_id = ? AND md.day = ? AND md.eq_batch_id <> ? AND b.status IN ('Generated','Paid')`, [it.equipment_id, d, it.eq_batch_id]);
+         WHERE md.equipment_id = ? AND md.day = ? AND md.eq_batch_id <> ? AND b.status IN ('Generated','HandedOver','Returned')`, [it.equipment_id, d, it.eq_batch_id]);
       if (Number(taken.n) > 0) continue;
       seen += 1;
       if (dry) continue;

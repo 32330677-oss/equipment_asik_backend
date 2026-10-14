@@ -1,4 +1,4 @@
-// P7 — two shifts per machine, monthly base billed once, fuel price difference, scan before finalize, invoice numbers.
+// P7 — two shifts per machine, monthly base billed once, fuel price difference, invoice numbers, scan before the hand-over.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const QRCode = require('qrcode');
@@ -65,14 +65,9 @@ test('fuel price difference: official price - base, x L/h x work hours; blocker 
   assert.strictEqual(batch.items[0].rate_snapshot.labels.vendor_name, 'Al-Bunyan Heavy Equipment');
 });
 
-test('finalize needs the signed sheet uploaded by the accountant; then invoice numbers are issued', async () => {
-  const no = await h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A());
-  assert.strictEqual(no.body.code, 'SCAN_MISSING');
-  const accFin = await h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(ACC());
-  assert.strictEqual(accFin.status, 403); // Admin finalizes
-  const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-10&equipment_id=${F.exc.equipment_id}`).set(ACC()));
-  await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
-  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
+test('issue gives the invoice numbers; the hand-over to finance needs the signed sheet uploaded', async () => {
+  // 14 Oct 2026: the accountant issues too; the signed sheet is checked at the hand-over
+  const fin = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(ACC()).send({ acknowledge_changes: true }));
   const nos = fin.invoices.map((i) => i.invoice_no).sort();
   assert.deepStrictEqual(nos, ['FD-2026-00001', 'MI-2026-00001', 'VI-2026-00001']);
   assert.strictEqual(fin.items[0].fuel_invoice_no, 'FD-2026-00001');
@@ -84,14 +79,26 @@ test('finalize needs the signed sheet uploaded by the accountant; then invoice n
   }
   const x = await bin(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}/export.xlsx`).set(ACC()));
   assert.strictEqual(x.status, 200);
+  const cert = await bin(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}/certificate.xlsx`).set(ACC()));
+  assert.strictEqual(cert.status, 200);
+  assert.strictEqual(cert.body.slice(0, 2).toString(), 'PK', 'an xlsx file');
+  const no = await h.api().post('/api/equipment/payroll/handovers').set(A()).send({ batch_ids: [batch.eq_batch_id], receiver_name: 'Finance' });
+  assert.strictEqual(no.body.code, 'SCAN_MISSING');
+  const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-10&equipment_id=${F.exc.equipment_id}`).set(ACC()));
+  await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
+  const ho = await ok(h.api().post('/api/equipment/payroll/handovers').set(A()).send({ batch_ids: [batch.eq_batch_id], receiver_name: 'Finance' }));
+  assert.strictEqual(ho.handover_no, 'HO-2026-00001');
+  assert.deepStrictEqual(ho.lines.map((l) => l.doc_no), ['VI-2026-00001']);
+  const sheet = await bin(h.api().get(`/api/equipment/payroll/handovers/${ho.handover_id}/pdf`).set(ACC()));
+  assert.strictEqual(sheet.body.slice(0, 4).toString(), '%PDF');
 });
 
-test('used fuel terms and prices cannot be rewritten', async () => {
+test('fuel terms and prices used by an invoice handed over to finance cannot be rewritten', async () => {
   const t = await h.api().post(`/api/equipment/machines/${F.exc.equipment_id}/fuel-terms`).set(A()).send({ effective_from: '2026-10-10', base_price_per_liter: 1.1, liters_per_hour: 2 });
-  assert.strictEqual(t.body.code, 'PAYROLL_PERIOD_FINALIZED');
+  assert.strictEqual(t.body.code, 'INVOICE_LOCKED');
   const prices = await ok(h.api().get('/api/equipment/fuel-prices').set(ACC()));
   const del = await h.api().delete(`/api/equipment/fuel-prices/${prices[0].fuel_price_id}`).set(A());
-  assert.strictEqual(del.body.code, 'PAYROLL_PERIOD_FINALIZED');
+  assert.strictEqual(del.body.code, 'INVOICE_LOCKED');
   await ok(h.api().post(`/api/equipment/machines/${F.exc.equipment_id}/fuel-terms`).set(A()).send({ effective_from: '2026-11-01', base_price_per_liter: 1.2, liters_per_hour: 2.5 }));
   const terms = await ok(h.api().get(`/api/equipment/machines/${F.exc.equipment_id}/fuel-terms`).set(A()));
   assert.strictEqual(terms.length, 2);

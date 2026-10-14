@@ -48,10 +48,10 @@ test('fuel receipt: versions with reason', async () => {
 });
 
 test('append-only tables for the app user', () => {
-  for (const t of ['audit_logs', 'eq_invoices', 'eq_invoice_cancellations', 'eq_correction_events', 'eq_file_versions']) assert.ok(APPEND_ONLY.includes(t), t);
+  for (const t of ['audit_logs', 'eq_invoices', 'eq_invoice_cancellations', 'eq_correction_events', 'eq_file_versions', 'eq_invoice_coverage', 'eq_handovers', 'eq_handover_items', 'eq_withdrawals']) assert.ok(APPEND_ONLY.includes(t), t);
 });
 
-test('an accountant cannot void or replace a finalized batch alone: the Admin approves or rejects the request', async () => {
+test('an issued invoice: the accountant cannot cancel it or hand it over; the Admin cancels it with a reason, numbers kept as cancelled', async () => {
   const QRCode = require('qrcode');
   const { S8 } = require('./fixtures');
   const r = await ok(h.api().post('/api/equipment/attendance/check-in').set(S8()).send({ equipment_id: F.exc.equipment_id, site_id: 8, check_in_time: '2026-11-04 07:00' }));
@@ -61,24 +61,17 @@ test('an accountant cannot void or replace a finalized batch alone: the Admin ap
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-11-01', end_date: '2026-11-15', equipment_id: F.exc.equipment_id }));
   const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-11&equipment_id=${F.exc.equipment_id}`).set(ACC()));
   await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
+  // 14 Oct 2026: the accountant issues too (setting payroll_finalize_admin_only = false)
+  const issued = await ok(h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/finalize`).set(ACC()).send({ acknowledge_changes: true }));
+  assert.strictEqual(issued.state, 'issued');
+  assert.deepStrictEqual(issued.actions.cancel, false, 'the accountant sees no Cancel');
 
   const asked = await h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/void`).set(ACC()).send({ reason: 'wrong period' });
-  assert.strictEqual(asked.status, 202);
-  assert.strictEqual(asked.body.data.status, 'Generated', 'nothing changes before the Admin decides');
-  assert.strictEqual(asked.body.data.pending_request.action, 'void');
-  const again = await h.api().post(`/api/equipment/payroll/batches/${b.eq_batch_id}/supersede`).set(ACC()).send({ reason: 'again' });
-  assert.strictEqual(again.body.code, 'REQUEST_PENDING');
-  const rej = await ok(h.api().patch(`/api/equipment/payroll/requests/${asked.body.data.pending_request.request_id}/reject`).set(A()).send({ note: 'period is right' }));
-  assert.strictEqual(rej.status, 'Generated');
-  assert.strictEqual(rej.pending_request, null);
-
-  const sup = await h.api().post(`/api/equipment/payroll/batches/${b.eq_batch_id}/supersede`).set(ACC()).send({ reason: 'rate fixed' });
-  assert.strictEqual(sup.status, 202);
-  const notAcc = await h.api().patch(`/api/equipment/payroll/requests/${sup.body.data.pending_request.request_id}/approve`).set(ACC()).send({});
-  assert.strictEqual(notAcc.status, 403);
-  const v2 = await ok(h.api().patch(`/api/equipment/payroll/requests/${sup.body.data.pending_request.request_id}/approve`).set(A()).send({ note: 'ok' }));
-  assert.strictEqual(v2.version_number, 2);
-  const old = await ok(h.api().get(`/api/equipment/payroll/batches/${b.eq_batch_id}`).set(ACC()));
-  assert.strictEqual(old.status, 'Superseded');
+  assert.strictEqual(asked.status, 403);
+  assert.strictEqual(asked.body.code, 'ADMIN_ONLY');
+  assert.strictEqual((await h.api().post('/api/equipment/payroll/handovers').set(ACC()).send({ batch_ids: [b.eq_batch_id], receiver_name: 'x' })).status, 403);
+  assert.strictEqual((await h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/void`).set(A()).send({})).body.code, 'VALIDATION_ERROR', 'a reason is required');
+  const v = await ok(h.api().patch(`/api/equipment/payroll/batches/${b.eq_batch_id}/void`).set(A()).send({ reason: 'wrong period' }));
+  assert.strictEqual(v.state, 'cancelled');
+  assert.ok(v.invoices.length && v.invoices.every((i) => i.cancelled), 'the numbers stay, cancelled, never reused');
 });

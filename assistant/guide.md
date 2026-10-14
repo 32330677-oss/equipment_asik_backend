@@ -72,10 +72,10 @@ related: first-setup-order, create-user
 
 The supervisor records on the phone, the accountant prepares prices and invoices, the Admin approves and closes.
 
-- **Admin**: users, sites, supervisors, settings, vendor contracts; approves or rejects attendance; reopens closed sheets; decides extra hours on monthly machines; approves the accountant's requests.
-- **Accountant**: vendors, machines, rate cards, deployments, fuel, adjustments, paper sheets, invoice batches.
+- **Admin**: users, sites, supervisors, settings, vendor contracts; approves or rejects attendance; reopens closed sheets; decides extra hours on monthly machines; hands invoices over to finance, withdraws them, cancels them, re-issues them and issues debit / credit notes.
+- **Accountant**: vendors, machines, rate cards, deployments, fuel, adjustments, paper sheets; creates, recalculates and issues invoices; prepares debit / credit notes.
 - **Supervisor**: records the machines of his own sites only. He never sees a price or an amount.
-- By default only the Admin may **Finalize** and **Mark paid** (setting "Only Admin can finalize / mark paid").
+- The app records no payment: finance pays outside it. Setting "Only Admin can issue invoices" stops the accountant from issuing.
 
 ## First-time setup, in order
 id: first-setup-order
@@ -178,7 +178,7 @@ id: change-setting
 roles: Admin
 screens: settings
 open: settings
-keywords: settings configuration weekly day off friday currency tolerance finalize admin only option
+keywords: settings configuration weekly day off friday currency tolerance issue admin only option
 related: who-does-what, audit-log
 
 Settings change how the whole system works. Settings that change amounts or permissions ask for a reason.
@@ -188,8 +188,8 @@ Settings change how the whole system works. Settings that change amounts or perm
 3. If asked, write the **Reason** (kept in the audit log) and save.
 
 - **Weekly day off (monthly machines)**: usually Friday.
-- **Only Admin can finalize / mark paid**: on by default.
-- **Hours to undo "Finalize"**: how long a finalized batch can go back to a draft.
+- **Only Admin can issue invoices**: off by default (the accountant issues too).
+- **Hand over to finance only with the signed sheets uploaded**: on by default.
 
 ## See who changed what (audit log)
 id: audit-log
@@ -210,7 +210,7 @@ roles: Admin, Accountant
 screens: vendors
 open: vendors
 keywords: vendor supplier company rental company new vendor create add owner
-related: add-contract, add-machine, opening-balance
+related: add-contract, add-machine, debit-credit-note
 
 A vendor is the company (or person) that rents machines to us.
 
@@ -233,20 +233,6 @@ The contract gives the vendor's currency. Only the Admin creates or changes it.
 3. Save, then **Upload document** to attach the signed contract (PDF or photo).
 
 Note: Uploading again does not delete the old file: it becomes a new version and asks for a reason.
-
-## Record an opening balance (money owed from before the system)
-id: opening-balance
-roles: Admin, Accountant
-screens: vendors
-open: vendors
-keywords: opening balance old debt previous balance owed before system old invoice carried
-related: create-invoice-batch, vendor-statement
-
-Money we already owed a vendor before using the system. It is added to the vendor's next invoice batch.
-
-1. Open **Vendors** and open the vendor.
-2. Under **Opening balances (before the system)** tap **Add opening balance**.
-3. Fill the **Balance date**, the amount still owed and the old invoice number, then save.
 
 ## Add a machine
 id: add-machine
@@ -293,14 +279,14 @@ open: machines
 keywords: change price new price increase decrease rate change from date revise rate card
 related: create-rate-card, test-price
 
-Never edit a card that was already paid: change it from a date instead.
+Never edit a card already used by an invoice: change it from a date instead.
 
 1. Open **Machines**, open the machine, find the current card under **Rate cards**.
 2. Tap **Change from a date**, set the date the new price starts, and the new values.
 3. Write the reason and save. The old card ends the day before; old invoices keep their prices.
 
 - **Close on a date**: the machine stops being paid by this card.
-- A card used by a draft batch cannot change: void the draft first.
+- A draft or an issued invoice follows the change (the issued one keeps its number). A card used by an invoice handed over to finance cannot change.
 
 ## Test a price before saving
 id: test-price
@@ -389,7 +375,7 @@ Some machines are paid per unit (trip, ton, cubic metre) from delivery notes.
 
 1. Set the prices: **Machines** → open the machine → **DNR prices (per unit)** → **New DNR price**.
 2. Record each note: **Delivery notes (DNR)** → **New delivery note**: machine, site, **Price item**, **Quantity**, number.
-3. The notes are billed in the next invoice batch of the period.
+3. The notes are billed in the next invoice of the period.
 
 Tip: A wrong note is fixed with **Correct** or **Cancel the note** (it is kept but never paid).
 
@@ -675,16 +661,17 @@ roles: Admin, Accountant
 screens: attendance-review
 open: attendance-review
 keywords: edit correct fix change row times status operator meter after approval purple
-related: official-correction, void-attendance-row, approve-attendance
+related: issued-invoice-changes, void-attendance-row, approve-attendance
 
-The office can fix a row directly while it is not inside a finalized invoice.
+The office can fix a row directly while its invoice is not handed over to finance.
 
 1. In **Attendance review**, open the row and tap **Edit**.
 2. Change the day status, times, pauses, meter, work done or remarks.
-3. An approved row needs a reason. It stays Approved and is marked "edited after approval" (purple in the table).
+3. An approved row stays Approved and is marked "edited after approval" (purple in the table).
 
-- A draft batch over that day becomes stale and must be recalculated.
-- If the day is in a finalized batch, **Edit** is replaced by **Official correction**.
+- A draft invoice over that day asks to be recalculated.
+- An issued invoice is brought up to date by itself, with the same number.
+- If the invoice is handed over to finance, the row is locked: the Admin withdraws the invoice first, or makes a debit / credit note.
 
 ## Void a row that should not exist
 id: void-attendance-row
@@ -722,13 +709,13 @@ roles: Admin, Accountant
 screens: attendance-review
 open: attendance-review
 keywords: change request supervisor asked change requests from supervisors apply request
-related: ask-office-change, official-correction
+related: ask-office-change, issued-invoice-changes
 
 Supervisors ask for changes to approved rows. The Admin or the accountant applies or rejects them.
 
 1. In **Attendance review**, tap **Change requests**.
 2. Open the request, compare the values, then **Apply** or **Reject the request**.
-3. If the day is already in a finalized batch, it becomes an official correction.
+3. If the day is in an invoice handed over to finance, it cannot be applied: withdraw the invoice first, or make a debit / credit note.
 
 ## Live board
 id: live-board
@@ -773,7 +760,7 @@ Fuel we gave to a vendor's machine, from the receipt.
 2. Choose the machine and site, the date, the **Litres (from the receipt)**, and the price if you know it.
 3. Save, then upload a photo or PDF of the receipt.
 
-Note: A date inside a finalized period is refused: use a date in an open month, or an official correction.
+Note: A date inside an invoice handed over to finance is refused: use another date, or a debit / credit note.
 
 ## Price the fuel issues
 id: price-fuel
@@ -803,7 +790,7 @@ An amount added to or deducted from a vendor's invoice: mobilization, penalty, d
 1. Open **Fuel & adjustments** → **Adjustments** and tap **New adjustment**.
 2. Choose the machine, the type (Mobilization, Penalty, Damage, Bonus...) and the amount.
 3. **Add to vendor** pays more; **Deduct from vendor** pays less.
-4. The date decides which month it is paid in. A date in a finalized month is refused.
+4. The date decides which invoice includes it. A date inside an invoice handed over to finance is refused.
 
 ## Upload the signed monthly sheet
 id: upload-signed-sheet
@@ -812,9 +799,9 @@ screens: paper-sheets
 open: paper-sheets
 popular: Accountant
 keywords: upload scan signed sheet paper timesheet photo pdf monthly sheet signature
-related: reconcile-sheet, finalize-batch
+related: reconcile-sheet, hand-over-finance
 
-One signed sheet per machine, site and month. By default a batch cannot be finalized without it.
+One signed sheet per machine, site and month. By default an invoice cannot be handed over to finance without it.
 
 1. Open **Paper sheets** and filter **Need a scan**.
 2. Open the sheet and tap **Upload scan** (PDF or photos).
@@ -835,7 +822,7 @@ Check the signed paper against the recorded rows, then close the sheet for the m
 2. Mark each row **Matches** or **Different** (say what is different).
 3. Tap **Close month**, type the **Site engineer** and the **Vendor representative** names, then **Close sheet**.
 
-Note: Matching is recommended but does not block payment, and it does not make a batch stale.
+Note: Matching is recommended but does not block an invoice, and it does not change one.
 
 ## Reopen a closed sheet
 id: reopen-sheet
@@ -850,25 +837,42 @@ Only the Admin can reopen a closed monthly sheet.
 1. Open the closed sheet in **Paper sheets**.
 2. Tap **Reopen** and write the reason.
 
-## Create the monthly invoice batch
+## Create an invoice (any vendor, machines and period)
 id: create-invoice-batch
 roles: Admin, Accountant
 screens: invoices
 open: invoices
 popular: Admin, Accountant
-keywords: invoice payroll batch generate month end vendor statement pay vendor calculate preview new invoice
-related: fix-blockers, finalize-batch, monthly-machine-exception
+keywords: invoice new invoice payroll batch generate month end vendor statement calculate preview period from to draft
+related: invoice-overlap, fix-blockers, finalize-batch, invoice-life
 
-At the month end the accountant calculates the vendors' invoices from the approved days.
+An invoice is made from the approved days, for any vendor, any of its machines and any period (a month, half a month, a week...). The app does not record payments: finance pays outside it.
 
-1. Open **Invoice** and tap **New invoice batch**.
-2. **Scope**: period (From / To), the vendor (or all), the site, the currency.
-3. With a vendor chosen, tick its machines (**Select all ready**).
-4. Tap **Calculate preview**: amounts per machine, and the problems to fix (blockers).
-5. Fix the blockers, calculate again, then tap **Generate batch**.
+1. Open **Invoice** and tap **New invoice**.
+2. Choose the period (**From** / **To**, or a quick button), the vendor, the site if needed, and the currency.
+3. Tick the machines (**Select all ready**). A machine that already has an invoice on some of these days shows it, with **Open** and the free dates.
+4. Tap **Calculate preview**: the amounts per machine and the problems to fix.
+5. Fix the problems, then tap **Create draft invoice**.
 
-- One batch per currency: USD and SYP make two batches.
-- **Generate anyway** leaves the open rows out (they go to a later batch) and needs a reason. Fix the problems first.
+- A draft has no number yet. It keeps its period for its machines, so nobody can invoice the same days twice.
+- One invoice per currency: USD and SYP make two invoices.
+- **Create anyway** leaves the rows with problems out (they can be invoiced later) and needs a reason.
+
+## A machine already has an invoice in this period
+id: invoice-overlap
+roles: Admin, Accountant
+screens: invoices
+open: invoices
+keywords: overlap already invoiced period taken same days twice conflict free dates existing invoice
+related: create-invoice-batch, void-or-new-version
+
+A machine is never in two invoices on the same day. When the period you ask for touches an existing invoice of the same machine, the app says which one and the free dates.
+
+1. Tap **Open** to see the invoice that already covers those days.
+2. Or tap one of the **Free** dates: the period changes to it.
+3. If the other invoice is only a draft, **Take it** moves the machine into your new invoice (the draft is deleted or recalculated without it).
+
+Note: Periods that do not touch are always allowed, e.g. 1–15 and 16–31.
 
 ## Fix what blocks the invoice
 id: fix-blockers
@@ -876,18 +880,18 @@ roles: Admin, Accountant
 screens: invoices, attendance-review, fuel-adjustments, paper-sheets
 open: invoices
 popular: Accountant
-keywords: blockers problems cannot generate blocked not approved fuel unpriced standby hours missing scan open session
+keywords: blockers problems cannot generate blocked not approved approve reject fuel unpriced standby hours missing scan open session
 related: create-invoice-batch, approve-attendance, price-fuel, standby-hours-monthly
 
-The preview lists what must be fixed, with where to fix it:
+The preview (and the invoice when you issue it) lists what must be fixed, row by row.
 
-- Rows not approved → **Attendance review** (Admin approves).
-- Anomaly not acknowledged → **Attendance review**.
+- Rows not approved: the Admin taps ✓ **Approve** or ✗ **Reject** (with a reason) on each row, or **Approve all submitted**. Open a row to edit it.
+- Draft rows: the supervisor has not sent them yet; open one to fix it.
+- Anomaly not acknowledged, standby hours not set: tap the row to open it and fix it.
 - Fuel without a price → **Fuel & adjustments** → **Fuel issues**.
 - Official fuel price missing → **Fuel & adjustments** → **Fuel prices**.
-- Standby hours not set (monthly machine) → **Attendance review** → **Set hours**.
-- Machine still checked in → the supervisor must check it out.
-- Signed sheet missing → **Paper sheets** → **Upload scan**.
+- Machine still checked in → the supervisor checks it out, or open the row and fix the times.
+- Signed sheet missing → **Paper sheets** → **Upload scan** (needed before the hand-over to finance).
 - A monthly machine with no row on a working day → it is deducted as a full absence.
 
 ## Monthly machine: exception for one month
@@ -900,11 +904,11 @@ related: monthly-machine-rules, create-invoice-batch
 
 When one machine's month is billed differently (e.g. the vendor is paid on the 27th day).
 
-1. In **New invoice batch**, choose the vendor and the machine.
+1. In **New invoice**, choose the vendor and the machine.
 2. In **Monthly machines: normal month or exception**, type the amount of the month, the days it is divided by, or the hourly price.
 3. Calculate the preview.
 
-Note: It cannot change while a batch (even a draft) bills that month: void the draft first.
+Note: A draft or an issued invoice of that month follows the change (the issued one keeps its number). It is locked only while an invoice of that month is handed over to finance.
 
 ## How monthly machines are paid
 id: monthly-machine-rules
@@ -921,6 +925,7 @@ The rules used to bill machines rented by the month.
 - Every working day has its hours (e.g. 10). An absence or a day with no row is deducted in full; a short day loses the missing hours.
 - Breakdown (the vendor's fault) is deducted by the breakdown % and never covered.
 - Extra hours, or work on the weekly day off, are extra hours. They do not cover missing hours unless the Admin decides it.
+- Several invoices in one month (e.g. 1–15 and 16–30) are linked: the month is counted as a whole.
 
 ## Let extra hours cover missing hours
 id: extra-hours-cover
@@ -930,178 +935,205 @@ open: invoices
 keywords: extra hours cover missing hours offset overtime compensate admin decision
 related: monthly-machine-rules
 
-Only the Admin decides, per machine and month, before finalizing.
+Only the Admin decides, per machine and month, while the invoice is a draft or issued (not handed over).
 
-1. In the preview (or the draft batch), find the monthly machine.
-2. Tick **COVER the missing hours (Admin decision)**.
-3. Yes: each extra hour covers a missing hour. No: missing hours are deducted and extra hours are paid as overtime (if overtime is on).
+1. In the preview or the invoice, find the monthly machine.
+2. Switch **use the extra hours to cover the missing hours?** on or off.
+3. On: each extra hour covers a missing hour. Off: missing hours are deducted and extra hours are paid as overtime (if overtime is on).
 
 Note: An hour is either used to cover or paid as overtime, never both.
 
-## Finalize a batch (issue the invoice numbers)
+## The life of an invoice
+id: invoice-life
+roles: Admin, Accountant
+screens: invoices
+open: invoices
+popular: Admin, Accountant
+keywords: states status draft issued handed over withdrawn cancelled re-issued life flow steps
+related: finalize-batch, hand-over-finance, withdraw-from-finance
+
+Every invoice goes through the same steps:
+
+- **Draft**: no number. Keeps its period. Recalculate or delete it freely.
+- **Issued**: official numbers (VI for the vendor, MI for each machine, FD for a fuel difference). Still in the office: a change to its days is brought into it with the SAME number. Nothing on the invoice says it changed; the Admin sees each change in the **Audit log**.
+- **Handed over**: given to finance with a signed hand-over sheet (HO-…). Locked for everybody.
+- **Withdrawn from finance**: back in the office with a signed acknowledgement (WD-…). The Admin can change it, then re-issue it with a NEW number, cancel it, or hand it over again unchanged.
+- **Cancelled** / **Re-issued**: the old numbers stay cancelled and are never used again.
+
+Note: An invoice number is unique in the whole system and is never reused.
+
+## Issue an invoice (official number)
 id: finalize-batch
 roles: Admin, Accountant
 screens: invoices
 open: invoices
-popular: Admin
-keywords: finalize lock close batch invoice numbers official approve invoice issue numbers
-related: undo-finalize, mark-batch-paid, stale-batch
+popular: Admin, Accountant
+keywords: issue finalize invoice numbers official number vi mi approve invoice issue numbers
+related: invoice-life, hand-over-finance, stale-batch
 
-Finalize issues the official invoice numbers: one per vendor, one per machine, and one for the fuel difference.
+Issuing gives the official numbers: one per vendor (VI-…), one per machine (MI-…), and one per fuel difference (FD-…).
 
-1. Open **Invoice** and open the draft batch.
-2. Check it. If it says changes since it was calculated, tap **Recalculate** first.
-3. Tap **Finalize** and confirm.
+1. Open **Invoice** and open the draft.
+2. If it says it changed since it was calculated, tap **Recalculate** first.
+3. Tap **Issue** and confirm (check the manual changes it lists).
 
-- After this, the days of the period cannot change, and no fuel, adjustment or deployment can be added there, except by an official correction.
-- By default only the Admin can finalize.
+- The period must have ended, and every row of the period must be approved or rejected: the invoice lists the rows with **Approve** / **Reject**.
+- The Admin and the accountant can issue (setting **Only Admin can issue invoices**).
 
-## Undo a Finalize
-id: undo-finalize
+## Change an issued invoice (same number)
+id: issued-invoice-changes
 roles: Admin, Accountant
-screens: invoices
+screens: invoices, attendance-review, fuel-adjustments
 open: invoices
-keywords: undo finalize unfinalize mistake back to draft reopen batch
-related: finalize-batch, official-correction
+keywords: change issued invoice edit after issue same number update correct mistake before finance
+related: invoice-life, hand-over-finance, edit-attendance-row
 
-Within a few hours (setting, 72 by default) and while nothing was paid or corrected, a finalized batch can go back to a draft with the same invoice numbers.
+While an issued invoice is still in the office, it stays open.
 
-1. Open the batch and tap **Undo Finalize** (it shows the time left).
-2. Write the reason. An Admin does it at once; an accountant's request waits for the Admin.
+1. Fix the day, the fuel, the adjustment or the price where it is (the office edits; the supervisor cannot change those days).
+2. Open the invoice: it is brought up to date by itself, with the same number and date.
 
-Note: After that time, use an official correction.
+- Nothing on the invoice shows that it changed. The **Audit log** (Admin) keeps who, when, why and the amounts before and after.
+- After the hand-over to finance, withdraw it first, or make a debit / credit note.
 
-## Mark a batch as paid
-id: mark-batch-paid
-roles: Admin, Accountant
-screens: invoices
-open: invoices
-popular: Admin
-keywords: mark paid paid payment pay batch paid done settle transfer cheque
-related: record-payment, finalize-batch
-
-After the money is paid, mark the finalized batch as paid.
-
-1. Open **Invoice** and open the finalized batch.
-2. Tap **Mark paid**, add the payment reference (bank transfer / cheque no.) if you have it, and confirm.
-
-- **Undo mark paid** is possible for a limited time (setting).
-- Paying part of it? Use **Record payment** instead.
-
-## Record a partial payment
-id: record-payment
-roles: Admin, Accountant
-screens: invoices
-open: invoices
-keywords: partial payment record payment pay part of batch partly paid some advance installment voucher remaining balance
-related: mark-batch-paid, reverse-payment, vendor-statement
-
-Record each payment to a vendor when you pay in several parts.
-
-1. Open the finalized batch and find the vendor.
-2. Tap **Record payment**: amount, **Method** (cash, bank transfer, cheque), **Payment date**, reference.
-3. Save. **Open voucher** prints the payment voucher. When nothing is left, the batch becomes Paid by itself.
-
-## Reverse a payment
-id: reverse-payment
-roles: Admin, Accountant
-screens: invoices
-open: invoices
-keywords: reverse payment wrong payment cancel payment undo payment voucher reversed
-related: record-payment
-
-Undo a payment recorded by mistake. Nothing is deleted.
-
-1. Open the batch, find the payment and tap **Reverse**.
-2. Write why (printed on the voucher). The voucher is kept and marked REVERSED; the amount is owed again.
-
-Note: An accountant can reverse their own payment within a limited time; after that, only the Admin.
-
-## Void a batch or make a new version
-id: void-or-new-version
-roles: Admin, Accountant
-screens: invoices
-open: invoices
-keywords: void cancel batch new version supersede regenerate wrong batch redo
-related: stale-batch, finalize-batch, approve-batch-request
-
-What to do when a batch is wrong depends on how far it went.
-
-- Draft batch with a mistake: **Void** it and generate again, or **Recalculate**.
-- Finalized, not paid: **New version** replaces it. The old invoice numbers are kept but marked cancelled.
-- Paid: not possible. Use an official correction.
-
-An accountant sees **Ask to void** / **Ask for new version**: the Admin approves it first.
-
-## A batch says it changed (stale)
+## A draft says it changed (stale)
 id: stale-batch
 roles: Admin, Accountant
 screens: invoices
 open: invoices
-keywords: stale changed recalculate outdated changes since calculated cannot finalize
-related: void-or-new-version, finalize-batch
+keywords: stale changed recalculate outdated changes since calculated cannot issue draft
+related: finalize-batch, issued-invoice-changes
 
 Something that moves money changed after the draft was calculated: hours, fuel, an adjustment, a price or a setting.
 
-1. Open the batch: it lists the changes.
-2. Tap **Recalculate** (or Void and generate again). It cannot be finalized before.
+1. Open the draft: it lists the changes.
+2. Tap **Recalculate**. It cannot be issued before.
 
-Note: Paper matching and notes do not make a batch stale.
+Note: An issued invoice does not show this: it is brought up to date by itself (same number).
 
-## Approve an accountant's request on a batch
-id: approve-batch-request
+## Hand invoices over to finance
+id: hand-over-finance
 roles: Admin
 screens: invoices
 open: invoices
-keywords: approve request accountant request void request new version request undo finalize waiting admin
-related: void-or-new-version, undo-finalize
+popular: Admin
+keywords: hand over finance accounting department deliver send invoices handover sheet ho signature
+related: invoice-life, withdraw-from-finance, upload-signed-sheet
 
-When only the Admin closes invoices, the accountant's void, new version or undo requests wait for you.
+When the invoices go to the finance department, the Admin records it. It is a formal sheet to sign; no scan is needed.
 
-1. Open **Invoice** and open the batch with a waiting request.
-2. Read the reason, then tap **Approve** (it runs now, in your name) or **Reject**.
+1. Open **Invoice** and tap **Hand over to finance** (or open the invoice and tap it there).
+2. Tick the invoices and the debit / credit notes you give.
+3. Write who receives them and the date, then tap **Hand over and print the sheet**.
+4. Print the hand-over sheet (HO-…) and have it signed.
 
-## PDFs, Excel and statements of a batch
+- From then on the invoice is locked for everybody.
+- The signed monthly sheets must be uploaded first (setting).
+- **Hand-over sheets** lists the old sheets to print them again.
+
+## Withdraw an invoice from finance
+id: withdraw-from-finance
+roles: Admin
+screens: invoices
+open: invoices
+keywords: withdraw back from finance return take back acknowledgement wd mistake after hand over
+related: reissue-invoice, invoice-life, debit-credit-note
+
+To change an invoice already handed over, the Admin takes it back with a signed acknowledgement.
+
+1. Open the invoice and tap **Withdraw from finance**.
+2. Write why, who in finance gives it back, the date, and whether finance had already paid it (and how much).
+3. Print the acknowledgement (WD-…) and have it signed. No scan is needed.
+
+Then the Admin can fix its days and **Re-issue (new number)**, **Cancel invoice**, or hand it over again unchanged.
+
+Tip: For a small difference, a debit / credit note is often simpler than a withdrawal.
+
+## Re-issue an invoice with a new number
+id: reissue-invoice
+roles: Admin
+screens: invoices
+open: invoices
+keywords: reissue re-issue new number replace corrected invoice after withdrawal
+related: withdraw-from-finance, invoice-life
+
+After a withdrawal from finance, the corrected invoice gets NEW numbers.
+
+1. Fix what was wrong (days, fuel, prices...).
+2. Open the withdrawn invoice and tap **Re-issue (new number)**, with the reason.
+
+- The old numbers stay cancelled and are never used again.
+- Nothing printed on the new invoice mentions the old one. The link between them is shown in the app only.
+
+## Delete a draft or cancel an invoice
+id: void-or-new-version
+roles: Admin, Accountant
+screens: invoices
+open: invoices
+keywords: delete draft cancel invoice void wrong invoice remove
+related: invoice-life, withdraw-from-finance
+
+- Draft: **Delete draft** (Admin or accountant). It has no number; its period becomes free.
+- Issued, or withdrawn from finance: the Admin taps **Cancel invoice** and writes why. Its numbers stay cancelled.
+- Handed over: withdraw it from finance first.
+
+## Debit / credit note
+id: debit-credit-note
+roles: Admin, Accountant
+screens: invoices
+open: invoices
+popular: Admin
+keywords: debit note credit note dn cn difference correction after finance add deduct vendor amount
+related: invoice-life, hand-over-finance, find-invoice
+
+A separate document for a difference: a debit note (DN-…) gives the vendor more, a credit note (CN-…) gives less. For one machine or for the vendor in general.
+
+1. In **Invoice** tap **New debit / credit note** (or, in an invoice, **Debit / credit note**, or the button on a machine).
+2. Choose debit or credit, the vendor, the machine (or none), the amount, the date, the period and the reason.
+3. Optional: **Belongs to invoice** links it to an invoice; the link is shown in the app only, never printed.
+4. Save: it is a draft. The Admin taps **Issue** to give it its number, then hands it over to finance like an invoice.
+
+## Find an old invoice
+id: find-invoice
+roles: Admin, Accountant
+screens: invoices
+open: invoices
+keywords: find search old invoice register number machine vendor list filter
+related: debit-credit-note, export-batch
+
+**Invoice** shows the invoices per vendor, newest period first, each with its machine invoices and, under it, its debit / credit notes.
+
+- Filter by **Vendor**, **Machine**, **From** / **To** and **State**.
+- **Search** finds an invoice or note number (VI-, MI-, DN-, CN-…) or a machine code.
+- Notes not linked to an invoice are listed at the end of the vendor.
+
+## Invoice documents: PDF and Excel
 id: export-batch
 roles: Admin, Accountant
 screens: invoices
 open: invoices
-keywords: pdf excel export print statement vendor invoice machine invoice fuel difference statement download
-related: vendor-statement
+keywords: pdf excel export print certificate payment certificate vendor invoice machine invoice fuel difference statement download
+related: vendor-statement, find-invoice
 
-Every document of a batch: vendor invoices, machine invoices, fuel difference, summary and Excel.
+Every document of an invoice carries the company logo and colours.
 
-1. Open **Invoice** and open the batch.
-2. Use **Summary PDF**, **Vendor invoice PDF**, **Machine invoice**, **Fuel difference statements** or **Excel**.
-3. Before the vendor PDF opens, choose what it shows (daily table, hours calculation, notes...). Items, amounts and totals are always shown.
+1. Open the invoice.
+2. **Documents**: **Vendor invoice (PDF)**, **Excel certificate** (the company's payment certificate, one sheet per machine), **Summary (PDF)**, **Data (Excel)**, **Fuel difference statements**.
+3. On each machine: **Machine invoice**, **Excel certificate**.
+4. Before the vendor PDF opens, choose what it shows (daily table, hours calculation, notes...). Items, amounts and totals are always shown.
 
-## Vendor statement of account
+Note: A draft prints "Draft". An issued invoice is printed up to date with its number.
+
+## Vendor statement of invoices
 id: vendor-statement
 roles: Admin, Accountant
 screens: vendors, machines
 open: vendors
-keywords: statement of account balance owed vendor account history ledger billing history provisional statement
-related: record-payment, opening-balance
+keywords: statement of invoices statement of account vendor history ledger billing history provisional statement
+related: find-invoice, debit-credit-note
 
-Everything we billed and paid a vendor, and what we still owe.
+Every invoice and debit / credit note of a vendor, with the running total.
 
-1. Open **Vendors**, open the vendor, and tap **Statement of account**: every invoice, payment and note, with the balance owed.
+1. Open **Vendors**, open the vendor, and tap **Statements** → **Statement of invoices**.
 2. **Provisional statement** shows what the next invoice would contain.
 3. For one machine: **Machines** → open it → **Billing history**.
-
-## Official correction after a batch is finalized
-id: official-correction
-roles: Admin, Accountant
-screens: attendance-review, fuel-adjustments, invoices
-open: attendance-review
-keywords: official correction debit note credit note dn cn mistake finalized paid locked fix after finalize
-related: edit-attendance-row, undo-finalize
-
-A finalized invoice never changes. The difference is settled with a debit note (DN, the vendor gets more) or a credit note (CN, for us).
-
-1. In **Attendance review**, open the row and tap **Official correction**. Choose what changes and write the reason.
-2. An Admin's correction is applied at once. An accountant's goes to the Admin.
-3. Follow it in **Fuel & adjustments** → **Corrections**: review, set another amount with a reason, **Approve**, **Return** or **Cancel**.
-4. On approval it issues a DN-… or CN-… number and an adjustment in the first open period.
-
-Tip: Fuel or amount mistakes: open the paid batch, then the machine, then **Official correction**.

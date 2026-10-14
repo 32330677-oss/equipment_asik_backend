@@ -3,7 +3,9 @@
 // APPEND-ONLY for it: SELECT + INSERT, never UPDATE / DELETE (an edit there needs the migration / admin user).
 // The figures a batch was generated with are append-only too: a batch is voided or replaced, never rewritten (C12).
 const APPEND_ONLY = ['audit_logs', 'eq_invoices', 'eq_invoice_cancellations', 'eq_correction_events', 'eq_file_versions', 'login_history',
-  'eq_payroll_items', 'eq_payroll_lines', 'eq_payroll_attendance_snapshot', 'eq_payroll_monthly_days', 'eq_payroll_batch_machines'];
+  'eq_payroll_items', 'eq_payroll_lines', 'eq_payroll_attendance_snapshot', 'eq_payroll_monthly_days', 'eq_payroll_batch_machines',
+  // 14 Oct 2026: what an invoice covers, hand-over sheets and withdrawal acknowledgements are never rewritten
+  'eq_invoice_coverage', 'eq_handovers', 'eq_handover_items', 'eq_withdrawals'];
 
 /**
  * Columns the app may still UPDATE on an append-only table (column-level right). 11 Oct 2026: an undone Finalize

@@ -1,5 +1,5 @@
 // P25 — terms of the month of monthly machines: a normal month by default (price / working days of the calendar month);
-// an EXCEPTION per machine and month (12 Oct 2026: amount, days, hourly price), locked while any batch bills the month;
+// an EXCEPTION per machine and month (12 Oct 2026: amount, days, hourly price), locked only while an invoice handed over to finance bills the month (14 Oct 2026);
 // overtime only when the card pays it. The card no longer has a "Fixed" divisor.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
@@ -81,56 +81,36 @@ test('a card without terms gives exactly the old amount; a new monthly card pays
   assert.deepStrictEqual(draft.items[0].rate_snapshot.monthly_terms, [{ month: '2026-10', divisor: 26, divisor_source: 'calendar', amount: null, amount_source: 'card', hourly: null, hourly_source: 'auto' }]);
 });
 
-test('an exception cannot change under a draft: void the draft, type it, generate again', async () => {
-  const locked = await terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 25, hourly_rate: null });
-  assert.strictEqual(locked.status, 409);
-  assert.strictEqual(locked.body.code, 'MONTHLY_TERMS_LOCKED');
-  assert.strictEqual(locked.body.details.finalized, false);
-  assert.match(locked.body.message, /Void that draft first/);
-  const list = await ok(h.api().get(`/api/equipment/payroll/monthly-terms?start_date=2026-10-01&end_date=2026-10-31&equipment_ids=${M2.equipment_id}`).set(ACC()));
-  assert.strictEqual(list[0].locked, true);
-  assert.strictEqual(list[0].locked_by_finalized, false);
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/void`).set(ACC()).send({}));
+test('an exception changes under a draft: the draft asks to be recalculated (14 Oct 2026)', async () => {
   const t = await ok(terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 25, hourly_rate: null }));
   assert.strictEqual(t.divisor, 25);
   assert.strictEqual(t.divisor_source, 'manual');
   assert.strictEqual(t.is_exception, true);
   assert.strictEqual(t.hourly, 8); // 2000 / 25 / 10
-  const v2 = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send(OCT()));
+  const list = await ok(h.api().get(`/api/equipment/payroll/monthly-terms?start_date=2026-10-01&end_date=2026-10-31&equipment_ids=${M2.equipment_id}`).set(ACC()));
+  assert.strictEqual(list[0].locked, false, 'a draft never locks the month');
+  const d = await ok(h.api().get(`/api/equipment/payroll/batches/${draft.eq_batch_id}`).set(ACC()));
+  assert.strictEqual(d.stale, true);
+  const v2 = await ok(h.api().post(`/api/equipment/payroll/batches/${draft.eq_batch_id}/supersede`).set(ACC()).send({}));
   // D = 25: base = full month (26 deployed days, 25 paid as base); the 26th day's 10 h are extra hours -> overtime x 8
   assert.strictEqual(v2.total_net, '2080.00');
   draft = v2;
 });
 
-test('after the Finalize the exception is locked (409); after the undo the batch is a draft: still locked until voided', async () => {
-  const sheets = await ok(h.api().get(`/api/equipment/timesheets?month=2026-10&equipment_id=${M2.equipment_id}`).set(ACC()));
-  await ok(h.api().post(`/api/equipment/timesheets/${sheets[0].timesheet_id}/scans`).set(ACC()).attach('files', await QRCode.toBuffer('signed'), 'scan.png'));
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
+test('issued: the exception is listed before issuing; handed over to finance: the month is locked (409)', async () => {
+  const review = await ok(h.api().get(`/api/equipment/payroll/batches/${draft.eq_batch_id}/review-summary`).set(A()));
+  assert.ok(review.items.find((i) => i.kind === 'monthly_exception' && /divided by 25 days/.test(i.ref)));
+  draft = await h.issue(draft.eq_batch_id);
+  await h.handOver(draft.eq_batch_id);
   const r = await terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 24 });
   assert.strictEqual(r.status, 409);
   assert.strictEqual(r.body.code, 'MONTHLY_TERMS_LOCKED');
+  assert.strictEqual(r.body.details.state, 'handed_over');
+  assert.match(r.body.message, /Withdraw it from finance first/);
   const list = await ok(h.api().get(`/api/equipment/payroll/monthly-terms?start_date=2026-10-01&end_date=2026-10-31&equipment_ids=${M2.equipment_id}`).set(ACC()));
   assert.strictEqual(list[0].locked, true);
   assert.strictEqual(list[0].locked_by_batch_id, draft.eq_batch_id);
-  assert.strictEqual(list[0].locked_by_finalized, true);
-  assert.match(r.body.message, /Undo its Finalize/);
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/unfinalize`).set(A()).send({ reason: 'check the terms' }));
-  const still = await terms({ equipment_id: M2.equipment_id, month: '2026-10', working_days: 25, note: 'agreed 25 days' });
-  assert.strictEqual(still.body.code, 'MONTHLY_TERMS_LOCKED');
-  assert.strictEqual(still.body.details.finalized, false);
-  // the Finalize review lists the exception of the month
-  const review = await ok(h.api().get(`/api/equipment/payroll/batches/${draft.eq_batch_id}/review-summary`).set(A()));
-  assert.ok(review.items.find((i) => i.kind === 'monthly_exception' && /divided by 25 days/.test(i.ref)));
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${draft.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
-});
-
-test('a Correction uses the terms frozen in the batch, not the table', async () => {
-  // someone changes the table behind the batch (cannot happen through the API once locked): the correction ignores it
-  await h.query("UPDATE eq_monthly_terms SET working_days = 20 WHERE equipment_id = ? AND month = '2026-10'", [M2.equipment_id]);
-  const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-05'", [M2.equipment_id]);
-  const c = await ok(h.api().post(`/api/equipment/admin/attendance/${row.eq_attendance_id}/correction`).set(ACC())
-    .send({ reason: 'Signed sheet shows 18:00', changes: { check_out_time: '2026-10-05 18:00' } }));
-  assert.strictEqual(Number(c.delta_amount), 8, '+1 h overtime at 2000 / 25 / 10 = 8 (the table would say 10)');
+  assert.strictEqual(list[0].locked_state, 'handed_over');
 });
 
 test('a batch over two months: one line per month, each with its own terms', async () => {

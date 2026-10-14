@@ -1,5 +1,4 @@
-// P22b — decisions of 11 Oct 2026:
-//  A. an Admin applies a correction at once; an Accountant's correction waits for an Admin (an Accountant never approves).
+// P22b — decisions of 11 Oct 2026 (official corrections were replaced by debit / credit notes on 14 Oct 2026):
 //  B. before the lock the office changes everything without a mandatory reason; a draft batch is recalculated in one step.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
@@ -10,7 +9,7 @@ const BD = require('../utils/businessDate');
 BD.setClock(() => new Date(Date.UTC(2026, 10, 20, 9, 0, 0))); // 2026-11-20 12:00
 const ACC = () => h.auth(h.T.accountant());
 const code = async (req) => (await req).body.code;
-let F; let oct; let paidRow;
+let F; let oct;
 
 async function workDay(m, date, inT, outT, approve = true) {
   const r = await ok(h.api().post('/api/equipment/attendance/check-in').set(S8()).send({ equipment_id: m.equipment_id, site_id: 8, check_in_time: `${date} ${inT}`, check_out_time: `${date} ${outT}`, late_reason: 'paper sheet typed late' }));
@@ -24,45 +23,12 @@ before(async () => {
   await h.query("UPDATE settings SET setting_value = 'false' WHERE setting_key = 'eq_finalize_requires_scan'");
   require('../services/settings').invalidate();
   F = await standardFleet();
-  paidRow = await workDay(F.exc, '2026-10-05', '07:00', '15:00');
+  await workDay(F.exc, '2026-10-05', '07:00', '15:00');
   await workDay(F.exc, '2026-10-06', '07:00', '15:00');
   oct = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ start_date: '2026-10-01', end_date: '2026-10-31', equipment_id: F.exc.equipment_id }));
   await ok(h.api().patch(`/api/equipment/payroll/batches/${oct.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
 });
 after(h.closePool);
-
-test('A: an Admin\'s correction is applied at once (attendance and financial)', async () => {
-  const c = await ok(h.api().post(`/api/equipment/admin/attendance/${paidRow}/correction`).set(A()).send({ reason: 'Signed sheet shows 16:00', changes: { check_out_time: '2026-10-05 16:00' } }));
-  assert.strictEqual(c.request_status, 'Approved');
-  assert.deepStrictEqual(c.events.map((e) => e.action), ['request', 'approve']);
-  assert.ok(c.note && c.note.kind === 'DebitNote');
-  const [row] = await h.query('SELECT check_out_time FROM eq_attendance WHERE eq_attendance_id = ?', [paidRow]);
-  assert.strictEqual(row.check_out_time, '2026-10-05 16:00:00');
-  const b = await ok(h.api().get(`/api/equipment/payroll/batches/${oct.eq_batch_id}`).set(ACC()));
-  const fin = await ok(h.api().post('/api/equipment/admin/corrections/financial').set(A())
-    .send({ target_type: 'rate_card', target_id: b.items[0].rate_card_id, eq_item_id: b.items[0].eq_item_id, amount: -10, reason: 'Agreed discount' }));
-  assert.strictEqual(fin.request_status, 'Approved');
-  assert.strictEqual(fin.note.kind, 'CreditNote');
-});
-
-test('A: an Accountant\'s correction waits; only an Admin approves it (the Admin may also return it)', async () => {
-  const [row2] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-06'", [F.exc.equipment_id]);
-  const c = await ok(h.api().post(`/api/equipment/admin/attendance/${row2.eq_attendance_id}/correction`).set(ACC()).send({ reason: 'Signed sheet shows 15:30', changes: { check_out_time: '2026-10-06 15:30' } }));
-  assert.strictEqual(c.request_status, 'Requested');
-  const [still] = await h.query('SELECT check_out_time FROM eq_attendance WHERE eq_attendance_id = ?', [row2.eq_attendance_id]);
-  assert.strictEqual(still.check_out_time, '2026-10-06 15:00:00', 'nothing changes before the Admin approves');
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(ACC()).send({})), 'ADMIN_APPROVES');
-  const ret = await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/return`).set(A()).send({ note: 'attach the sheet' }));
-  assert.strictEqual(ret.return_count, 1);
-  const done = await ok(h.api().patch(`/api/equipment/admin/corrections/${c.correction_id}/approve`).set(A()).send({}));
-  assert.strictEqual(done.request_status, 'Approved');
-  // an Accountant's financial correction waits too
-  const b = await ok(h.api().get(`/api/equipment/payroll/batches/${oct.eq_batch_id}`).set(ACC()));
-  const fin = await ok(h.api().post('/api/equipment/admin/corrections/financial').set(ACC())
-    .send({ target_type: 'other', eq_item_id: b.items[0].eq_item_id, amount: 5, reason: 'Transport not billed' }));
-  assert.strictEqual(fin.request_status, 'Requested');
-  assert.strictEqual((await ok(h.api().patch(`/api/equipment/admin/corrections/${fin.correction_id}/approve`).set(A()).send({}))).request_status, 'Approved');
-});
 
 test('B: no reason needed before the lock: edit an approved row, void a row, void / recalculate a draft', async () => {
   const id = await workDay(F.exc, '2026-11-10', '07:00', '15:00');
@@ -107,7 +73,8 @@ test('B: a recalculated draft keeps the blockers that were accepted', async () =
   await ok(h.api().patch(`/api/equipment/payroll/batches/${r.body.data.eq_batch_id}/void`).set(ACC()).send({}));
 });
 
-test('B: once finalized, void and new version still need a reason', async () => {
+test('B: once issued, cancelling needs the Admin and a reason; it is never recalculated by hand', async () => {
   assert.strictEqual(await code(h.api().patch(`/api/equipment/payroll/batches/${oct.eq_batch_id}/void`).set(A()).send({})), 'VALIDATION_ERROR');
-  assert.strictEqual(await code(h.api().post(`/api/equipment/payroll/batches/${oct.eq_batch_id}/supersede`).set(A()).send({})), 'VALIDATION_ERROR');
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/payroll/batches/${oct.eq_batch_id}/void`).set(ACC()).send({ reason: 'wrong' })), 'ADMIN_ONLY');
+  assert.strictEqual(await code(h.api().post(`/api/equipment/payroll/batches/${oct.eq_batch_id}/supersede`).set(A()).send({})), 'BATCH_STATE');
 });

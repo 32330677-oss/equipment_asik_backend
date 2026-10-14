@@ -36,38 +36,42 @@ async function rateCardOn(conn, equipmentId, date) {
   return rows[0] || null;
 }
 
-/** True when the rate card is referenced by an active finalized payroll batch. */
+/**
+ * The invoice that stops the current user from changing this rate card (14 Oct 2026): one handed over to finance (or
+ * withdrawn, for a non-Admin) bills it. A draft or issued invoice follows the change (recalculated / brought up to date).
+ * Returns the batch id or null.
+ */
 async function rateCardLocked(conn, rateCardId) {
+  const lock = require('./eqLock');
   const [rows] = await conn.execute(
-    `SELECT b.eq_batch_id FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-     WHERE i.rate_card_id = ? AND b.status IN ('Generated','Paid') AND b.is_finalized = 1 LIMIT 1`, [rateCardId]);
-  return rows[0] ? rows[0].eq_batch_id : null;
+    `SELECT DISTINCT b.eq_batch_id, b.status, b.is_finalized FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
+     WHERE i.rate_card_id = ? AND b.status IN ('Generated','HandedOver','Returned') AND b.is_finalized = 1`, [rateCardId]);
+  const b = rows.find((x) => lock.denies(x));
+  return b ? b.eq_batch_id : null;
 }
 
 /**
- * Last date billed with a rate card by an active batch (draft or finalized), for the close / "change from a date" rules.
- * Returns { date, eq_batch_id, state: 'draft' | 'finalized' | 'paid' } of the batch that bills the latest day, or null.
- *  - Hourly / Daily: the last attendance row of the batch (a day without a row is not billed).
- *  - Monthly: the whole batch period inside the card (end of the batch, or end of the card if earlier), because a
- *    monthly machine is billed on every deployed day of the period, even days without a row (hours due).
- * On a tie the finalized batch is reported first (it cannot be voided freely).
+ * Last date billed with a rate card by an invoice the current user may not change (handed over; withdrawn for a
+ * non-Admin), for the close / "change from a date" rules. Returns { date, eq_batch_id, state } or null.
+ *  - Hourly / Daily: the last attendance row of the invoice (a day without a row is not billed).
+ *  - Monthly: the whole invoice period inside the card, because a monthly machine is billed on every deployed day.
  */
 async function rateCardBilledUpTo(conn, rateCardId) {
+  const lock = require('./eqLock');
   const [rows] = await conn.execute(
     `SELECT x.d, x.eq_batch_id, x.status, x.is_finalized FROM (
        SELECT MAX(s.record_date) AS d, b.eq_batch_id, b.status, b.is_finalized FROM eq_payroll_attendance_snapshot s
        JOIN eq_payroll_items i ON i.eq_item_id = s.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = s.eq_batch_id
-       WHERE i.rate_card_id = ? AND b.status IN ('Generated','Paid')
+       WHERE i.rate_card_id = ? AND b.status IN ('Generated','HandedOver','Returned')
        GROUP BY b.eq_batch_id, b.status, b.is_finalized
        UNION ALL
        SELECT LEAST(b.end_date, COALESCE(rc.effective_to, b.end_date)) AS d, b.eq_batch_id, b.status, b.is_finalized FROM eq_payroll_items i
        JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id JOIN eq_rate_cards rc ON rc.rate_card_id = i.rate_card_id
-       WHERE i.rate_card_id = ? AND i.billing_mode = 'Monthly' AND b.status IN ('Generated','Paid')
-     ) x WHERE x.d IS NOT NULL ORDER BY x.d DESC, x.is_finalized DESC LIMIT 1`, [rateCardId, rateCardId]);
-  const r = rows[0];
+       WHERE i.rate_card_id = ? AND i.billing_mode = 'Monthly' AND b.status IN ('Generated','HandedOver','Returned')
+     ) x WHERE x.d IS NOT NULL ORDER BY x.d DESC`, [rateCardId, rateCardId]);
+  const r = rows.find((x) => lock.denies(x));
   if (!r) return null;
-  const state = r.status === 'Paid' ? 'paid' : Number(r.is_finalized) ? 'finalized' : 'draft';
-  return { date: String(r.d).slice(0, 10), eq_batch_id: r.eq_batch_id, state };
+  return { date: String(r.d).slice(0, 10), eq_batch_id: r.eq_batch_id, state: lock.stateOf(r) };
 }
 
 /** Last date billed with a rate card by an active batch (see rateCardBilledUpTo), or null. */

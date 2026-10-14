@@ -1,5 +1,5 @@
 // P14 — entering history backwards: the first day of fuel price difference terms and of a supervisor period can be
-// corrected (with a reason) while the days involved are in an open period; never inside a finalized payroll.
+// corrected (with a reason) while the days involved are not in an invoice handed over to finance.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const QRCode = require('qrcode');
@@ -64,13 +64,17 @@ test('backfilled September is paid with its fuel difference; afterwards its star
   assert.ok(fd, 'the fuel difference of the corrected terms is paid');
   assert.strictEqual(Number(fd.amount), 24, '(1.000 - 0.800) x 15 L/h x 8 h');
   await ok(h.api().patch(`/api/equipment/payroll/batches/${sept.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${sept.eq_batch_id}/mark-paid`).set(A()).send({ payment_reference: 'TRF-0905 (paid 2026-09-05)' }));
-  // September is closed: its start dates cannot move any more
+  await h.handOver(sept.eq_batch_id);
+  // September is handed over to finance: its start dates cannot move any more
   // moving the start earlier into August only adds August days: August is still open, so it is allowed
   const aug = await ok(h.api().patch(`/api/equipment/fuel-terms/${terms1.fuel_terms_id}/start`).set(ACC()).send({ effective_from: '2026-08-20', reason: 'joined on the 20th of August' }));
   assert.strictEqual(aug.effective_from, '2026-08-20');
-  assert.strictEqual(await code(h.api().patch(`/api/equipment/fuel-terms/${terms1.fuel_terms_id}/start`).set(ACC()).send({ effective_from: '2026-09-15', reason: 'later start' })), 'PAYROLL_PERIOD_FINALIZED');
-  assert.strictEqual(await code(h.api().patch(`/api/site-supervisors/${sup9Site10.site_supervisor_id}/start`).set(A()).send({ from_date: '2026-09-15', reason: 'later start' })), 'PAYROLL_PERIOD_FINALIZED');
+  assert.strictEqual(await code(h.api().patch(`/api/equipment/fuel-terms/${terms1.fuel_terms_id}/start`).set(ACC()).send({ effective_from: '2026-09-15', reason: 'later start' })), 'INVOICE_LOCKED');
+  // the supervisor of site 8 (the invoice bills site 8 days): locked; site 10 has no invoice: free
+  const [s8] = await h.query("SELECT site_supervisor_id FROM site_supervisors WHERE site_id = 8 AND shift_type = 'Day' ORDER BY from_date LIMIT 1");
+  assert.strictEqual(await code(h.api().patch(`/api/site-supervisors/${s8.site_supervisor_id}/start`).set(A()).send({ from_date: '2026-09-15', reason: 'later start' })), 'INVOICE_LOCKED');
+  const free = await ok(h.api().patch(`/api/site-supervisors/${sup9Site10.site_supervisor_id}/start`).set(A()).send({ from_date: '2026-09-15', reason: 'later start' }));
+  assert.strictEqual(free.from_date, '2026-09-15');
   // an open period can still be corrected (October)
   const oct = await ok(h.api().patch(`/api/equipment/fuel-terms/${terms2.fuel_terms_id}/start`).set(ACC()).send({ effective_from: '2026-10-11', reason: 'agreement signed on the 11th' }));
   assert.strictEqual(oct.effective_from, '2026-10-11');

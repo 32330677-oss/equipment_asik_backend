@@ -101,7 +101,7 @@ exports.list = async (req, res) => {
   const [rows] = await pool.execute(
     `SELECT rc.*, vc.contract_number, vc.currency,
        EXISTS(SELECT 1 FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-              WHERE i.rate_card_id = rc.rate_card_id AND b.status IN ('Generated','Paid') AND b.is_finalized = 1) AS used_in_finalized_payroll
+              WHERE i.rate_card_id = rc.rate_card_id AND b.status = 'HandedOver') AS used_in_finalized_payroll
      FROM eq_rate_cards rc JOIN eq_vendor_contracts vc ON vc.vendor_contract_id = rc.vendor_contract_id
      WHERE rc.equipment_id = ? ORDER BY rc.effective_from DESC`, [id]);
   res.json({ status: 'success', data: rows.map((r) => ({ ...r, used_in_finalized_payroll: Boolean(Number(r.used_in_finalized_payroll)) })) });
@@ -124,24 +124,23 @@ exports.create = async (req, res) => {
   res.status(201).json({ status: 'success', data: created });
 };
 
-/** Active batch (Generated, not finalized) billed with this card: editing the card turns it stale. */
-async function rateCardInGeneratedBatch(conn, rateCardId) {
+/** Draft or issued invoice billed with this card: it follows the change (draft recalculated, issued brought up to date). */
+async function rateCardInOpenBatch(conn, rateCardId) {
   const [rows] = await conn.execute(
     `SELECT b.eq_batch_id FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-     WHERE i.rate_card_id = ? AND b.status = 'Generated' AND b.is_finalized = 0 LIMIT 1`, [rateCardId]);
+     WHERE i.rate_card_id = ? AND b.status = 'Generated' ORDER BY b.eq_batch_id DESC LIMIT 1`, [rateCardId]);
   return rows[0] ? rows[0].eq_batch_id : null;
 }
 
 /**
- * 409 when a close / "change from a date" would move days already billed with the card. The message says which batch
- * bills them and what to do: a DRAFT batch can be voided (then generated again); a finalized one needs a Correction.
+ * 409 when a close / "change from a date" would move days billed with the card by an invoice handed over to finance
+ * (or withdrawn, for a non-Admin). Draft and issued invoices follow the change by themselves.
  */
 function billedConflict(billed, hint) {
   const { date, eq_batch_id: batchId, state } = billed;
-  const msg = state === 'draft'
-    ? `Draft invoice batch #${batchId} (not finalized, not paid) already bills this card up to ${date}. ${hint}, or void that draft batch first, change the card, then generate it again.`
-    : `${state === 'paid' ? 'Paid' : 'Finalized'} invoice batch #${batchId} bills this card up to ${date}. ${hint}. A price that was wrong on those days is fixed by an official Correction.`;
-  return AppError.conflict('RATE_CARD_LOCKED', msg, { eq_batch_id: batchId, billed_up_to: date, batch_state: state });
+  const where = state === 'returned' ? 'withdrawn from finance (the Admin changes it)' : 'handed over to finance';
+  return AppError.conflict('RATE_CARD_LOCKED', `Invoice batch #${batchId}, ${where}, bills this card up to ${date}. ${hint}. `
+    + 'To change a price already handed over: withdraw the invoice from finance first, or make a debit / credit note.', { eq_batch_id: batchId, billed_up_to: date, batch_state: state });
 }
 
 exports.update = async (req, res) => {
@@ -151,12 +150,12 @@ exports.update = async (req, res) => {
   const updated = await withTransaction(async (conn) => {
     const before = await C.loadRateCard(conn, id, true);
     const lockedBy = await C.rateCardLocked(conn, id);
-    if (lockedBy) throw AppError.conflict('RATE_CARD_LOCKED', `This rate card is used by finalized invoice batch #${lockedBy}. Use "Change from a date" for the future; a wrong price already paid is fixed by an official Correction.`, { eq_batch_id: lockedBy });
-    const generated = await rateCardInGeneratedBatch(conn, id);
-    if (generated) {
-      // 12 Oct 2026: a price is never changed under a draft — the draft is voided first, then generated again
-      throw AppError.conflict('RATE_CARD_IN_DRAFT', `Draft invoice batch #${generated} uses this card. Void that draft first, change the card, then generate again.`, { eq_batch_id: generated });
+    if (lockedBy) {
+      throw AppError.conflict('RATE_CARD_LOCKED', `This rate card is used by invoice batch #${lockedBy}, handed over to finance. Use "Change from a date" for the future; `
+        + 'to change a price already handed over, withdraw the invoice from finance first, or make a debit / credit note.', { eq_batch_id: lockedBy });
     }
+    // 14 Oct 2026: a draft or issued invoice using the card follows the change (it is recalculated / brought up to date)
+    const generated = await rateCardInOpenBatch(conn, id);
     const card = checkCard({ ...before, overtime_enabled: Boolean(before.overtime_enabled), operator_included: Boolean(before.operator_included), ...d });
     const machine = await C.loadMachine(conn, before.equipment_id, true);
     await assertContractAndOverlap(conn, machine, card, id);

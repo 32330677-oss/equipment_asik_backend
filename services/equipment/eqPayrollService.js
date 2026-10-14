@@ -52,7 +52,7 @@ async function batchScope(conn, batch) {
   };
 }
 
-const ACTIVE_BATCH = "b.status IN ('Generated','Paid')";
+const ACTIVE_BATCH = "b.status IN ('Generated','HandedOver','Returned')";
 
 /** Rate cards of the machines in scope that overlap the period. */
 async function loadRateCards(conn, equipmentIds, start, end) {

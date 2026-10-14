@@ -1,5 +1,5 @@
-// P16 — rate card close / "change from a date" after billing (monthly = whole batch period), clear message for a
-// draft vs a finalized batch, and the list of monthly days without any attendance row (information only here: the
+// P16 — rate card close / "change from a date" after billing (monthly = whole batch period): only an invoice handed
+// over to finance locks the card (14 Oct 2026), and the list of monthly days without any attendance row (information only here: the
 // harness turns eq_block_monthly_days_without_rows off; p28 tests it blocking).
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
@@ -49,31 +49,24 @@ test('monthly machine: deployed working days without any row are listed before g
   assert.ok(septBatch.eq_batch_id);
 });
 
-test('monthly card: a draft batch locks the WHOLE period (not only up to the last row), with a draft message', async () => {
-  // last row is Sep 24 but the batch bills Sep 25..30 too (hours due)
+test('monthly card: an invoice handed over to finance locks the WHOLE period (not only up to the last row); a date after it is accepted', async () => {
+  // a draft or an issued invoice never locks the card (14 Oct 2026): issue it and hand it over
+  const issued = await h.issue(septBatch.eq_batch_id);
+  assert.strictEqual(issued.state, 'issued');
+  await h.handOver(septBatch.eq_batch_id);
+  // last row is Sep 24 but the invoice bills Sep 25..30 too (hours due)
   const r = await revise(craneCard.rate_card_id, '2026-09-28');
   assert.strictEqual(r.status, 409);
   assert.strictEqual(r.body.code, 'RATE_CARD_LOCKED');
   assert.strictEqual(r.body.details.billed_up_to, '2026-09-30');
-  assert.strictEqual(r.body.details.batch_state, 'draft');
+  assert.strictEqual(r.body.details.batch_state, 'handed_over');
   assert.strictEqual(r.body.details.eq_batch_id, septBatch.eq_batch_id);
-  assert.match(r.body.message, /Draft invoice batch/);
-  assert.match(r.body.message, /void that draft batch/);
-  assert.doesNotMatch(r.body.message, /already paid/);
+  assert.match(r.body.message, /handed over to finance/);
+  assert.match(r.body.message, /debit \/ credit note/);
   const c = await close(craneCard.rate_card_id, '2026-09-26');
   assert.strictEqual(c.status, 409);
   assert.match(c.body.message, /Close it on 2026-09-30 or later/);
-});
-
-test('monthly card: after finalizing, the message points to an official Correction; a date after the period is accepted', async () => {
-  const fin = await h.api().patch(`/api/equipment/payroll/batches/${septBatch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true });
-  assert.ok([200, 201].includes(fin.status), JSON.stringify(fin.body));
-  const r = await revise(craneCard.rate_card_id, '2026-09-28');
-  assert.strictEqual(r.status, 409);
-  assert.strictEqual(r.body.details.batch_state, 'finalized');
-  assert.match(r.body.message, /Finalized invoice batch/);
-  assert.match(r.body.message, /official Correction/);
-  // the finalized month is no longer listed as days without rows
+  // the invoiced month is no longer listed as days without rows
   const blk = await ok(h.api().get(`/api/equipment/payroll/blockers?start_date=2026-09-01&end_date=2026-09-30&equipment_id=${F.crane.equipment_id}`).set(ACC()));
   assert.ok(!blk.find((b) => b.code === 'MONTHLY_DAYS_WITHOUT_ROWS'));
   // the day after the period is fine
@@ -83,16 +76,14 @@ test('monthly card: after finalizing, the message points to an official Correcti
   assert.strictEqual(cards.find((c) => c.rate_card_id === craneCard.rate_card_id).effective_to, '2026-09-30');
 });
 
-test('hourly card: unchanged rule, locked only up to the last row billed', async () => {
+test('hourly card under a draft: no lock, the draft asks to be recalculated', async () => {
   await recordExampleA(F); // rows Oct 1..8 for the excavator
   await h.query("UPDATE eq_attendance SET status = 'Approved', anomaly_ack_at = NOW() WHERE equipment_id = ?", [F.exc.equipment_id]);
   const b = await ok(h.api().post('/api/equipment/payroll/generate').set(ACC())
     .send({ start_date: '2026-10-01', end_date: '2026-10-31', equipment_id: F.exc.equipment_id, accept_blockers: true, accept_reason: 'test data only' }));
   assert.ok(b.eq_batch_id);
-  const locked = await revise(excCard.rate_card_id, '2026-10-08');
-  assert.strictEqual(locked.status, 409);
-  assert.strictEqual(locked.body.details.billed_up_to, '2026-10-08');
-  assert.strictEqual(locked.body.details.batch_state, 'draft');
-  const nc = await ok(revise(excCard.rate_card_id, '2026-10-09'));
-  assert.strictEqual(nc.effective_from, '2026-10-09');
+  const nc = await ok(revise(excCard.rate_card_id, '2026-10-05'));
+  assert.strictEqual(nc.effective_from, '2026-10-05');
+  const d = await ok(h.api().get(`/api/equipment/payroll/batches/${b.eq_batch_id}`).set(ACC()));
+  assert.strictEqual(d.stale, true);
 });

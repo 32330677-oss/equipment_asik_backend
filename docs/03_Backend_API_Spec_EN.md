@@ -70,7 +70,8 @@ controllers/equipment/
   rateCardController.js      rate cards + preview
   deploymentController.js    site assignments / transfers / end
   eqAttendanceController.js  supervisor recording, submit, resubmit, my-sites
-  eqReviewController.js      review, anomalies, edits, corrections
+  eqReviewController.js      review, anomalies, edits, change requests
+  eqFinanceController.js     hand-over to finance, withdrawal, debit / credit notes
   eqFuelAdjustmentController.js
   timesheetController.js     sheets, print, scans, paper checks, close
   eqPayrollController.js     preview, blockers, generate, life cycle, exports, statements
@@ -411,9 +412,7 @@ Body `{site_id, shift_type, record_date}`. Blocks with 409 and a list when: open
 | POST | `/admin/attendance/approve` | A | `{ids:[...]}` — skips rows not Submitted, refuses rows with unacknowledged anomaly; returns `{approved:[], skipped:[{id, reason}]}` |
 | POST | `/admin/attendance/reject` | A | `{ids:[...], notes}` (notes required) |
 | POST | `/admin/attendance/:id/ack-anomaly` | A | `{note}` |
-| PATCH | `/admin/attendance/:id` | A | Edit any non-locked row (Submitted/Approved too); Approved → paper back to Pending (BR-28) |
-| POST | `/admin/attendance/:id/correction` | A | Finalized period: `{reason, changes:{...}}` → writes `eq_attendance_corrections` (`locked_batch_id`, `payroll_effect='AdjustmentRequired'`, `adjustment_status='Open'`) and applies the change; payroll untouched |
-| GET | `/admin/corrections?request_status=Requested,Reviewed` | A, C | Official corrections (see 5.9b): each approved one is settled automatically by a DN/CN and a Correction adjustment |
+| PATCH | `/admin/attendance/:id` | A, C | Edit any row not locked for the user (see 5.9 Locks); Approved → paper back to Pending (BR-28) |
 
 ## 5.7 Fuel and adjustments
 
@@ -447,99 +446,59 @@ Payroll generation refuses rows of a fuel issue without a price: it appears in *
 
 Paper check rules (BR-27): server recomputes `diff_minutes = max(|paper_in − in|, |paper_out − out|)`; `Matched` with diff > tolerance or a missing signature → 400 `CANNOT_MATCH` (details: diff, tolerance, missing signatures). Previous current check of the row gets `is_current = 0`; row `paper_status` updated; `refreshStatus`.
 
-## 5.9 Payroll (equipment)
+## 5.9 Invoices (decisions of 13-14 Oct 2026)
+
+The app records attendance and issues invoices; it records **no payment** (finance pays outside it). Payments, balances
+carried to a later batch, opening balances and official corrections were removed (migration 022).
+
+**States** of an invoice batch (`state` in every response): `draft` (no number, reserves its period) → `issued`
+(VI / MI / FD numbers; still in the office: brought up to date with the **same numbers**) → `handed_over` (locked for
+everybody) → `returned` (withdrawn from finance by a signed acknowledgement; the Admin may change it) → re-issued with
+**new** numbers (`replaced`) or `cancelled`. `superseded` = an older calculation of the same invoice (never listed).
+Every response of a batch carries `actions` = what the current role may do now.
+
+**Locks** (eqLock.denies): handed over → everybody; returned → everybody but the Admin; issued → the Supervisor only;
+draft → nobody. Everything dated inside the period of a machine of the invoice follows (attendance, fuel issues,
+adjustments, delivery notes, deployments, rate cards, monthly terms, fuel terms and prices). Error `INVOICE_LOCKED`
+(`details: {eq_batch_id, state, invoice_no, start_date, end_date}`).
 
 | Method | Path | Roles | Purpose |
 |---|---|---|---|
-| POST | `/payroll/preview` | A, C | `{start_date, end_date, vendor_id?, equipment_id?, site_id?, currency?}` → full calculation, **nothing saved** |
-| GET | `/payroll/blockers?start_date=&end_date=&vendor_id=&equipment_id=&site_id=` | A, C | Why rows are not payable (see below) |
-| POST | `/payroll/generate` | A, C | Same body as preview → creates batch (409 `NOTHING_TO_PAY`, `MIXED_CURRENCY` with list when currency omitted and scope has several) |
-| GET | `/payroll/batches?status=&vendor_id=&from=&to=` | A, C | List |
-| GET | `/payroll/batches/:id` | A, C | Batch + items + lines + stale flag |
-| GET | `/payroll/batches/:id/rows?equipment_id=` | A, C | Snapshot rows |
-| PATCH | `/payroll/batches/:id/finalize` | A, C† | Locks (BR-23) |
-| PATCH | `/payroll/batches/:id/mark-paid` | A, C† | `{paid_at?}` finalized only |
-| PATCH | `/payroll/batches/:id/void` | A, C | `{reason}`, not Paid |
-| POST | `/payroll/batches/:id/supersede` | A, C | `{reason}` finalized only → new version with same scope, rows recalculated |
-| GET | `/payroll/batches/:id/versions` | A, C | Chain |
-| GET | `/payroll/batches/:id/export.pdf?view=&vendor_id=&equipment_id=` | A, C | D2/D3/D4 — `view` = `summary`, `vendor` or `machine` |
-| GET | `/payroll/batches/:id/export.xlsx` | A, C | Workbook: Summary, Vendors, Machines, Lines, Rows |
-| GET | `/statements/machine/:equipmentId.pdf?from=&to=` | A, C | D2 on demand **without** a batch — watermark "PROVISIONAL — not a payroll batch" |
-| GET | `/statements/vendor/:vendorId.pdf?from=&to=` | A, C | D3 provisional |
+| POST | `/payroll/preview` | A, C | `{start_date, end_date, vendor_id?, equipment_ids?, site_id?, currency?, offsets?}` → calculation + `overlaps` (nothing saved) |
+| GET | `/payroll/coverage?vendor_id=&start_date=&end_date=&site_id=` | A, C | Per machine: `ready`, `is_ready`, `overlaps` (invoices already covering part of the period), `free` ranges, `in_draft`, `blockers` |
+| GET | `/payroll/blockers?…` | A, C | Problems; `NOT_APPROVED` items carry `eq_attendance_id` and `status` (approve / reject them inline) |
+| POST | `/payroll/generate` | A, C | Creates a **draft**. 409 `PERIOD_OVERLAP` `{overlaps:[{equipment_id, label, conflicts:[{eq_batch_id, state, invoice_no, start_date, end_date}], free:[{from,to}]}]}`; `take_from_drafts: true` moves the machines out of other drafts |
+| GET | `/payroll/register?vendor_id=&equipment_id=&from=&to=&state=&q=` | A, C | Per vendor: invoices (newest period first) with `machine_invoices`, `fuel_statements`, `notes` (DN / CN linked to it), then `general_notes` |
+| GET | `/payroll/batches?state=Draft\|Issued\|HandedOver\|Returned\|Cancelled\|Replaced\|Active&vendor_id=&equipment_id=&from=&to=&q=` | A, C | List (never Superseded) |
+| GET | `/payroll/batches/:id` | A, C | Detail: `state`, `actions`, `stale`, `needs_refresh`, `invoices`, `vendor_invoice_no`, `handover`, `withdrawal`, `notes`, `replaced_by`, `replaces`, items |
+| PATCH | `/payroll/batches/:id/finalize` | A, C (setting `payroll_finalize_admin_only`) | **Issue**: 409 `PERIOD_NOT_ENDED`, `BATCH_STALE`, `ROWS_NOT_APPROVED` (`details.blockers`), `CHANGES_NOT_ACKNOWLEDGED` |
+| POST | `/payroll/batches/:id/refresh` | A, C | Issued: brought up to date, same numbers and issue date (audit `invoice_updated` with before / after); `unchanged: true` when nothing changed. Exports call it too |
+| POST | `/payroll/batches/:id/supersede` | A, C | Draft: Recalculate |
+| PATCH | `/payroll/batches/:id/offsets` | A | Monthly extra hours cover missing hours (draft: recalculated; issued: refreshed) |
+| PATCH | `/payroll/batches/:id/void` | A, C | Draft: deleted (A, C). Issued / returned: Admin + `reason` (numbers kept cancelled). Handed over: 409 `INVOICE_HANDED_OVER` |
+| POST | `/payroll/handovers` | A | `{batch_ids, note_ids, receiver_name, handed_on?, note?}` → HO-YYYY-NNNNN. Issued invoices are refreshed first; returned must be unchanged (409 `REISSUE_FIRST`); `SCAN_MISSING` when `eq_finalize_requires_scan` |
+| GET | `/payroll/handovers`, `/payroll/handovers/:id`, `/payroll/handovers/:id/pdf` | A, C | Hand-over sheets (to sign) |
+| POST | `/payroll/batches/:id/withdraw` | A | `{reason ≥5, finance_person, withdrawn_on?, was_paid?, paid_amount?}` → WD-YYYY-NNNNN, state `returned`; response `withdrawal_id` |
+| GET | `/payroll/withdrawals/:id/pdf` | A, C | Withdrawal acknowledgement (to sign; no scan) |
+| POST | `/payroll/batches/:id/reissue` | A | `{reason}` returned → recalculated with **new** numbers; old = `replaced`, its numbers cancelled. Nothing printed refers to the old one |
+| GET/POST | `/payroll/notes` | A, C | Debit / credit notes: list (`vendor_id, equipment_id, ref_batch_id, status, q`), create a draft `{kind: Debit\|Credit, vendor_id, equipment_id?, currency, amount > 0, reason, note_date?, period_from?, period_to?, ref_batch_id?}` |
+| GET/PUT | `/payroll/notes/:id` | A, C | Detail (`actions`, `ref_invoice`); change: draft A, C — issued / returned Admin (same number) |
+| PATCH | `/payroll/notes/:id/issue` | A | DN-YYYY-NNNNN / CN-YYYY-NNNNN |
+| PATCH | `/payroll/notes/:id/cancel` | A, C | Draft deleted; issued / returned Admin + reason; handed over 409 `NOTE_HANDED_OVER` |
+| POST | `/payroll/notes/:id/withdraw` | A | Like a batch |
+| GET | `/payroll/notes/:id/pdf` | A, C | The note (logo, bilingual) |
+| GET | `/payroll/batches/:id/export.pdf?view=summary\|vendor\|machine\|fueldiff&vendor_id=&equipment_id=&hide=` | A, C | Header `X-Batch-Id` = the batch printed (an issued invoice is printed up to date) |
+| GET | `/payroll/batches/:id/export.xlsx` | A, C | Data workbook |
+| GET | `/payroll/batches/:id/certificate.xlsx?vendor_id=&equipment_id=` | A, C | Vendor invoice + one **payment certificate** sheet per machine (company format, logo, charcoal / gold) |
+| GET | `/statements/vendor/:id/account(.pdf)?from=&to=` | A, C | Statement of invoices: issued invoices + DN − CN, running total, estimate of what is not invoiced yet |
 
-Blocker codes (each with row ids / dates / machine): `NOT_APPROVED` (Draft/Submitted/Rejected), `PAPER_NOT_MATCHED`, `OPEN_SESSION`, `UNACK_ANOMALY`, `NO_RATE_CARD`, `FUEL_UNPRICED`, `IN_OTHER_BATCH` (with batch id), `CURRENCY_MISMATCH`.
+Removed routes: `/payroll/batches/:id/mark-paid`, `/undo-paid`, `/payment-reference`, `/payments`, `/payroll/payments/*`,
+`/payroll/batches/:id/statement.pdf`, `/unfinalize`, `/payroll/requests/*`, `/opening-balances*`, `/admin/attendance/:id/correction`,
+`/admin/corrections*`. `PATCH /admin/change-requests/:id/approve` no longer accepts `convert_to_correction`.
 
-Generate algorithm (transaction):
-
-1. Resolve scope, load eligible rows (doc 02 §4.5) `FOR UPDATE`.
-2. Load rate cards overlapping the period for the machines; resolve per row; rows without card → abort with `NO_RATE_CARD` list (never silently skip).
-3. Group rows by (equipment, site, rate_card); for Monthly build `ctx.months` from deployments (assigned days per calendar month inside the period, clipped to the rate card dates).
-4. Attach fuel (by issue date → rate card) and adjustments (by date; site if given, else the machine's item with the most rows) not consumed by an active batch.
-5. Call `equipmentBillingEngine.billItem` for each group; check single currency.
-6. Insert batch, items (with `rate_snapshot`), lines (with source links), snapshot rows (with per-row minutes from `dayMinutes`), totals. Audit.
-7. Response: batch summary + warnings.
-
-`stale = true` on a non-finalized batch when any snapshot row was edited after `generated_at` (compare `eq_attendance.updated_at`) — UI shows "Recalculate" (void + generate).
-
-### Opening balances (014)
-
-| Method | Path | Roles | Purpose |
-|---|---|---|---|
-| GET | `/opening-balances?vendor_id=&status=` | A, C | List with `state` = `Open` / `Carried` (with `carried_to_batch_id`) / `Cancelled` |
-| POST | `/vendors/:id/opening-balances` | A, C | `{amount, as_of_date, description, currency?, equipment_id?, period_from?, period_to?, reference?, note?}` — currency defaults to the vendor's only contract currency |
-| PUT | `/opening-balances/:id` | A, C | Change while `Open` (409 `OPENING_BALANCE_CARRIED` once carried) |
-| PATCH | `/opening-balances/:id/cancel` | A, C | `{reason}` (≥ 5 chars), while `Open` |
-
-`POST /payroll/preview` lists open opening balances in `carry_forward` (`kind: "opening"`, `opening_balance_id`, `description`); `generate` with `carry_forward: true` carries them with the batch balances.
-
-## 5.9b Correction policy (decisions of 6 Oct 2026)
-
-Principle: **not financially committed → normal correction path; finalized or paid → official Correction path.** A finalized
-period is never reopened and never paid by a new batch (no "recovery batch").
-
-| Method | Path | Roles | Purpose |
-|---|---|---|---|
-| POST | `/attendance/check-in` | A, S | adds `late_reason`, and `check_out_time` + `meter_end` to record a whole past session in one call. A row older than `eq_late_entry_days` (default 3) is saved and flagged `late_entry` (warning `LATE_ENTRY` in `warnings`, never a block) |
-| POST | `/attendance/day-status` | A, S | adds `late_reason` (same late-entry warning). Overwriting a session keeps the old values in the audit log |
-| PATCH | `/attendance/:id/downtime/:downtimeId` | A, S | correct a pause in place `{downtime_type?, start_time?, end_time?, reason?}` (Draft/Rejected rows) |
-| PATCH | `/attendance/:id/cancel` | A, S | supervisor cancels a Rejected row that was **never approved** `{reason ≥5}`; the row stays as `Cancelled` and frees its slot. A row approved once (`approved_by_user_id` or an `approve` audit entry) → 409 `APPROVED_BEFORE`: only the office voids it or corrects it. The row view carries `was_approved` |
-| POST | `/attendance/:id/change-requests` | A, S | the **current** supervisor asks the office for a change `{reason ≥5, changes:{...}}` (Approved rows, or days before their assignment) |
-| GET | `/attendance/change-requests` | A, S | own requests |
-| PATCH | `/attendance/change-requests/:id/withdraw` | A, S | requester only |
-| GET | `/attendance/site/:siteId` | A, C, S | adds `access: {can_edit, reason: moved_away / before_assignment / ..., late_after_days, days_old}`. Historical visibility is not editing permission |
-| GET | `/admin/attendance` | A, C | adds `late=only`; `Cancelled` hidden unless `status=Cancelled`; `pending_change_requests` per row; `meta.counts.late_entries` |
-| GET | `/admin/attendance/:id` | A, C | adds `change_requests`, `locked_by_status` (Finalized / Paid), `generated_batch_id`, history with `changed_fields` and `payroll_effect` |
-| PATCH | `/admin/attendance/:id` | A, C | office edit before the lock, several fields at once; reason ≥5 on an Approved row; paper status resets only when a paper field changes |
-| PATCH | `/admin/attendance/:id/cancel` | A, C | void a row before the lock `{reason ≥5}` (kept as Cancelled) |
-| GET | `/admin/change-requests?status=` | A, C | list |
-| PATCH | `/admin/change-requests/:id/approve` | A, C | applies the change (another person than the requester). Locked row → 409 `ROW_LOCKED_USE_CORRECTION` unless `convert_to_correction: true` |
-| PATCH | `/admin/change-requests/:id/reject` | A, C | `{note ≥3}` |
-| POST | `/admin/attendance/:id/correction` | A, C | official Correction, several fields (or `cancel_row: true` alone) `{reason ≥5, changes, amount_override?, override_reason?}` |
-| POST | `/admin/corrections/financial` | A, C | official Correction of money that is not attendance: `target_type` fuel_issue (with `fuel_changes`, amount computed) / rate_card / fuel_price / fuel_terms / adjustment / deployment / other (`amount`), `eq_item_id` of the finalized item |
-| PATCH | `/admin/corrections/:id/review` | A, C | the requester amends (stays Requested) or another person reviews (Reviewed) |
-| PATCH | `/admin/corrections/:id/approve` | A, C | by a person other than the author of the last version → applies the change, issues the debit / credit note and a Correction adjustment in the first open period |
-| PATCH | `/admin/corrections/:id/return`, `/cancel` | A, C | return (not the last author); cancel (requester, reviewer or Admin). `resolve` was removed |
-| PATCH | `/deployments/:id/start` | A, C | correct the first day `{assigned_date, reason ≥5}`; refused inside a closed period |
-| PATCH | `/fuel-terms/:id/start` | A, C | correct the first day of fuel price difference terms `{effective_from, reason ≥5}`; refused when the days added or removed are in a finalized payroll of the machine, or overlap earlier terms (`FUEL_TERMS_OVERLAP`) |
-| PATCH | `/api/site-supervisors/:id/start` | A | correct the first day of a supervisor period `{from_date, reason ≥5}`; refused when the days involved are in a finalized payroll of the site, or another supervisor covers that site/shift (`SUPERVISOR_PERIOD_OVERLAP`) |
-| PATCH | `/payroll/batches/:id/finalize` | A, C† | `{acknowledge_changes: true}` required when the batch pays manual changes (409 `CHANGES_NOT_ACKNOWLEDGED` with the list) |
-| GET | `/payroll/batches/:id/review-summary` | A, C | manual changes the batch pays (edits after approval, late entries, standby hours, adjustments, correction settlements, fuel / rate card changes, accepted blockers) |
-| PATCH | `/payroll/batches/:id/mark-paid` | A, C† | adds `payment_reference?` |
-| PATCH | `/payroll/batches/:id/undo-paid` | A, C† | `{reason ≥5}`; only within `eq_paid_undo_hours` (default 168) and without payment reference (409 `UNDO_PAID_NOT_ALLOWED`) |
-| PATCH | `/payroll/batches/:id/payment-reference` | A, C† | record / change (reason when changing) |
-| POST | `/payroll/generate` | A, C | accepting blockers needs `accept_reason ≥5` (kept on the batch) |
-
-Final business decisions (6 Oct 2026, confirmed):
-- **Undo Mark Paid:** default window 168 h (`eq_paid_undo_hours`, control setting: a reason to change it), counted from `paid_marked_at`; only without payment reference, with a reason, for the users allowed by `payroll_finalize_admin_only`.
-- **No monetary threshold** on manual adjustments; no extra approval because of an amount.
-- **No extra separation of duties** in Generate / Finalize / Mark Paid (the same allowed person may do all three). The four-eyes rule applies only to official Corrections (the author of the latest version never approves it) and to supervisor change requests (the requester never applies their own request).
-- **Late entries:** `eq_late_entry_days` = 3, warning and flag only, never a block and never a payroll lock; the reason is always optional; no second threshold.
-- **Supervisor cancel:** only Rejected, never-approved rows.
-- **No legacy clean-up:** the database is empty; no script or migration rewrites old check-out fuel rows or old Open corrections.
-
-Other rules: blockers add `IN_CLOSED_PERIOD` (information only) and items of a closed period never block a new batch; fuel
-litres / a set price change need a reason; a correction settlement adjustment cannot be cancelled
-(`CORRECTION_ADJUSTMENT_LOCKED`); control settings, role changes and deactivations need a reason ≥5.
+Numbers: `eq_invoice_counters` per kind and year (VI, MI, FD, DN, CN, HO, WD); a number is never reused — the same number
+appears again only when the **same** issued invoice is brought up to date (it is reserved as `Withdrawn` for the new
+calculation and given back).
 
 ## 5.10 Live board and reports
 
@@ -600,9 +559,10 @@ Implementation: ~6 set-based queries in `Promise.all` (deployments active today,
 | `RATE_CARD_OVERLAP` / `RATE_CARD_OUTSIDE_CONTRACT` / `RATE_CARD_LOCKED` | 409 | BR-05 / BR-06 |
 | `TIMESHEET_CLOSED` / `FINAL_SCAN_REQUIRED` / `CANNOT_MATCH` / `DUPLICATE_SCAN` | 409/400 | Paper rules |
 | `FILE_TOO_LARGE` / `FILE_TYPE_NOT_ALLOWED` | 413 / 415 | Uploads |
-| `PAYROLL_PERIOD_FINALIZED` | 409 | BR-23 |
+| `INVOICE_LOCKED` | 409 | The date is inside an invoice that stops the user (handed over / returned / issued for a supervisor) |
+| `PERIOD_OVERLAP` / `PERIOD_NOT_ENDED` / `ROWS_NOT_APPROVED` / `REISSUE_FIRST` / `INVOICE_HANDED_OVER` / `NOTE_HANDED_OVER` / `MONTH_LINKED` | 409 | Invoices (5.9) |
 | `NOTHING_TO_PAY` / `MIXED_CURRENCY` / `NO_RATE_CARD` / `FUEL_UNPRICED` | 409 | Payroll |
-| `BATCH_STATE` | 409 | Finalize/paid/void/supersede not allowed in current state |
+| `BATCH_STATE` | 409 | Action not allowed in the current state of the invoice / note |
 
 # 7. Route file skeleton
 

@@ -190,10 +190,10 @@ const NOTE_FROM = `FROM eq_delivery_notes dn JOIN eq_equipment e ON e.equipment_
   LEFT JOIN users u ON u.user_id = dn.created_by_user_id`;
 const NOTE_COLS = `dn.*, e.equipment_code, e.machine_label, t.type_name, vd.vendor_name, s.site_code, s.site_name, r.item_name, r.unit, u.full_name AS created_by,
   (SELECT b.eq_batch_id FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-    WHERE l.source_table = 'eq_delivery_notes' AND l.source_id = dn.delivery_note_id AND b.status IN ('Generated','Paid') ORDER BY b.eq_batch_id DESC LIMIT 1) AS in_batch_id,
-  (SELECT IF(b.status = 'Paid', 'Paid', IF(b.is_finalized = 1, 'Finalized', 'Draft')) FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id
+    WHERE l.source_table = 'eq_delivery_notes' AND l.source_id = dn.delivery_note_id AND b.status IN ('Generated','HandedOver','Returned') ORDER BY b.eq_batch_id DESC LIMIT 1) AS in_batch_id,
+  (SELECT IF(b.status = 'HandedOver', 'HandedOver', IF(b.status = 'Returned', 'Returned', IF(b.is_finalized = 1, 'Issued', 'Draft'))) FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id
     JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-    WHERE l.source_table = 'eq_delivery_notes' AND l.source_id = dn.delivery_note_id AND b.status IN ('Generated','Paid') ORDER BY b.eq_batch_id DESC LIMIT 1) AS batch_state`;
+    WHERE l.source_table = 'eq_delivery_notes' AND l.source_id = dn.delivery_note_id AND b.status IN ('Generated','HandedOver','Returned') ORDER BY b.eq_batch_id DESC LIMIT 1) AS batch_state`;
 
 function noteView(n) {
   const amount = D.exactCents(Number(n.quantity) * Number(n.unit_price)) / 100;
@@ -256,7 +256,8 @@ exports.createNote = async (req, res) => {
     await C.loadSite(conn, d.site_id);
     const rate = await D.loadRate(conn, d.dnr_rate_id);
     D.assertUsable(rate, machine, d.note_date);
-    // 11 Oct 2026: a note dated inside a finalized period is allowed; the next batch of the machine bills it
+    // 14 Oct 2026: refused inside an invoice handed over to finance (an issued invoice is brought up to date by itself)
+    await lock.assertOpen(conn, { equipmentId: d.equipment_id, siteId: d.site_id, from: d.note_date, what: 'A delivery note on this date' });
     await assertNumberFree(conn, machine.vendor_id, d.dn_number);
     let r;
     try {
@@ -296,7 +297,7 @@ exports.updateNote = async (req, res) => {
     const before = await loadNote(conn, id);
     if (before.status === 'Cancelled') throw AppError.conflict('INVALID_STATE', 'This delivery note is cancelled.');
     const used = await lock.sourceConsumed(conn, 'eq_delivery_notes', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This delivery note is in finalized invoice batch #${used.eq_batch_id}. Ask for an official Correction (open that batch, the machine, "Official correction").`);
+    if (used) throw lock.lockedError(used, 'This delivery note');
     const machine = await C.loadMachine(conn, before.equipment_id);
     const next = { ...before, note_date: day(before.note_date), ...d };
     const moneyKeys = ['quantity', 'dnr_rate_id', 'note_date', 'site_id'];
@@ -308,6 +309,7 @@ exports.updateNote = async (req, res) => {
     if (changesMoney && reason.length < 5) throw AppError.validation({ reason: 'say why the quantity, price, date or site changes (at least 5 characters)' });
     if (next.note_date > businessToday()) throw AppError.badRequest('FUTURE_DATE', 'The date cannot be in the future.');
     if (d.site_id !== undefined) await C.loadSite(conn, d.site_id);
+    if (d.note_date !== undefined || d.site_id !== undefined) await lock.assertOpen(conn, { equipmentId: before.equipment_id, siteId: next.site_id, from: next.note_date, what: 'The new date of this delivery note' });
     let unitPrice = before.unit_price; let currency = before.currency;
     if (d.dnr_rate_id !== undefined || d.note_date !== undefined) {
       const rate = await D.loadRate(conn, next.dnr_rate_id);
@@ -343,7 +345,7 @@ exports.cancelNote = async (req, res) => {
     const before = await loadNote(conn, id);
     if (before.status === 'Cancelled') return;
     const used = await lock.sourceConsumed(conn, 'eq_delivery_notes', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This delivery note is in finalized invoice batch #${used.eq_batch_id}. Reverse it with an official Correction.`);
+    if (used) throw lock.lockedError(used, 'This delivery note');
     const inBatch = await lock.sourceConsumed(conn, 'eq_delivery_notes', id);
     await conn.execute("UPDATE eq_delivery_notes SET status = 'Cancelled', cancel_reason = ?, cancelled_by_user_id = ?, cancelled_at = ? WHERE delivery_note_id = ?",
       [reason, req.user.user_id, businessNow(), id]);

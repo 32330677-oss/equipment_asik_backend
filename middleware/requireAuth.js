@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const { env } = require('../config/env');
 const { pool } = require('../config/db');
 const AppError = require('../utils/AppError');
+const { runAs } = require('../utils/requestContext');
 
 // Routes still reachable while must_change_password = 1.
 const PASSWORD_GATE_ALLOW = new Set(['/api/auth/me', '/api/auth/change-password']);
@@ -40,7 +41,8 @@ async function requireAuth(req, res, next) {
     if (req.user.must_change_password && !PASSWORD_GATE_ALLOW.has(path)) {
       throw new AppError(403, 'PASSWORD_CHANGE_REQUIRED', 'You must change your password before continuing.');
     }
-    next();
+    // the rest of the request knows who is calling (lock rules by role, 14 Oct 2026)
+    runAs(req.user, next);
   } catch (e) {
     next(e);
   }

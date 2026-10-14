@@ -1,25 +1,19 @@
-// services/equipment/eqLedger.js — running statements (decision of 11 Oct 2026).
+// services/equipment/eqLedger.js — running statements (11 Oct 2026; payments removed 14 Oct 2026).
 //
-// 1. Vendor statement of account (كشف حساب تراكمي): every official movement with the vendor, oldest first, with the
-//    running balance = what the company still owes the vendor.
-//      + vendor invoice (VI) of every FINALIZED batch (date = finalize date), opening balances (money owed before the system),
-//        debit notes, a payment reversed (its reversal line)
-//      - payments (vouchers), credit notes
-//    Not in it: drafts; balances carried from a batch to another ("Add previous balances": an internal move).
-//    A debit / credit note is counted when it is issued; the vendor invoice that later pays its settlement adjustment shows
-//    its amount WITHOUT that adjustment (said on the line), so nothing is counted twice.
-//    One section per currency. Lines before `from` are summed into the balance brought forward.
-//    At the end, an ESTIMATE of what is earned but not invoiced yet (approved days not in any batch), clearly marked.
+// 1. Vendor statement of invoices (كشف فواتير المورد): every official document with the vendor, oldest first, with the
+//    cumulative total invoiced: + vendor invoices (VI) of issued / handed-over / withdrawn invoices (date = issue date),
+//    + debit notes, - credit notes. Not in it: drafts, cancelled numbers. Finance pays outside the application.
+//    One section per currency. Lines before `from` are summed. At the end, an ESTIMATE of what is earned but not
+//    invoiced yet (approved days not in any invoice), clearly marked.
 //
-// 2. Machine billing history (كشف الآلية): every batch item of the machine (period billed, invoice numbers, days, hours,
-//    gross / deductions / net, state of the batch and its payment), the debit / credit notes of the machine, and the days
-//    NOT billed yet (approved, waiting for approval, monthly deployed days) so a forgotten period shows at once.
+// 2. Machine billing history (كشف الآلية): every invoice item of the machine (period billed, invoice numbers, days, hours,
+//    gross / deductions / net, state), the debit / credit notes of the machine, and the days NOT billed yet (approved,
+//    waiting for approval, monthly deployed days) so a forgotten period shows at once.
 'use strict';
 
 const P = require('../pdfKit');
 const settings = require('../settings');
 const PS = require('./eqPayrollService');
-const S = require('./eqSettlement');
 const { businessToday, businessNow, addDays } = require('../../utils/businessDate');
 
 const { COLORS, fmt } = P;
@@ -28,19 +22,15 @@ const cents = (v) => Math.round(n(v) * 100);
 const day = (d) => (d ? String(d).slice(0, 10) : null);
 const money = (c, cur) => fmt.money(c, cur); // c = cents
 const BEGIN = '2000-01-01';
-const ACTIVE = "b.status IN ('Generated','Paid')";
+const ACTIVE = "b.status IN ('Generated','HandedOver','Returned')";
 
 const KIND_TEXT = {
-  opening: { en: 'Opening balance', ar: 'رصيد افتتاحي' },
   invoice: { en: 'Invoice', ar: 'فاتورة' },
-  DebitNote: { en: 'Debit note', ar: 'إشعار مدين' },
-  CreditNote: { en: 'Credit note', ar: 'إشعار دائن' },
-  payment: { en: 'Payment', ar: 'سند صرف' },
-  reversal: { en: 'Payment reversed', ar: 'عكس دفعة' },
-  marked: { en: 'Marked paid', ar: 'تسديد' },
+  Debit: { en: 'Debit note', ar: 'إشعار مدين' },
+  Credit: { en: 'Credit note', ar: 'إشعار دائن' },
 };
-const METHOD_TEXT = { BankTransfer: 'bank transfer', Cheque: 'cheque', Cash: 'cash', Other: 'other' };
-const ORDER = { opening: 0, invoice: 1, DebitNote: 2, CreditNote: 3, payment: 4, marked: 4, reversal: 5 };
+const ORDER = { invoice: 1, Debit: 2, Credit: 3 };
+const STATE_TEXT = { Generated: 'Issued', HandedOver: 'Handed over to finance', Returned: 'Withdrawn from finance' };
 
 /** Consecutive dates -> "dd/mm/yyyy - dd/mm/yyyy (n)" ranges. A gap made only of the weekly off day (offDay, 0-6) does not cut a range. */
 function ranges(dates, offDay = null) {
@@ -70,58 +60,22 @@ async function vendorMovements(conn, vendorId) {
     const [[no]] = await conn.query(
       `SELECT x.invoice_no FROM eq_invoices x LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = x.invoice_id
        WHERE x.eq_batch_id = ? AND x.vendor_id = ? AND x.kind = 'Vendor' AND x.status = 'Issued' AND c.invoice_id IS NULL ORDER BY x.invoice_id DESC LIMIT 1`, [b.eq_batch_id, vendorId]);
-    // settlement adjustments of corrections paid by this invoice: their note was counted when it was issued
-    const [corr] = await conn.query(
-      `SELECT l.amount, a.reason FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id
-       JOIN eq_adjustments a ON l.source_table = 'eq_adjustments' AND a.adjustment_id = l.source_id
-       WHERE i.eq_batch_id = ? AND i.vendor_id = ? AND a.correction_id IS NOT NULL`, [b.eq_batch_id, vendorId]);
-    const corrCents = corr.reduce((a, l) => a + cents(l.amount), 0);
-    const notes = corr.map((l) => (String(l.reason || '').match(/^(DN|CN)-\d{4}-\d{5}/) || [])[0]).filter(Boolean);
+    const state = STATE_TEXT[b.status] || b.status;
     out.push({
       kind: 'invoice', date: day(b.finalized_at) || day(b.end_date), currency: b.currency, doc_no: no ? no.invoice_no : `Batch #${b.eq_batch_id}`,
-      description: `${fmt.date(day(b.start_date))} - ${fmt.date(day(b.end_date))}, ${b.items} item(s), batch #${b.eq_batch_id}${Number(b.version_number) > 1 ? ` v${b.version_number}` : ''}`
-        + (corrCents ? `; excl. ${notes.join(', ') || 'corrections'} already counted (${money(corrCents, b.currency)})` : ''),
-      debit: cents(b.net) - corrCents, credit: 0, eq_batch_id: b.eq_batch_id,
+      description: `${fmt.date(day(b.start_date))} - ${fmt.date(day(b.end_date))}, ${b.items} machine(s), ${state}`,
+      debit: cents(b.net), credit: 0, eq_batch_id: b.eq_batch_id,
     });
-    // batches marked paid before payments were recorded: the whole balance was settled at that time
-    if (b.status === 'Paid') {
-      const [[p]] = await conn.query('SELECT COUNT(*) AS n FROM eq_payments WHERE eq_batch_id = ?', [b.eq_batch_id]);
-      if (!Number(p.n)) {
-        const [[bb]] = await conn.query('SELECT * FROM eq_payroll_batches WHERE eq_batch_id = ?', [b.eq_batch_id]);
-        const money2 = await S.balances(conn, bb);
-        const v = money2._vendors.find((x) => x.vendor_id === vendorId);
-        if (v && v._paid) {
-          out.push({ kind: 'marked', date: day(bb.paid_at) || day(bb.finalized_at), currency: b.currency, doc_no: no ? no.invoice_no : '',
-            description: 'Marked paid (no voucher recorded)', debit: 0, credit: v._paid });
-        }
-      }
-    }
   }
-  // debit / credit notes (official corrections)
+  // debit / credit notes (14 Oct 2026): stand-alone documents, counted once issued
   const [notes] = await conn.query(
-    `SELECT x.invoice_no, x.kind, x.amount, x.currency, x.issued_at, e.equipment_code, e.machine_label FROM eq_invoices x
-     LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = x.invoice_id LEFT JOIN eq_equipment e ON e.equipment_id = x.equipment_id
-     WHERE x.vendor_id = ? AND x.kind IN ('DebitNote','CreditNote') AND c.invoice_id IS NULL`, [vendorId]);
+    `SELECT n.note_no, n.kind, n.amount, n.currency, n.note_date, n.reason, e.equipment_code, e.machine_label FROM eq_notes n
+     LEFT JOIN eq_equipment e ON e.equipment_id = n.equipment_id
+     WHERE n.vendor_id = ? AND n.status IN ('Issued','HandedOver','Returned')`, [vendorId]);
   for (const x of notes) {
     const c = cents(x.amount);
-    out.push({ kind: x.kind, date: day(x.issued_at), currency: x.currency, doc_no: x.invoice_no,
-      description: `Correction${x.equipment_code ? `: ${x.machine_label || x.equipment_code}` : ''}`, debit: c > 0 ? c : 0, credit: c < 0 ? -c : 0 });
-  }
-  // payments (and their reversal)
-  const [pays] = await conn.query('SELECT * FROM eq_payments WHERE vendor_id = ?', [vendorId]);
-  for (const p of pays) {
-    const how = [METHOD_TEXT[p.method] || p.method, p.reference].filter(Boolean).join(' ');
-    out.push({ kind: 'payment', date: day(p.paid_on), currency: p.currency, doc_no: p.voucher_no, description: `${how}${p.note ? ` - ${p.note}` : ''}`, debit: 0, credit: cents(p.amount) });
-    if (p.status === 'Reversed') {
-      out.push({ kind: 'reversal', date: day(p.reversed_at) || day(p.paid_on), currency: p.currency, doc_no: p.voucher_no,
-        description: `Reversed${p.reverse_reason ? `: ${p.reverse_reason}` : ''}`, debit: cents(p.amount), credit: 0 });
-    }
-  }
-  // opening balances (money owed before the system)
-  const [ob] = await conn.query("SELECT * FROM eq_opening_balances WHERE vendor_id = ? AND status = 'Active'", [vendorId]);
-  for (const o of ob) {
-    out.push({ kind: 'opening', date: day(o.as_of_date), currency: o.currency, doc_no: o.reference || '',
-      description: `${o.description}${o.period_from ? ` (${fmt.date(day(o.period_from))} - ${fmt.date(day(o.period_to))})` : ''}`, debit: cents(o.amount), credit: 0 });
+    out.push({ kind: x.kind, date: day(x.note_date), currency: x.currency, doc_no: x.note_no,
+      description: `${x.equipment_code ? `${x.machine_label || x.equipment_code}: ` : ''}${x.reason}`, debit: x.kind === 'Debit' ? c : 0, credit: x.kind === 'Credit' ? c : 0 });
   }
   return out;
 }
@@ -148,7 +102,7 @@ async function vendorStatement(conn, vendorId, { from = BEGIN, to = businessToda
     const rows = ms.filter((m) => m.date >= from).map((m) => { bal += m.debit - m.credit; return { ...m, balance: bal }; });
     sections.push({
       currency: cur, brought_forward: brought, rows, total_debit: rows.reduce((a, r) => a + r.debit, 0), total_credit: rows.reduce((a, r) => a + r.credit, 0),
-      closing: bal, last_payment: [...rows].reverse().find((r) => r.kind === 'payment') || null, estimate: null,
+      closing: bal, estimate: null,
     });
   }
   // what is earned but not invoiced yet (approved days, fuel, adjustments... not in any batch): an estimate
@@ -189,15 +143,6 @@ async function machineHistory(conn, equipmentId, { from = BEGIN, to = businessTo
      FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id JOIN sites s ON s.site_id = i.site_id
      WHERE i.equipment_id = ? AND ${ACTIVE} AND b.start_date <= ? AND b.end_date >= ?
      ORDER BY b.start_date, i.eq_item_id`, [equipmentId, to, from]);
-  // payment state of each batch for this vendor
-  const pay = new Map();
-  for (const id of [...new Set(items.filter((i) => Number(i.is_finalized)).map((i) => i.eq_batch_id))]) {
-    const [[b]] = await conn.query('SELECT * FROM eq_payroll_batches WHERE eq_batch_id = ?', [id]);
-    const bal = await S.balances(conn, b);
-    const v = bal.vendors.find((x) => x.vendor_id === m.vendor_id);
-    pay.set(id, v ? v.payment_status : null);
-  }
-  const STATE = { Paid: 'Paid', PartiallyPaid: 'Partly paid', Unpaid: 'Finalized - unpaid', CarriedForward: 'Carried forward', NothingDue: 'Nothing due' };
   const rows = items.map((i) => {
     const firsts = [day(i.r_from), day(i.m_from)].filter(Boolean).sort();
     const lasts = [day(i.r_to), day(i.m_to)].filter(Boolean).sort();
@@ -210,16 +155,12 @@ async function machineHistory(conn, equipmentId, { from = BEGIN, to = businessTo
       days: i.billing_mode === 'Monthly' && Number(i.m_days) ? Number(i.m_days) : Number(i.worked_days || i.days_recorded || 0),
       work_hours: n(i.work_hours), overtime_hours: n(i.overtime_hours),
       gross: cents(i.gross_amount), deductions: cents(i.deductions_amount), net: cents(i.net_amount),
-      state: fin ? (STATE[pay.get(i.eq_batch_id)] || 'Finalized') : 'Draft', finalized: fin,
+      state: fin ? (STATE_TEXT[i.status] || i.status) : 'Draft', finalized: fin,
     };
   });
   const [notes] = await conn.query(
-    `SELECT x.invoice_no, x.kind, x.amount, x.currency, x.issued_at, x.eq_batch_id,
-       (SELECT MIN(i.eq_batch_id) FROM eq_adjustments a JOIN eq_payroll_lines l ON l.source_table = 'eq_adjustments' AND l.source_id = a.adjustment_id
-          JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-        WHERE a.correction_id IS NOT NULL AND a.reason LIKE CONCAT(x.invoice_no, ' %') AND ${ACTIVE}) AS settled_batch_id
-     FROM eq_invoices x LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = x.invoice_id
-     WHERE x.equipment_id = ? AND x.kind IN ('DebitNote','CreditNote') AND c.invoice_id IS NULL AND DATE(x.issued_at) BETWEEN ? AND ? ORDER BY x.issued_at`, [equipmentId, from, to]);
+    `SELECT n.note_no, n.kind, n.amount, n.currency, n.note_date, n.ref_batch_id FROM eq_notes n
+     WHERE n.equipment_id = ? AND n.status IN ('Issued','HandedOver','Returned') AND n.note_date BETWEEN ? AND ? ORDER BY n.note_date`, [equipmentId, from, to]);
   // ---- not billed yet (attendance rows outside any active batch; monthly deployed days not billed)
   const until = to < businessToday() ? to : businessToday();
   const [free] = await conn.query(
@@ -261,14 +202,12 @@ async function machineHistory(conn, equipmentId, { from = BEGIN, to = businessTo
     const ns = notes.filter((x) => x.currency === cur);
     return {
       currency: cur, finalized: rs.filter((r) => r.finalized).reduce((a, r) => a + r.net, 0), draft: rs.filter((r) => !r.finalized).reduce((a, r) => a + r.net, 0),
-      // a note already paid inside a listed batch is in that batch's net: not added again
-      notes: ns.filter((x) => !x.settled_batch_id).reduce((a, x) => a + cents(x.amount), 0),
+      notes: ns.reduce((a, x) => a + (x.kind === 'Credit' ? -cents(x.amount) : cents(x.amount)), 0),
     };
   });
   return {
     machine: m, from, to, rows,
-    notes: notes.map((x) => ({ invoice_no: x.invoice_no, kind: x.kind, amount: cents(x.amount), currency: x.currency, date: day(x.issued_at), eq_batch_id: x.eq_batch_id,
-      settled_batch_id: x.settled_batch_id || null })),
+    notes: notes.map((x) => ({ invoice_no: x.note_no, kind: x.kind, amount: x.kind === 'Credit' ? -cents(x.amount) : cents(x.amount), currency: x.currency, date: day(x.note_date), eq_batch_id: x.ref_batch_id })),
     not_billed: { approved, pending, monthly_days: monthly, until }, totals,
   };
 }
@@ -304,10 +243,10 @@ async function vendorStatementPdf(conn, st, user) {
   const company = await settings.getString('company_name');
   const printedAt = businessNow().slice(0, 16);
   const v = st.vendor;
-  const doc = P.createDoc({ info: { Title: `Statement of account ${v.vendor_name}` } });
+  const doc = P.createDoc({ info: { Title: `Statement of invoices ${v.vendor_name}` } });
   const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
   const periodText = `${st.from <= BEGIN ? 'Since the start' : fmt.date(st.from)} - ${fmt.date(st.to)}`;
-  let y = head(doc, 'STATEMENT OF ACCOUNT', 'كشف حساب', company, [v.vendor_name, v.vendor_code ? `Code ${v.vendor_code}` : '', periodText].filter(Boolean));
+  let y = head(doc, 'STATEMENT OF INVOICES', 'كشف فواتير الجهة المؤجرة', company, [v.vendor_name, v.vendor_code ? `Code ${v.vendor_code}` : '', periodText].filter(Boolean));
   y = P.infoGrid(doc, [
     { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${v.vendor_name}${v.vendor_code ? ` (${v.vendor_code})` : ''}` },
     { label: v.vendor_type === 'Individual' ? 'National ID' : 'Tax number', labelAr: v.vendor_type === 'Individual' ? 'الرقم الوطني' : 'الرقم الضريبي', value: (v.vendor_type === 'Individual' ? v.national_id : v.tax_number) || '-' },
@@ -323,22 +262,21 @@ async function vendorStatementPdf(conn, st, user) {
     // summary
     y = sectionTitle(doc, y + 4, `Summary (${cur})`, 'ملخص الحساب');
     const cells = [
-      { label: 'Brought forward', labelAr: 'رصيد مدوّر', value: money(s.brought_forward, cur) },
-      { label: 'Invoiced and added', labelAr: 'فواتير وإضافات', value: money(s.total_debit, cur) },
-      { label: 'Paid and deducted', labelAr: 'مدفوع وحسومات', value: money(s.total_credit, cur) },
-      { label: 'Balance owed', labelAr: 'الرصيد المستحق', value: money(s.closing, cur) },
+      { label: 'Before the period', labelAr: 'قبل الفترة', value: money(s.brought_forward, cur) },
+      { label: 'Invoices and debit notes', labelAr: 'فواتير وإشعارات مدينة', value: money(s.total_debit, cur) },
+      { label: 'Credit notes', labelAr: 'إشعارات دائنة', value: money(s.total_credit, cur) },
+      { label: 'Total invoiced (net)', labelAr: 'صافي المفوتر', value: money(s.closing, cur) },
     ];
     y = P.infoGrid(doc, cells, y, 4);
-    if (s.last_payment) P.text(doc, `Last payment: ${fmt.date(s.last_payment.date)} ${s.last_payment.doc_no} ${money(s.last_payment.credit, cur)}`, L, y - 2, { size: 7, color: COLORS.muted, width: W, lineBreak: false });
     y += 8;
     y = sectionTitle(doc, y, `Movements (${cur})`, 'الحركات');
     const rows = [];
-    if (st.from > BEGIN) rows.push({ d: fmt.date(st.from), k: 'Brought forward', no: '', what: 'Balance before the period', bal: money(s.brought_forward, cur), _bold: true, _fill: COLORS.soft });
+    if (st.from > BEGIN) rows.push({ d: fmt.date(st.from), k: 'Before', no: '', what: 'Invoiced before the period', bal: money(s.brought_forward, cur), _bold: true, _fill: COLORS.soft });
     for (const r of s.rows) {
       rows.push({
         d: fmt.date(r.date), k: (KIND_TEXT[r.kind] || {}).en || r.kind, no: r.doc_no || '', what: r.description,
         dr: r.debit ? money(r.debit, cur) : '', cr: r.credit ? money(r.credit, cur) : '', bal: money(r.balance, cur),
-        _color: r.kind === 'reversal' ? COLORS.amber : undefined,
+        _color: r.kind === 'Credit' ? COLORS.red : undefined,
       });
     }
     rows.push({ k: 'Totals', what: '', dr: money(s.total_debit, cur), cr: money(s.total_credit, cur), bal: money(s.closing, cur), _bold: true, _fill: COLORS.band });
@@ -347,14 +285,13 @@ async function vendorStatementPdf(conn, st, user) {
       columns: [
         { key: 'd', en: 'Date', ar: 'التاريخ', width: 50 }, { key: 'k', en: 'Document', ar: 'المستند', width: 58 },
         { key: 'no', en: 'Number', ar: 'الرقم', width: 76 }, { key: 'what', en: 'Description', ar: 'البيان', width: 191, align: 'left', wrap: true, size: 6.6 },
-        { key: 'dr', en: 'Due to vendor', ar: 'له', width: 57, align: 'right' }, { key: 'cr', en: 'Paid / less', ar: 'دفعنا', width: 57, align: 'right' },
-        { key: 'bal', en: 'Balance', ar: 'الرصيد', width: 58, align: 'right', bold: true },
+        { key: 'dr', en: 'Invoiced', ar: 'مفوتر', width: 57, align: 'right' }, { key: 'cr', en: 'Credit', ar: 'دائن', width: 57, align: 'right' },
+        { key: 'bal', en: 'Cumulative', ar: 'التراكمي', width: 58, align: 'right', bold: true },
       ],
     }) + 10;
     if (y + 80 > doc.page.height - doc.page.margins.bottom - 18) { doc.addPage(); y = doc.page.margins.top + 4; }
-    y = boxRow(doc, y, `BALANCE OWED (${cur})`, 'الرصيد المستحق للمورد', money(s.closing, cur),
-      { fill: s.closing > 0 ? COLORS.navy : COLORS.green, color: COLORS.white, arColor: '#E9DDBE', bold: true, size: 9.5 });
-    if (s.closing < 0) P.text(doc, 'Negative: the vendor was paid more than invoiced (advance).', L, y + 2, { size: 7, color: COLORS.amber, width: W, align: 'right' });
+    y = boxRow(doc, y, `TOTAL INVOICED (${cur})`, 'إجمالي المفوتر', money(s.closing, cur),
+      { fill: COLORS.navy, color: COLORS.white, arColor: '#E9DDBE', bold: true, size: 9.5 });
     y += 8;
     if (s.estimate) {
       const e = s.estimate;
@@ -362,7 +299,7 @@ async function vendorStatementPdf(conn, st, user) {
         ? `Not invoiced yet: could not be estimated (${e.error})`
         : `Earned, not invoiced yet (estimate, approved days ${fmt.date(e.from)} - ${fmt.date(e.to)}, ${e.machines} machine(s)): ${money(e.amount, cur)}`;
       P.text(doc, label, L, y, { size: 7.5, color: COLORS.muted, width: W, align: 'right' });
-      P.text(doc, 'تقدير لمستحقات لم تُفوتر بعد، وليست جزءاً من الرصيد', L, doc.y + 1, { size: 7, color: COLORS.muted, width: W, align: 'right' });
+      P.text(doc, 'تقدير لمستحقات لم تُفوتر بعد، وليست جزءاً من المجموع', L, doc.y + 1, { size: 7, color: COLORS.muted, width: W, align: 'right' });
       y = doc.y + 6;
     }
   });
@@ -370,8 +307,8 @@ async function vendorStatementPdf(conn, st, user) {
     P.text(doc, `Cancelled invoice numbers (kept, never reused; not counted): ${st.cancelled_numbers.join(', ')}`, L, y + 4, { size: 7, color: COLORS.muted, width: W });
     y = doc.y + 4;
   }
-  P.text(doc, 'Balance = invoices of finalized batches + opening balances + debit notes - payments - credit notes. Drafts are not included. '
-    + 'A balance moved from one batch to another ("previous balances") is an internal move and is not shown.', L, y + 6, { size: 6.8, color: COLORS.muted, width: W });
+  P.text(doc, 'Total = issued vendor invoices + debit notes - credit notes (drafts and cancelled numbers are not included). '
+    + 'Payments are made by finance outside this application.', L, y + 6, { size: 6.8, color: COLORS.muted, width: W });
   const yy = doc.y + 14;
   const lw = W / 3;
   [['Prepared by (Finance)', 'إعداد: الإدارة المالية'], ['Approved by', 'اعتماد'], ['Acknowledged by the lessor', 'إقرار الجهة المؤجرة']].forEach(([en, ar], i) => {
@@ -382,9 +319,9 @@ async function vendorStatementPdf(conn, st, user) {
     P.text(doc, en, x, sy + 33, { size: 7.5, width: lw, align: 'center', lineBreak: false });
     P.text(doc, ar, x, sy + 43, { size: 7, color: COLORS.muted, width: lw, align: 'center', lineBreak: false });
   });
-  P.footers(doc, `${company} | Statement of account ${v.vendor_code || v.vendor_name} | printed ${printedAt} by ${user.full_name}`);
+  P.footers(doc, `${company} | Statement of invoices ${v.vendor_code || v.vendor_name} | printed ${printedAt} by ${user.full_name}`);
   const tag = `${v.vendor_code || `vendor-${v.vendor_id}`}-${st.to}`;
-  return { buffer: await P.toBuffer(doc), fileName: `statement-of-account-${tag}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
+  return { buffer: await P.toBuffer(doc), fileName: `statement-of-invoices-${tag}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
 }
 
 async function machineHistoryPdf(conn, h, user) {
@@ -411,8 +348,8 @@ async function machineHistoryPdf(conn, h, user) {
     _color: r.finalized ? undefined : COLORS.muted,
   }));
   for (const x of h.notes) {
-    rows.push({ p: fmt.date(x.date), b: `#${x.eq_batch_id}`, vi: x.kind === 'DebitNote' ? 'Debit note' : 'Credit note', mi: x.invoice_no, net: money(x.amount, x.currency),
-      st: x.settled_batch_id ? `In batch #${x.settled_batch_id}` : 'Correction - not paid yet', _color: COLORS.info });
+    rows.push({ p: fmt.date(x.date), b: '', vi: x.kind === 'Debit' ? 'Debit note' : 'Credit note', mi: x.invoice_no, net: money(x.amount, x.currency),
+      st: 'Separate document', _color: COLORS.info });
   }
   for (const t of h.totals) {
     rows.push({ p: `Total finalized (${t.currency})`, net: money(t.finalized + t.notes, t.currency), _bold: true, _fill: COLORS.band });
@@ -440,7 +377,7 @@ async function machineHistoryPdf(conn, h, user) {
   line('Approved days, ready for the next invoice', nb.approved, COLORS.ink);
   line('Days waiting for approval (Draft / Submitted / Rejected)', nb.pending, COLORS.amber);
   if (nb.monthly_days.length || h.rows.some((r) => r.billing_mode === 'Monthly')) line('Monthly machine: deployed working days not billed', nb.monthly_days, COLORS.red);
-  P.text(doc, 'The vendor is paid per vendor invoice (see the statement of account); a machine invoice is part of it.', L, y + 6, { size: 6.8, color: COLORS.muted, width: W });
+  P.text(doc, 'A machine invoice is part of its vendor invoice; finance pays the vendor invoices (outside this application).', L, y + 6, { size: 6.8, color: COLORS.muted, width: W });
   P.footers(doc, `${company} | Billing history ${m.equipment_code} | printed ${printedAt} by ${user.full_name}`);
   return { buffer: await P.toBuffer(doc), fileName: `billing-history-${m.equipment_code}-${h.to}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
 }

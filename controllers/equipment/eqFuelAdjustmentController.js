@@ -45,7 +45,8 @@ exports.createFuel = async (req, res) => {
   const row = await withTransaction(async (conn) => {
     await C.loadMachine(conn, d.equipment_id);
     await C.loadSite(conn, d.site_id);
-    // 11 Oct 2026: a fuel issue dated inside a finalized period is allowed; the next batch of the machine bills it
+    // 14 Oct 2026: refused inside an invoice handed over to finance (an issued invoice is brought up to date by itself)
+    await lock.assertOpen(conn, { equipmentId: d.equipment_id, siteId: d.site_id, from: d.issue_date, what: 'A fuel issue on this date' });
     const [r] = await conn.execute(
       'INSERT INTO eq_fuel_issues (equipment_id, site_id, issue_date, liters, price_per_liter, receipt_number, issued_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [d.equipment_id, d.site_id, d.issue_date, d.liters, d.price_per_liter ?? null, d.receipt_number || null, req.user.user_id]);
@@ -65,8 +66,8 @@ async function loadFuel(conn, id) {
 }
 
 /**
- * Price, litres or receipt number of a fuel issue not billed by a finalized batch. The first price needs no reason; changing the litres
- * or a price already set does. A fuel issue billed by a finalized batch is corrected through an official Correction.
+ * Price, litres or receipt number of a fuel issue. The first price needs no reason; changing the litres or a price already set
+ * does. Refused while the fuel issue is in an invoice handed over to finance (withdraw it first).
  */
 exports.updateFuel = async (req, res) => {
   const id = parseId(req.params.id);
@@ -79,8 +80,7 @@ exports.updateFuel = async (req, res) => {
     const before = await loadFuel(conn, id);
     if (before.is_cancelled) throw AppError.conflict('INVALID_STATE', 'This fuel issue is cancelled.');
     const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized invoice batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
-    // never billed (even if dated in a finalized period): it is priced / changed normally and billed by the next batch
+    if (used) throw lock.lockedError(used, 'This fuel issue');
     const changesMoney = (d.liters !== undefined && Number(d.liters) !== Number(before.liters))
       || (d.price_per_liter !== undefined && before.price_per_liter !== null && Number(d.price_per_liter) !== Number(before.price_per_liter));
     if (changesMoney && reason.length < 5) throw AppError.validation({ reason: 'say why the litres or the price already set change (at least 5 characters)' });
@@ -101,9 +101,9 @@ exports.cancelFuel = async (req, res) => {
   await withTransaction(async (conn) => {
     const before = await loadFuel(conn, id);
     if (before.is_cancelled) return;
-    // in a FINALIZED batch: official Correction. In a Generated batch: allowed, that batch turns stale (void and regenerate).
+    // in an invoice handed over to finance: refused. In a draft / issued invoice: allowed, the invoice follows.
     const used = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This fuel issue is in finalized invoice batch #${used.eq_batch_id}. Ask for an official Correction (Corrections tab).`);
+    if (used) throw lock.lockedError(used, 'This fuel issue');
     const inBatch = await lock.sourceConsumed(conn, 'eq_fuel_issues', id);
     await conn.execute('UPDATE eq_fuel_issues SET is_cancelled = 1, cancel_reason = ? WHERE fuel_issue_id = ?', [reason, id]);
     await audit.log(conn, { table: 'eq_fuel_issues', id, action: 'cancel', oldValues: { is_cancelled: 0 }, newValues: { is_cancelled: 1 }, reason,
@@ -120,7 +120,7 @@ exports.uploadReceipt = [uploads.single('file'), async (req, res) => {
   const out = await withTransaction(async (conn) => {
     const f = await loadFuel(conn, id);
     if (req.user.role === 'Supervisor') await assertCanActOnSite(req.user, f.site_id, 'Day', f.issue_date, conn).catch(async () => assertCanActOnSite(req.user, f.site_id, 'Night', f.issue_date, conn));
-    // a receipt of fuel already paid by a finalized batch: kept as evidence, but the reason is written down
+    // a receipt of fuel in an invoice handed over to finance: kept as evidence, but the reason is written down
     const paid = await lock.sourceConsumed(conn, 'eq_fuel_issues', id, true);
     const v = await FV.add(conn, {
       ownerTable: 'eq_fuel_issues', ownerId: id, key, sha256: hash, contentType: type.mime, size: req.file.size || req.file.buffer.length,
@@ -165,7 +165,7 @@ exports.listAdjustments = async (req, res) => {
   const [rows] = await pool.query(
     `SELECT a.*, e.equipment_code, e.machine_label, vd.vendor_name, s.site_code, u.full_name AS created_by, ni.invoice_no AS correction_note_no,
        (SELECT b.eq_batch_id FROM eq_payroll_lines l JOIN eq_payroll_items i ON i.eq_item_id = l.eq_item_id JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
-         WHERE l.source_table = 'eq_adjustments' AND l.source_id = a.adjustment_id AND b.status IN ('Generated','Paid') ORDER BY b.eq_batch_id DESC LIMIT 1) AS in_batch_id
+         WHERE l.source_table = 'eq_adjustments' AND l.source_id = a.adjustment_id AND b.status IN ('Generated','HandedOver','Returned') ORDER BY b.eq_batch_id DESC LIMIT 1) AS in_batch_id
      FROM eq_adjustments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN eq_vendors vd ON vd.vendor_id = e.vendor_id
      LEFT JOIN sites s ON s.site_id = a.site_id JOIN users u ON u.user_id = a.created_by_user_id
      LEFT JOIN eq_attendance_corrections cc ON cc.correction_id = a.correction_id LEFT JOIN eq_invoices ni ON ni.invoice_id = cc.note_invoice_id
@@ -183,7 +183,8 @@ exports.createAdjustment = async (req, res) => {
   const row = await withTransaction(async (conn) => {
     await C.loadMachine(conn, d.equipment_id);
     if (d.site_id) await C.loadSite(conn, d.site_id);
-    // 11 Oct 2026: an adjustment dated inside a finalized period is allowed; the next batch of the machine bills it
+    // 14 Oct 2026: refused inside an invoice handed over to finance (an issued invoice is brought up to date by itself)
+    await lock.assertOpen(conn, { equipmentId: d.equipment_id, siteId: d.site_id || null, from: d.adjustment_date, what: 'An adjustment on this date' });
     const card = await C.rateCardOn(conn, d.equipment_id, d.adjustment_date);
     // a machine paid only per delivery note (DNR) has no rate card: the currency is the one of its DNR price
     const dnrPrice = card ? null : (await DNR.ratesForMachines(conn, [d.equipment_id], d.adjustment_date, d.adjustment_date))[0];
@@ -214,7 +215,7 @@ exports.cancelAdjustment = async (req, res) => {
         { correction_id: a.correction_id });
     }
     const used = await lock.sourceConsumed(conn, 'eq_adjustments', id, true);
-    if (used) throw AppError.conflict('PAYROLL_PERIOD_FINALIZED', `This adjustment is in finalized invoice batch #${used.eq_batch_id}. Reverse it with an official Correction.`);
+    if (used) throw lock.lockedError(used, 'This adjustment');
     const inBatch = await lock.sourceConsumed(conn, 'eq_adjustments', id);
     await conn.execute("UPDATE eq_adjustments SET status = 'Cancelled', cancelled_by_user_id = ?, cancelled_at = ? WHERE adjustment_id = ?", [req.user.user_id, businessNow(), id]);
     await audit.log(conn, { table: 'eq_adjustments', id, action: 'cancel', oldValues: { status: 'Active' }, newValues: { status: 'Cancelled' }, reason,

@@ -24,7 +24,7 @@ const clientRep = require('../controllers/equipment/clientReportController');
 const AS = requireRole('Admin', 'Supervisor');
 const fd = require('../controllers/equipment/eqFuelDiffController');
 const dnr = require('../controllers/equipment/dnrController');
-const ob = require('../controllers/equipment/openingBalanceController');
+const fin = require('../controllers/equipment/eqFinanceController');
 const ledger = require('../controllers/equipment/ledgerController');
 
 router.use(requireAuth);
@@ -41,11 +41,6 @@ router.put('/contracts/:id', A, vendor.updateContract);
 router.post('/contracts/:id/document', A, uploadLimiter, vendor.uploadDocument);
 router.get('/contracts/:id/document', AC, vendor.downloadDocument);
 router.get('/contracts/:id/documents', AC, vendor.listDocuments);
-// opening balances: money owed to a vendor from before the system (014)
-router.get('/opening-balances', AC, ob.list);
-router.post('/vendors/:id/opening-balances', AC, ob.create);
-router.put('/opening-balances/:id', AC, ob.update);
-router.patch('/opening-balances/:id/cancel', AC, ob.cancel);
 
 // 5.2 types, machines, operators
 router.get('/types', ACS, fleet.listTypes);
@@ -126,18 +121,9 @@ router.patch('/admin/attendance/:id/standby-credit', AC, review.standbyCredit);
 router.patch('/admin/attendance/:id/cancel', AC, review.voidRow);
 // not financially committed: the office (Admin or Accountant) corrects the row directly, with a reason once Approved
 router.patch('/admin/attendance/:id', AC, review.adminEdit);
-// financially committed: official correction. An Admin applies it at once; an Accountant's request waits for an Admin (11 Oct 2026)
-router.post('/admin/attendance/:id/correction', AC, review.correction);
 router.get('/admin/change-requests', AC, review.listChangeRequests);
 router.patch('/admin/change-requests/:id/approve', AC, review.approveChangeRequest);
 router.patch('/admin/change-requests/:id/reject', AC, review.rejectChangeRequest);
-router.get('/admin/corrections', AC, review.listCorrections);
-router.post('/admin/corrections/financial', AC, review.financialCorrection);
-router.get('/admin/corrections/:id', AC, review.getCorrection);
-router.patch('/admin/corrections/:id/review', AC, review.reviewCorrection);
-router.patch('/admin/corrections/:id/return', AC, review.returnCorrection);
-router.patch('/admin/corrections/:id/approve', AC, review.approveCorrection);
-router.patch('/admin/corrections/:id/cancel', AC, review.cancelCorrection);
 
 // 5.7 fuel & adjustments
 router.get('/fuel-issues', AC, fuel.listFuel);
@@ -173,34 +159,42 @@ router.post('/timesheets/:id/paper-checks', AC, ts.paperChecks);
 router.patch('/timesheets/:id/close', AC, ts.close);
 router.patch('/timesheets/:id/reopen', A, ts.reopen);
 
-// 5.9 payroll
+// 5.9 invoices (13-14 Oct 2026): draft -> issued (same numbers while in the office) -> handed over -> withdrawn -> re-issued
 router.post('/payroll/preview', AC, pay.preview);
 router.get('/payroll/blockers', AC, pay.blockers);
-router.get('/payroll/coverage', AC, pay.coverage); // per machine of a vendor: ready / held by / blockers (11 Oct 2026)
+router.get('/payroll/coverage', AC, pay.coverage); // per machine of a vendor: ready / invoices already covering the period / blockers
 router.get('/payroll/monthly-terms', AC, monthlyTerms.list); // terms of the month of monthly machines
 router.put('/payroll/monthly-terms', AC, monthlyTerms.put);
 router.post('/payroll/generate', AC, pay.generate);
+router.get('/payroll/register', AC, pay.register); // invoices per vendor with their machine invoices and notes
 router.get('/payroll/batches', AC, pay.list);
 router.get('/payroll/batches/:id', AC, pay.get);
 router.get('/payroll/batches/:id/rows', AC, pay.rows);
 router.get('/payroll/batches/:id/versions', AC, pay.versions);
 router.get('/payroll/batches/:id/export.pdf', AC, pay.exportPdf);
 router.get('/payroll/batches/:id/export.xlsx', AC, pay.exportXlsx);
-router.patch('/payroll/batches/:id/finalize', AC, pay.finalize);
-router.patch('/payroll/batches/:id/unfinalize', AC, pay.unfinalize); // undo Finalize within eq_finalize_undo_hours (11 Oct 2026)
-router.patch('/payroll/batches/:id/mark-paid', AC, pay.markPaid);
-router.patch('/payroll/batches/:id/undo-paid', AC, pay.undoPaid);
-router.patch('/payroll/batches/:id/payment-reference', AC, pay.setPaymentReference);
+router.get('/payroll/batches/:id/certificate.xlsx', AC, pay.certificateXlsx); // vendor invoice + payment certificate per machine (Excel)
+router.patch('/payroll/batches/:id/finalize', AC, pay.finalize); // issue: official numbers
+router.post('/payroll/batches/:id/refresh', AC, pay.refresh); // issued: brought up to date, same numbers
+router.post('/payroll/batches/:id/reissue', A, pay.reissue); // withdrawn from finance: new numbers
 router.get('/payroll/batches/:id/review-summary', AC, pay.reviewSummary);
-router.patch('/payroll/batches/:id/void', AC, pay.void);
-router.post('/payroll/batches/:id/supersede', AC, pay.supersede);
+router.patch('/payroll/batches/:id/void', AC, pay.void); // draft: delete; issued / withdrawn: Admin cancels
+router.post('/payroll/batches/:id/supersede', AC, pay.supersede); // draft: recalculate
 router.patch('/payroll/batches/:id/offsets', AC, pay.setOffsets); // Admin: extra hours cover missing hours (monthly, 12 Oct 2026)
-router.post('/payroll/batches/:id/payments', AC, pay.recordPayment);
-router.get('/payroll/batches/:id/statement.pdf', AC, pay.accountStatementPdf);
-router.patch('/payroll/payments/:id/reverse', AC, pay.reversePayment);
-router.get('/payroll/payments/:id/voucher.pdf', AC, pay.voucherPdf);
-router.patch('/payroll/requests/:id/approve', A, pay.approveRequest);
-router.patch('/payroll/requests/:id/reject', A, pay.rejectRequest);
+router.post('/payroll/batches/:id/withdraw', A, fin.withdrawBatch); // back from finance (signed acknowledgement)
+router.get('/payroll/handovers', AC, fin.listHandovers);
+router.post('/payroll/handovers', A, fin.handOver);
+router.get('/payroll/handovers/:id', AC, fin.getHandover);
+router.get('/payroll/handovers/:id/pdf', AC, fin.handoverPdf);
+router.get('/payroll/withdrawals/:id/pdf', AC, fin.withdrawalPdf);
+router.get('/payroll/notes', AC, fin.listNotes); // debit / credit notes
+router.post('/payroll/notes', AC, fin.createNote);
+router.get('/payroll/notes/:id', AC, fin.getNote);
+router.put('/payroll/notes/:id', AC, fin.updateNote);
+router.patch('/payroll/notes/:id/issue', A, fin.issueNote);
+router.patch('/payroll/notes/:id/cancel', AC, fin.cancelNote);
+router.post('/payroll/notes/:id/withdraw', A, fin.withdrawNote);
+router.get('/payroll/notes/:id/pdf', AC, fin.notePdf);
 // running statements (11 Oct 2026): vendor statement of account, machine billing history
 router.get('/statements/vendor/:id/account', AC, ledger.vendorAccount);
 router.get('/statements/vendor/:id/account.pdf', AC, ledger.vendorAccountPdf);

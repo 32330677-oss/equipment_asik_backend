@@ -15,28 +15,26 @@ const DEFINITIONS = {
   week_gate_enabled: { type: 'bool', description: 'Block submitting a day while the previous week has Draft rows' },
   company_name: { type: 'string', max: 255, description: 'Company name printed on documents' },
   app_time_zone: { type: 'string', max: 64, readOnly: true, description: 'Business time zone (Syria time). Set on the server with APP_TIME_ZONE; shown here for information' },
-  payroll_finalize_admin_only: { type: 'bool', description: 'Only Admin may finalize / mark paid invoice batches' },
+  payroll_finalize_admin_only: { type: 'bool', description: 'Only the Admin may issue invoices (off: the Accountant issues too; hand-over, cancel and withdrawal stay Admin only)' },
   eq_weekly_off_day: { type: 'int', min: 0, max: 6, description: 'Weekly day off for monthly machines (0=Sunday ... 5=Friday ... 6=Saturday)' },
-  eq_finalize_requires_scan: { type: 'bool', description: 'A batch can be finalized only when the signed monthly sheets are uploaded for all its rows' },
+  eq_finalize_requires_scan: { type: 'bool', description: 'An invoice is handed over to finance only when the signed monthly sheets are uploaded for all its rows' },
   eq_fuel_diff_allow_negative: { type: 'bool', description: 'Fuel price difference: deduct from the vendor when the official price falls below the base price' },
   eq_shift_continuity_minutes: { type: 'int', min: 0, max: 180, description: 'Shifts of one machine closer than this (minutes) are continuous: overtime starts after threshold x shifts' },
-  eq_paid_undo_hours: { type: 'int', min: 0, max: 720, description: 'Hours during which an Admin may undo Mark Paid (only without a payment reference, reason required; 0 = never)' },
-  eq_finalize_undo_hours: { type: 'int', min: 0, max: 720, description: 'Hours after Finalize during which the batch can go back to a draft with the same invoice numbers (0 = never; afterwards: official Correction)' },
   eq_block_monthly_days_without_rows: { type: 'bool', description: 'Monthly machines: a deployed working day with no attendance row blocks generating (it is deducted in full as an absence); the batch can still be generated with a reason' },
   eq_late_entry_days: { type: 'int', min: 1, max: 60, description: 'A row created more than this many days after its date is flagged as a late entry (warning only; a reason is asked)' },
 };
 
 /** Settings that change amounts or switch a control: changing them needs a reason. */
 const CONTROL_KEYS = new Set(['eq_payroll_requires_paper_match', 'eq_weekly_off_day', 'eq_fuel_diff_allow_negative', 'eq_shift_continuity_minutes',
-  'payroll_finalize_admin_only', 'eq_finalize_requires_scan', 'eq_paid_undo_hours', 'eq_finalize_undo_hours', 'eq_block_monthly_days_without_rows']);
+  'payroll_finalize_admin_only', 'eq_finalize_requires_scan', 'eq_block_monthly_days_without_rows']);
 
 const DEFAULTS = {
   eq_payroll_requires_paper_match: 'false', eq_paper_tolerance_minutes: '10', eq_meter_tolerance_pct: '15',
   eq_long_session_review_hours: '16', eq_default_currency: 'USD', eq_timesheet_blank_rows: '6',
   eq_live_refresh_seconds: '60', week_start_day: '6', week_gate_enabled: 'true',
-  company_name: 'ASIK ENGINEERING CONSTRUCTION', app_time_zone: 'Asia/Damascus', payroll_finalize_admin_only: 'true',
+  company_name: 'ASIK ENGINEERING CONSTRUCTION', app_time_zone: 'Asia/Damascus', payroll_finalize_admin_only: 'false',
   eq_finalize_requires_scan: 'true', eq_fuel_diff_allow_negative: 'true', eq_weekly_off_day: '5',
-  eq_shift_continuity_minutes: '30', eq_paid_undo_hours: '168', eq_late_entry_days: '3', eq_finalize_undo_hours: '72',
+  eq_shift_continuity_minutes: '30', eq_late_entry_days: '3',
   eq_block_monthly_days_without_rows: 'true',
 };
 

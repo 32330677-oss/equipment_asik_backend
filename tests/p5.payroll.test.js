@@ -115,7 +115,7 @@ test('generate, rows never paid twice, export PDFs and Excel', async () => {
   assert.strictEqual(batch.total_net, '8287.50');
   assert.strictEqual(batch.items.length, 3);
   const again = await h.api().post('/api/equipment/payroll/generate').set(ACC()).send({ ...SCOPE, vendor_id: F.vendor.vendor_id });
-  assert.ok(['NOTHING_TO_PAY', 'OVERLAPPING_BATCH'].includes(again.body.code), again.body.code);
+  assert.ok(['NOTHING_TO_PAY', 'PERIOD_OVERLAP'].includes(again.body.code), again.body.code);
   const dir = path.join(__dirname, '..', 'docs', 'generated');
   fs.mkdirSync(dir, { recursive: true });
   for (const view of ['vendor', 'summary', 'machine']) {
@@ -135,30 +135,31 @@ test('generate, rows never paid twice, export PDFs and Excel', async () => {
   assert.strictEqual(none.status, 409);
 });
 
-test('finalize locks; supersede creates v2; void rules; accountant finalize setting', async () => {
-  await ok(h.api().put('/api/settings/payroll_finalize_admin_only').set(A()).send({ value: 'true', reason: 'only the Admin closes payroll' }));
+test('issue (setting: Admin only); an issued invoice stays open to the office with the same numbers; the Admin cancels it', async () => {
+  await ok(h.api().put('/api/settings/payroll_finalize_admin_only').set(A()).send({ value: 'true', reason: 'only the Admin issues invoices' }));
   const accFin = await h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(ACC());
   assert.strictEqual(accFin.body.code, 'FORBIDDEN_ROLE');
-  await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
+  const issued = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/finalize`).set(A()).send({ acknowledge_changes: true }));
+  assert.strictEqual(issued.state, 'issued');
+  const numbers = issued.invoices.map((i) => i.invoice_no).sort();
+  // the office may still edit its days (a remark does not move money: nothing to bring up to date)
   const [row] = await h.query("SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-03'", [F.exc.equipment_id]);
-  const edit = await h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'x' });
-  assert.strictEqual(edit.body.code, 'PAYROLL_PERIOD_FINALIZED');
-  // finalized, not paid, within eq_finalize_undo_hours: a new version may replace it (undo + recalculate, 11 Oct 2026);
-  // the old numbers are withdrawn (reserved for the new version), and cancelled if that version is voided
-  const sup = await ok(h.api().post(`/api/equipment/payroll/batches/${batch.eq_batch_id}/supersede`).set(A()).send({ reason: 'rate correction' }));
-  assert.strictEqual(sup.version_number, 2);
-  assert.strictEqual(sup.total_net, '8287.50');
-  assert.ok(sup.reserved_numbers.length > 0, 'the draft keeps the numbers of the version it replaces');
-  const old = await ok(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}`).set(ACC()));
-  assert.ok(old.invoices.length > 0 && old.invoices.every((i) => i.status === 'Withdrawn' && !i.cancelled), 'superseded numbers are reserved, not cancelled');
-  const chain = await ok(h.api().get(`/api/equipment/payroll/batches/${sup.eq_batch_id}/versions`).set(ACC()));
-  assert.deepStrictEqual(chain.map((c) => c.status), ['Superseded', 'Generated']);
-  const voided = await ok(h.api().patch(`/api/equipment/payroll/batches/${sup.eq_batch_id}/void`).set(A()).send({ reason: 'redo' }));
+  await ok(h.api().patch(`/api/equipment/admin/attendance/${row.eq_attendance_id}`).set(A()).send({ remarks: 'x', reason: 'remark' }));
+  const r = await h.api().post(`/api/equipment/payroll/batches/${batch.eq_batch_id}/refresh`).set(ACC()).send({});
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.body.unchanged, true);
+  assert.deepStrictEqual(r.body.data.invoices.map((i) => i.invoice_no).sort(), numbers);
+  // the supervisor cannot touch a day of an issued invoice
+  const sup = await h.api().patch(`/api/equipment/attendance/${row.eq_attendance_id}`).set(S8()).send({ remarks: 'y' });
+  assert.ok([403, 409].includes(sup.status));
+  // an issued invoice is not "recalculated" by hand: it is brought up to date (refresh)
+  assert.strictEqual((await h.api().post(`/api/equipment/payroll/batches/${batch.eq_batch_id}/supersede`).set(A()).send({})).body.code, 'BATCH_STATE');
+  const voided = await ok(h.api().patch(`/api/equipment/payroll/batches/${batch.eq_batch_id}/void`).set(A()).send({ reason: 'redo' }));
   assert.strictEqual(voided.status, 'Voided');
-  const oldAfter = await ok(h.api().get(`/api/equipment/payroll/batches/${batch.eq_batch_id}`).set(ACC()));
-  assert.ok(oldAfter.invoices.every((i) => i.cancelled), 'voiding the new version cancels the reserved numbers');
+  assert.ok(voided.invoices.every((i) => i.cancelled), 'the numbers stay, cancelled');
   const again = await ok(h.api().post('/api/equipment/payroll/preview').set(ACC()).send(SCOPE));
-  assert.strictEqual(again.totals[0].net, '8287.50', 'void frees rows');
+  assert.strictEqual(again.totals[0].net, '8287.50', 'cancelling frees the rows');
+  await ok(h.api().put('/api/settings/payroll_finalize_admin_only').set(A()).send({ value: 'false', reason: 'back to the default' }));
 });
 
 test('stale batch cannot be finalized', async () => {
