@@ -293,7 +293,7 @@ function machineSheet(wb, logoId, ctx, it) {
   [
     ['Prepared by - Plant Coordinator / Clerk', 'Compiles the timesheets and this certificate'],
     ['Verified by - Plant & Equipment Manager', 'Hours, rate, machine, breakdowns'],
-    ['Certified by - Project Manager', `Work done on site ${it.site_code || ''}`.trim()],
+    ['Certified by - Project Director', `Work done on site ${it.site_code || ''}`.trim()],
     ['Checked by - Cost Control / QS', 'Cost code, budget, contract terms'],
     ['Reviewed by - Accounts Payable', 'Invoice, deductions, taxes, duplicates'],
     ['Approved for payment - Finance Manager', 'Final release per authority matrix'],
