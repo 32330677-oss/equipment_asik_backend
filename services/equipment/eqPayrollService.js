@@ -253,7 +253,10 @@ function fuelDifference(perRow, equipmentId, currency, terms, prices, allowNegat
     const hours = pr.work / 60;
     const liters = hours * Number(t.liters_per_hour);
     const amountCents = Math.round(liters * diff * 100);
-    days.push({ record_date: date, hours: Math.round(hours * 100) / 100, liters_per_hour: Number(t.liters_per_hour), liters: Math.round(liters * 100) / 100,
+    // regular and overtime hours of the day kept apart for the statement (the compensation is on both)
+    const otH = Math.max(0, Number(pr.ot || 0)) / 60;
+    days.push({ record_date: date, hours: Math.round(hours * 100) / 100,
+      regular_hours: Math.round((hours - otH) * 100) / 100, overtime_hours: Math.round(otH * 100) / 100, liters_per_hour: Number(t.liters_per_hour), liters: Math.round(liters * 100) / 100,
       base_price: base, national_price: price, diff, amount: amountCents / 100, fuel_terms_id: t.fuel_terms_id, fuel_price_id: p.fuel_price_id });
     const key = `${t.fuel_terms_id}|${p.fuel_price_id}`;
     const g = groups.get(key) || { t, p, diff, hours: 0, liters: 0, amountCents: 0, from: date, to: date };

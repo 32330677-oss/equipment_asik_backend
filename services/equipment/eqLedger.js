@@ -12,6 +12,7 @@
 'use strict';
 
 const P = require('../pdfKit');
+const F = require('./eqDocFigures');
 const settings = require('../settings');
 const PS = require('./eqPayrollService');
 const { businessToday, businessNow, addDays } = require('../../utils/businessDate');
@@ -311,7 +312,8 @@ async function vendorStatementPdf(conn, st, user) {
     + 'Payments are made by finance outside this application.', L, y + 6, { size: 6.8, color: COLORS.muted, width: W });
   const yy = doc.y + 14;
   const lw = W / 3;
-  [['Prepared by (Finance)', 'إعداد: الإدارة المالية'], ['Approved by', 'اعتماد'], ['Acknowledged by the lessor', 'إقرار الجهة المؤجرة']].forEach(([en, ar], i) => {
+  const sg = await F.signatories();
+  [[`Prepared by (${sg.preparedEn})`, `إعداد: ${sg.preparedAr}`], [`Approved by (${sg.approverEn})`, `اعتماد: ${sg.approverAr}`], ['Acknowledged by the lessor', 'إقرار الجهة المؤجرة']].forEach(([en, ar], i) => {
     let sy = yy;
     if (sy + 50 > doc.page.height - doc.page.margins.bottom - 14) { if (!i) doc.addPage(); sy = doc.page.margins.top + 10; }
     const x = L + i * lw;
@@ -343,7 +345,7 @@ async function machineHistoryPdf(conn, h, user) {
   const rows = h.rows.map((r) => ({
     p: `${fmt.date(r.period_from)} - ${fmt.date(r.period_to)}`, b: `#${r.eq_batch_id}${r.version_number > 1 ? ` v${r.version_number}` : ''}`,
     vi: r.vi_no || '-', mi: r.mi_no || '-', site: r.site_code, mode: r.billing_mode,
-    days: String(r.days), h: fmt.num(r.work_hours), ot: r.overtime_hours ? fmt.num(r.overtime_hours) : '',
+    days: String(r.days), h: fmt.num(F.hoursSplit(r).regular), ot: Number(r.overtime_hours) ? fmt.num(r.overtime_hours) : '',
     g: money(r.gross, r.currency), dd: r.deductions ? money(r.deductions, r.currency) : '', net: money(r.net, r.currency), st: r.state,
     _color: r.finalized ? undefined : COLORS.muted,
   }));
@@ -362,7 +364,7 @@ async function machineHistoryPdf(conn, h, user) {
       { key: 'p', en: 'Period billed', ar: 'الفترة', width: 118, align: 'left' }, { key: 'b', en: 'Batch', ar: 'الدفعة', width: 46 },
       { key: 'vi', en: 'Vendor invoice', ar: 'فاتورة المورد', width: 72 }, { key: 'mi', en: 'Machine invoice', ar: 'فاتورة الآلية', width: 78 },
       { key: 'site', en: 'Site', ar: 'الموقع', width: 40 }, { key: 'mode', en: 'Billing', ar: 'الأساس', width: 46 },
-      { key: 'days', en: 'Days', ar: 'الأيام', width: 32 }, { key: 'h', en: 'Work h', ar: 'العمل', width: 42 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 36 },
+      { key: 'days', en: 'Days', ar: 'الأيام', width: 32 }, { key: 'h', en: 'Regular h', ar: 'ساعات عادية', width: 42 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 36 },
       { key: 'g', en: 'Gross', ar: 'الإجمالي', width: 64, align: 'right' }, { key: 'dd', en: 'Deductions', ar: 'الحسومات', width: 58, align: 'right' },
       { key: 'net', en: 'Net', ar: 'الصافي', width: 66, align: 'right', bold: true }, { key: 'st', en: 'State', ar: 'الحالة', width: W - 698, align: 'left' },
     ],

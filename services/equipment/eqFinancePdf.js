@@ -160,7 +160,8 @@ async function notePdf(note, user) {
   P.text(doc, debit
     ? 'This amount is added to what the company owes the lessor. / يضاف هذا المبلغ إلى مستحقات الجهة المؤجرة.'
     : 'This amount is deducted from what the company owes the lessor. / يحسم هذا المبلغ من مستحقات الجهة المؤجرة.', L, y, { size: 7.5, color: COLORS.muted, width: W });
-  signatures(doc, doc.y + 18, [['Prepared by', 'إعداد'], ['Approved by', 'اعتماد'], ['Acknowledged by the lessor', 'إقرار الجهة المؤجرة']]);
+  const sg = await require('./eqDocFigures').signatories();
+  signatures(doc, doc.y + 18, [[`Prepared by (${sg.preparedEn})`, `إعداد: ${sg.preparedAr}`], [`Approved by (${sg.approverEn})`, `اعتماد: ${sg.approverAr}`], ['Acknowledged by the lessor', 'إقرار الجهة المؤجرة']]);
   P.footers(doc, `${company} | ${debit ? 'Debit' : 'Credit'} note ${note.note_no || 'draft'} | printed ${printedAt} by ${user.full_name}`);
   return { buffer: await P.toBuffer(doc), fileName: safeName(`${note.note_no || `note-draft-${note.note_id}`}.pdf`) };
 }

@@ -3,11 +3,12 @@ const ExcelJS = require('exceljs');
 const P = require('../pdfKit');
 const settings = require('../settings');
 const { businessNow } = require('../../utils/businessDate');
+const F = require('./eqDocFigures');
 
 const { COLORS, fmt } = P;
 const LINE_LABEL = {
-  Work: 'Work', Overtime: 'Overtime', Standby: 'Standby (billable part)', Breakdown: 'Breakdown (billable part)',
-  MinimumTopUp: 'Minimum guarantee top-up', MonthlyBase: 'Monthly base', AbsenceDeduction: 'Absence deduction',
+  Work: 'Regular work', Overtime: 'Overtime', Standby: 'Standby (billable part)', Breakdown: 'Breakdown (billable part)',
+  MinimumTopUp: 'Minimum guarantee top-up', MonthlyBase: 'Monthly base (regular)', AbsenceDeduction: 'Absence deduction',
   BreakdownDeduction: 'Breakdown deduction', Operator: 'Operator (not included in rate)', Fuel: 'Fuel issued by us', Adjustment: 'Adjustment',
   FuelPriceDifference: 'Fuel price difference (compensation)', HoursShortfall: 'Hours below the monthly hours due', SecondShift: 'Second shift the same day',
   DeliveryNote: 'Delivery note (DNR)', ExtraHoursOffset: 'Extra hours covering missing hours',
@@ -50,13 +51,14 @@ function intWords(x) {
   return parts.join(' ');
 }
 function amountInWords(amount, currency) {
-  const c = Math.round(Math.abs(amount) * 100);
+  // SYP is printed without piastres (rounded to the pound): the words say the same rounded amount
+  const c = currency === 'SYP' ? Math.round(Math.abs(amount)) * 100 : Math.round(Math.abs(amount) * 100);
   const whole = Math.floor(c / 100); const fr = c % 100;
   const name = { USD: ['US dollars', 'cents'], SYP: ['Syrian pounds', 'piastres'], EUR: ['euros', 'cents'] }[currency] || [currency, 'cents'];
   let s = `${intWords(whole)} ${name[0]}`;
   if (fr && currency !== 'SYP') s += ` and ${intWords(fr)} ${name[1]}`;
   s = s.charAt(0).toUpperCase() + s.slice(1);
-  return amount < 0 ? `Minus ${s.toLowerCase()}` : s;
+  return amount < 0 && c > 0 ? `Minus ${s.toLowerCase()}` : s;
 }
 
 // --------------------------------------------------------------- shared bits
@@ -151,6 +153,7 @@ function totalsBox(doc, y, { gross, deductions, net, currency }) {
 
 function lineDesc(l, rate, hide = new Set()) {
   let s = LINE_LABEL[l.line_type] || l.line_type;
+  if (l.line_type === 'Work') s = l.unit === 'day' ? 'Regular work (days)' : 'Regular hours (not overtime)';
   if (l.line_type === 'Standby' && rate) s += ` @ ${n(rate.standby_billable_pct)}%`;
   if (l.line_type === 'Breakdown' && rate) s += ` @ ${n(rate.breakdown_billable_pct)}%`;
   if (l.line_type === 'Overtime' && rate && rate.billing_mode !== 'Monthly') s += ` (> ${n(rate.overtime_threshold_hours ?? rate.standard_hours_per_day)} h/shift)`;
@@ -361,26 +364,40 @@ function drawMachine(doc, ctx, b, items) {
       y = totalsBox(doc, y + 4, { gross: it.gross_amount, deductions: it.deductions_amount, net: it.net_amount, currency: cur });
       continue;
     }
-    const rows = it.rows.map((r) => ({
-      date: fmt.dayDate(r.record_date), status: `${r.day_status}${r.not_approved ? ' *' : ''}`, op: r.operator_name || '', in: fmt.time(r.check_in_time), out: fmt.time(r.check_out_time),
-      work: fmt.hours(r.work_minutes), ot: n(r.overtime_minutes) ? fmt.hours(r.overtime_minutes) : '', sb: n(r.standby_minutes) ? fmt.hours(r.standby_minutes) : '',
-      bd: n(r.breakdown_minutes) ? fmt.hours(r.breakdown_minutes) : '', tu: n(r.topup_minutes) ? fmt.hours(r.topup_minutes) : '',
-      meter: r.meter_start !== null && r.meter_end !== null && r.meter_start !== undefined ? fmt.num(n(r.meter_end) - n(r.meter_start), 1) : '',
-      row: r.sheet_row_no, paper: r.paper_status,
-    }));
+    // each day: regular hours and overtime apart (work_minutes holds both), with a total row under the days.
+    // A monthly machine has no overtime per day: its overtime is the extra hours of the month (Monthly hours table)
+    const monthly = it.billing_mode === 'Monthly';
+    const rows = it.rows.map((r) => {
+      const h = F.rowMinutes(r);
+      return {
+        date: fmt.dayDate(r.record_date), status: `${r.day_status}${r.not_approved ? ' *' : ''}`, op: r.operator_name || '', in: fmt.time(r.check_in_time), out: fmt.time(r.check_out_time),
+        work: fmt.hours(monthly ? h.total : h.regular), ot: h.overtime ? fmt.hours(h.overtime) : '', sb: n(r.standby_minutes) ? fmt.hours(r.standby_minutes) : '',
+        bd: n(r.breakdown_minutes) ? fmt.hours(r.breakdown_minutes) : '', tu: n(r.topup_minutes) ? fmt.hours(r.topup_minutes) : '',
+        meter: r.meter_start !== null && r.meter_end !== null && r.meter_start !== undefined ? fmt.num(n(r.meter_end) - n(r.meter_start), 1) : '',
+        row: r.sheet_row_no, paper: r.paper_status,
+      };
+    });
+    const sumMin = (f) => it.rows.reduce((a, r) => a + f(r), 0);
+    rows.push({
+      date: 'Total', work: fmt.hours(sumMin((r) => (monthly ? F.rowMinutes(r).total : F.rowMinutes(r).regular))), ot: fmt.hours(sumMin((r) => F.rowMinutes(r).overtime)),
+      sb: fmt.hours(sumMin((r) => n(r.standby_minutes))), bd: fmt.hours(sumMin((r) => n(r.breakdown_minutes))), tu: fmt.hours(sumMin((r) => n(r.topup_minutes))),
+      _bold: true, _fill: COLORS.soft,
+    });
     if (!hide.has('days')) {
       // columns hidden on request give their width to the date / status columns
       const cols = [
         { key: 'date', en: 'Date', ar: 'التاريخ', width: 50 }, { key: 'status', en: 'Status', ar: 'الحالة', width: 48 },
         ...(hide.has('operator') ? [] : [{ key: 'op', en: 'Operator', ar: 'المشغل', width: 70, align: 'left' }]),
         { key: 'in', en: 'Start', ar: 'البدء', width: 30 },
-        { key: 'out', en: 'End', ar: 'الانتهاء', width: 30 }, { key: 'work', en: 'Work h', ar: 'ساعات العمل', width: 34, bold: true },
-        { key: 'ot', en: 'OT h', ar: 'إضافي', width: 30 }, { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 36 },
+        { key: 'out', en: 'End', ar: 'الانتهاء', width: 30 },
+        ...(monthly ? [{ key: 'work', en: 'Work h', ar: 'ساعات العمل', width: 34, bold: true }]
+          : [{ key: 'work', en: 'Regular h', ar: 'ساعات عادية', width: 34, bold: true }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 30 }]),
+        { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 36 },
         { key: 'bd', en: 'Breakdown h', ar: 'أعطال', width: 36 }, { key: 'tu', en: 'Min. top-up', ar: 'حد أدنى', width: 34 },
         { key: 'meter', en: 'Meter diff', ar: 'فرق العداد', width: 34 },
         ...(hide.has('paper') ? [] : [{ key: 'row', en: 'Sheet row', ar: 'السطر', width: 28 }, { key: 'paper', en: 'Paper', ar: 'الورقة', width: 37 }]),
       ];
-      const spare = 497 - cols.reduce((a, c) => a + c.width, 0);
+      const spare = doc.page.width - doc.page.margins.left - doc.page.margins.right - cols.reduce((a, c) => a + c.width, 0);
       if (spare > 0) { cols[0].width += Math.floor(spare / 2); cols[1].width += spare - Math.floor(spare / 2); }
       y = P.table(doc, { y, rows, rowHeight: 15, headHeight: 24, fontSize: 7, columns: cols, onNewPage: () => doc.page.margins.top + 4 });
       y += 6;
@@ -398,7 +415,8 @@ function drawMachine(doc, ctx, b, items) {
     y = sectionTitle(doc, y, 'Machine total', 'إجمالي الآلية');
     y = totalsBox(doc, y, { gross: sum('gross_amount'), deductions: sum('deductions_amount'), net: sum('net_amount'), currency: cur });
   }
-  signatureRow(doc, y + 6, [['Prepared by', 'إعداد'], ['Reviewed by', 'تدقيق'], ['Approved by', 'اعتماد']]);
+  const sg = ctx.sign;
+  signatureRow(doc, y + 6, [[`Prepared by (${sg.preparedEn})`, `إعداد: ${sg.preparedAr}`], ['Reviewed by', 'تدقيق'], [`Approved by (${sg.approverEn})`, `اعتماد: ${sg.approverAr}`]]);
 }
 
 /** DNR item: one row per delivery note (from the frozen snapshot of the batch, or from the lines of a provisional statement). */
@@ -429,9 +447,12 @@ function drawLines(doc, y, items, cur, withMachine = true, hide = new Set()) {
   const rows = [];
   for (const it of items) {
     for (const l of it.lines) {
+      // regular time (hours / days / monthly base as days x price of a day) and overtime are separate lines, each with
+      // its quantity, price and amount; the other lines follow, then the totals
+      const d = F.displayLine(l, it);
       rows.push({
-        m: mshort(it), desc: hide.has('reasons') && l.line_type === 'Adjustment' ? `Adjustment: ${String(l.note || '').split(':')[0]}` : lineDesc(l, it.rate, hide), qty: fmt.num(l.quantity, l.unit === 'day' || l.unit === 'month' ? 3 : 2).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)),
-        unit: UNIT_TEXT[l.unit] || l.unit, price: fmt.num(l.unit_price, ['FuelPriceDifference', 'Fuel', 'DeliveryNote'].includes(l.line_type) ? 3 : 2), amount: money(l.amount, cur),
+        m: mshort(it), desc: hide.has('reasons') && l.line_type === 'Adjustment' ? `Adjustment: ${String(l.note || '').split(':')[0]}` : lineDesc(l, it.rate, hide), qty: fmt.num(d.quantity, d.unit === 'day' || d.unit === 'month' ? 3 : 2).replace(/\.?0+$/, (m) => (m.startsWith('.') ? '' : m)),
+        unit: UNIT_TEXT[d.unit] || d.unit, price: fmt.num(d.unit_price, d.decimals), amount: money(l.amount, cur),
         _color: n(l.amount) < 0 ? COLORS.red : undefined,
       });
     }
@@ -464,29 +485,32 @@ function drawVendor(doc, ctx, b, items) {
     { label: 'Issued', labelAr: 'تاريخ الإصدار', value: final && b.finalized_at ? fmt.date(String(b.finalized_at).slice(0, 10)) : (b.unapproved_rows ? `${b.unapproved_rows} attendance row(s) NOT APPROVED yet` : `${ctx.printedAt} (draft)`) },
   ], y, 4);
   y = sectionTitle(doc, y, '1. Machines summary', 'ملخص الآليات');
-  const fuelOf = (it) => it.lines.filter((l) => l.line_type === 'Fuel').reduce((a, l) => a + n(l.amount), 0);
-  const adjOf = (it) => it.lines.filter((l) => l.line_type === 'Adjustment').reduce((a, l) => a + n(l.amount), 0);
-  const special = ['Fuel', 'Adjustment', 'FuelPriceDifference'];
-  const dnrOf = (it) => it.lines.filter((l) => l.line_type === 'DeliveryNote').length;
-  const otherDed = (it) => it.lines.filter((l) => !special.includes(l.line_type) && n(l.amount) < 0).reduce((a, l) => a + n(l.amount), 0);
-  const earn = (it) => it.lines.filter((l) => !special.includes(l.line_type) && n(l.amount) > 0).reduce((a, l) => a + n(l.amount), 0);
-  const rows = items.map((it) => ({
-    m: `${it.equipment_code}\n${mlabel(it)}`, site: it.site_code, bill: it.billing_mode === 'DNR' ? `DNR (${dnrOf(it)})` : it.billing_mode, days: it.worked_days, work: it.billing_mode === 'DNR' ? '-' : fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours),
-    sb: fmt.num(it.standby_hours), bd: fmt.num(it.breakdown_hours), earn: money(earn(it), cur), fd: fuelDiffOf(it) ? money(fuelDiffOf(it), cur) : '-',
-    fuel: fuelOf(it) ? money(fuelOf(it), cur) : '-', adj: adjOf(it) ? money(adjOf(it), cur) : '-', ded: otherDed(it) ? money(otherDed(it), cur) : '-', net: money(it.net_amount, cur),
-  }));
+  // regular time and overtime apart (hours and money), then the other lines, then the net
+  const rows = items.map((it) => {
+    const h = F.hoursSplit(it); const a = F.amountSplit(it.lines);
+    const dnr = it.billing_mode === 'DNR';
+    return {
+      m: `${it.equipment_code}\n${mlabel(it)}`, site: it.site_code, bill: dnr ? `DNR (${it.lines.filter((l) => l.line_type === 'DeliveryNote').length})` : it.billing_mode, days: it.worked_days,
+      reg: dnr ? '-' : fmt.num(h.regular), regA: a.regular ? money(a.regular, cur) : '-', ot: h.overtime ? fmt.num(h.overtime) : '-', otA: a.overtime ? money(a.overtime, cur) : '-',
+      oth: a.otherAdd ? money(a.otherAdd, cur) : '-', fd: a.fuelDiff ? money(a.fuelDiff, cur) : '-', fuel: a.fuel ? money(a.fuel, cur) : '-',
+      adj: a.adjustments ? money(a.adjustments, cur) : '-', ded: a.otherDed ? money(a.otherDed, cur) : '-', net: money(it.net_amount, cur),
+    };
+  });
   const tot = (f) => items.reduce((a, it) => a + f(it), 0);
-  rows.push({ m: 'Totals', net: money(tot((i) => n(i.net_amount)), cur), earn: money(tot(earn), cur), fd: money(tot(fuelDiffOf), cur), fuel: money(tot(fuelOf), cur), adj: money(tot(adjOf), cur), ded: money(tot(otherDed), cur), _bold: true, _fill: COLORS.soft });
+  const ta = (k) => tot((it) => F.amountSplit(it.lines)[k]);
+  rows.push({ m: 'Totals', reg: fmt.num(tot((it) => F.hoursSplit(it).regular)), regA: money(ta('regular'), cur), ot: fmt.num(tot((it) => F.hoursSplit(it).overtime)), otA: money(ta('overtime'), cur),
+    oth: money(ta('otherAdd'), cur), fd: money(ta('fuelDiff'), cur), fuel: money(ta('fuel'), cur), adj: money(ta('adjustments'), cur), ded: money(ta('otherDed'), cur),
+    net: money(tot((i) => n(i.net_amount)), cur), _bold: true, _fill: COLORS.soft });
   y = P.table(doc, {
     y, rows, rowHeight: 16, headHeight: 26, fontSize: 6.8,
     columns: [
-      { key: 'm', en: 'Machine', ar: 'الآلية', width: 66, align: 'left', wrap: true }, { key: 'site', en: 'Site', ar: 'الموقع', width: 30 },
-      { key: 'bill', en: 'Billing', ar: 'الأساس', width: 34 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 28 },
-      { key: 'work', en: 'Work h', ar: 'العمل', width: 34 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 28 },
-      { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 34 }, { key: 'bd', en: 'Brkdn h', ar: 'أعطال', width: 30 },
-      { key: 'earn', en: 'Earnings', ar: 'المستحق', width: 48, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 40, align: 'right' },
+      { key: 'm', en: 'Machine', ar: 'الآلية', width: 58, align: 'left', wrap: true }, { key: 'site', en: 'Site', ar: 'الموقع', width: 28 },
+      { key: 'bill', en: 'Billing', ar: 'الأساس', width: 32 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 26 },
+      { key: 'reg', en: 'Regular h', ar: 'ساعات عادية', width: 32 }, { key: 'regA', en: 'Regular amt', ar: 'مبلغ العادي', width: 48, align: 'right' },
+      { key: 'ot', en: 'OT h', ar: 'ساعات إضافي', width: 28 }, { key: 'otA', en: 'OT amt', ar: 'مبلغ الإضافي', width: 42, align: 'right' },
+      { key: 'oth', en: 'Other add.', ar: 'إضافات أخرى', width: 42, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 40, align: 'right' },
       { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 38, align: 'right' }, { key: 'adj', en: 'Adjust.', ar: 'تسويات', width: 38, align: 'right' },
-      { key: 'ded', en: 'Other ded.', ar: 'حسومات', width: 38, align: 'right' }, { key: 'net', en: 'Net', ar: 'الصافي', width: 61, align: 'right', bold: true },
+      { key: 'ded', en: 'Other ded.', ar: 'حسومات', width: 38, align: 'right' }, { key: 'net', en: 'Net', ar: 'الصافي', width: 57, align: 'right', bold: true },
     ],
     onNewPage: () => doc.page.margins.top + 4,
   });
@@ -527,7 +551,8 @@ function drawVendor(doc, ctx, b, items) {
     : `Only approved attendance rows are included${ctx.requirePaper ? ', matched with the signed monthly timesheets' : ''}`;
   P.text(doc, `${approvalNote}. Machine invoices: ${[...new Set(items.map((i) => i.invoice_no).filter(Boolean))].join(', ') || '-'}.`,
     doc.page.margins.left, y, { size: 6.8, color: COLORS.muted, width: doc.page.width - 48 });
-  signatureRow(doc, doc.y + 10, [['Prepared by (Finance)', 'إعداد: الإدارة المالية'], ['Approved by (Project Manager)', 'اعتماد: مدير المشروع'], ['Acknowledged by the lessor', 'إقرار ممثل الجهة المؤجرة']]);
+  const sg = ctx.sign;
+  signatureRow(doc, doc.y + 10, [[`Prepared by (${sg.preparedEn})`, `إعداد: ${sg.preparedAr}`], [`Approved by (${sg.approverEn})`, `اعتماد: ${sg.approverAr}`], ['Acknowledged by the lessor', 'إقرار ممثل الجهة المؤجرة']]);
 }
 
 // --------------------------------------------------------------- D5 fuel price difference statement
@@ -554,19 +579,21 @@ function drawFuelDiff(doc, ctx, b, it) {
   P.text(doc, 'تعويض عن ارتفاع سعر المحروقات الرسمي، ويحسب بضرب الفرق بين السعر الرسمي والسعر الأساسي باستهلاك الآلية في الساعة وبعدد ساعات العمل العادية والإضافية', doc.page.margins.left, doc.y + 2, { size: 7.5, color: COLORS.muted, width: doc.page.width - 48, align: 'right' });
   y = doc.y + 6;
   const days = fd.days || [];
+  const split = (d) => (d.regular_hours !== undefined ? { reg: n(d.regular_hours), ot: n(d.overtime_hours) } : null);
   const rows = days.map((d) => ({
-    date: fmt.dayDate(d.record_date), h: fmt.num(d.hours), lph: fmt.num(d.liters_per_hour), l: fmt.num(d.liters),
+    date: fmt.dayDate(d.record_date), reg: split(d) ? fmt.num(split(d).reg) : '-', ot: split(d) && split(d).ot ? fmt.num(split(d).ot) : '-', h: fmt.num(d.hours), lph: fmt.num(d.liters_per_hour), l: fmt.num(d.liters),
     np: fmt.num(d.national_price, 3), bp: fmt.num(d.base_price, 3), diff: fmt.num(d.diff, 3), amount: money(d.amount, cur), _color: n(d.amount) < 0 ? COLORS.red : undefined,
   }));
   const tot = (k) => days.reduce((a, d) => a + n(d[k]), 0);
-  rows.push({ date: 'Total', h: fmt.num(tot('hours')), l: fmt.num(tot('liters')), amount: money(fuelDiffOf(it), cur), _bold: true, _fill: COLORS.soft });
+  rows.push({ date: 'Total', reg: fmt.num(tot('regular_hours')), ot: fmt.num(tot('overtime_hours')), h: fmt.num(tot('hours')), l: fmt.num(tot('liters')), amount: money(fuelDiffOf(it), cur), _bold: true, _fill: COLORS.soft });
   y = P.table(doc, {
     y, rows, rowHeight: 15, headHeight: 26, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
     columns: [
-      { key: 'date', en: 'Date', ar: 'التاريخ', width: 62 }, { key: 'h', en: 'Work h (incl. OT)', ar: 'ساعات العمل', width: 70 },
-      { key: 'lph', en: 'L per hour', ar: 'ليتر لكل ساعة', width: 55 }, { key: 'l', en: 'Litres', ar: 'الليترات', width: 60 },
-      { key: 'np', en: 'Official price', ar: 'السعر الرسمي', width: 68, align: 'right' }, { key: 'bp', en: 'Base price', ar: 'السعر الأساسي', width: 68, align: 'right' },
-      { key: 'diff', en: 'Difference/L', ar: 'الفرق لليتر', width: 62, align: 'right' }, { key: 'amount', en: `Amount (${cur})`, ar: 'المبلغ', width: 102, align: 'right', bold: true },
+      { key: 'date', en: 'Date', ar: 'التاريخ', width: 56 }, { key: 'reg', en: 'Regular h', ar: 'ساعات عادية', width: 40 },
+      { key: 'ot', en: 'OT h', ar: 'إضافي', width: 34 }, { key: 'h', en: 'Total h', ar: 'مجموع الساعات', width: 40 },
+      { key: 'lph', en: 'L per hour', ar: 'ليتر لكل ساعة', width: 50 }, { key: 'l', en: 'Litres', ar: 'الليترات', width: 54 },
+      { key: 'np', en: 'Official price', ar: 'السعر الرسمي', width: 64, align: 'right' }, { key: 'bp', en: 'Base price', ar: 'السعر الأساسي', width: 64, align: 'right' },
+      { key: 'diff', en: 'Difference/L', ar: 'الفرق لليتر', width: 58, align: 'right' }, { key: 'amount', en: `Amount (${cur})`, ar: 'المبلغ', width: 87, align: 'right', bold: true },
     ],
   });
   y += 8;
@@ -576,7 +603,8 @@ function drawFuelDiff(doc, ctx, b, it) {
   P.text(doc, money(fuelDiffOf(it), cur), L + W - 140, y, { size: 9.5, bold: true, color: COLORS.white, width: 134, height: 22, valign: 'middle', align: 'right', lineBreak: false });
   y += 30;
   P.text(doc, 'This amount is already included in the machine invoice above; this statement explains it and is not paid separately.', L, y, { size: 6.8, color: COLORS.muted, width: W });
-  signatureRow(doc, doc.y + 10, [['Prepared by (Finance)', 'إعداد: الإدارة المالية'], ['Approved by', 'اعتماد'], ['Acknowledged by the lessor', 'إقرار ممثل الجهة المؤجرة']]);
+  const sg = ctx.sign;
+  signatureRow(doc, doc.y + 10, [[`Prepared by (${sg.preparedEn})`, `إعداد: ${sg.preparedAr}`], [`Approved by (${sg.approverEn})`, `اعتماد: ${sg.approverAr}`], ['Acknowledged by the lessor', 'إقرار ممثل الجهة المؤجرة']]);
 }
 
 // --------------------------------------------------------------- D4 summary
@@ -590,30 +618,39 @@ function drawSummary(doc, ctx, b, items) {
     { label: 'Scope', labelAr: 'نطاق الكشف', value: scopeText(b) },
     { label: 'Machines', labelAr: 'عدد الآليات', value: String(new Set(items.map((i) => i.equipment_id)).size) },
     { label: 'Lessors', labelAr: 'الجهات المؤجرة', value: String(new Set(items.map((i) => i.vendor_id)).size) },
-    { label: 'Work hours', labelAr: 'ساعات العمل', value: fmt.num(items.reduce((a, i) => a + n(i.work_hours), 0)) },
+    { label: 'Regular / OT hours', labelAr: 'ساعات عادية / إضافي', value: `${fmt.num(items.reduce((a, i) => a + F.hoursSplit(i).regular, 0))} / ${fmt.num(items.reduce((a, i) => a + F.hoursSplit(i).overtime, 0))}` },
     { label: `Net (${cur})`, labelAr: 'صافي المستحق', value: money(items.reduce((a, i) => a + n(i.net_amount), 0), cur) },
   ], y, 4);
   const rows = [];
+  const totalsOf = (its) => {
+    const s = (k) => its.reduce((a, i) => a + n(i[k]), 0);
+    const h = (k) => its.reduce((a, i) => a + F.hoursSplit(i)[k], 0);
+    const am = (k) => its.reduce((a, i) => a + F.amountSplit(i.lines)[k], 0);
+    return { reg: fmt.num(h('regular')), regA: money(am('regular'), cur), ot: fmt.num(h('overtime')), otA: money(am('overtime'), cur),
+      fd: money(its.reduce((a, i) => a + fuelDiffOf(i), 0), cur), gross: money(s('gross_amount'), cur), ded: money(s('deductions_amount'), cur), net: money(s('net_amount'), cur) };
+  };
   const vendors = [...new Set(items.map((i) => i.vendor_id))];
   for (const vid of vendors) {
     const its = items.filter((i) => i.vendor_id === vid);
     rows.push({ v: `${its[0].vendor_name}${its[0].vendor_invoice_no ? `  [${its[0].vendor_invoice_no}]` : ''}`, _bold: true, _fill: COLORS.band });
     for (const it of its) {
-      rows.push({ m: `${it.equipment_code} ${mlabel(it)}`, inv: it.invoice_no || '', site: it.site_code, bill: it.billing_mode, days: it.worked_days, work: fmt.num(it.work_hours), ot: fmt.num(it.overtime_hours), sb: fmt.num(it.standby_hours), fd: fuelDiffOf(it) ? money(fuelDiffOf(it), cur) : '', gross: money(it.gross_amount, cur), ded: money(it.deductions_amount, cur), net: money(it.net_amount, cur) });
+      const h = F.hoursSplit(it); const a = F.amountSplit(it.lines);
+      rows.push({ m: `${it.equipment_code} ${mlabel(it)}`, inv: it.invoice_no || '', site: it.site_code, bill: it.billing_mode, days: it.worked_days,
+        reg: fmt.num(h.regular), regA: money(a.regular, cur), ot: fmt.num(h.overtime), otA: money(a.overtime, cur),
+        fd: fuelDiffOf(it) ? money(fuelDiffOf(it), cur) : '', gross: money(it.gross_amount, cur), ded: money(it.deductions_amount, cur), net: money(it.net_amount, cur) });
     }
-    const s = (k) => its.reduce((a, i) => a + n(i[k]), 0);
-    rows.push({ m: 'Lessor subtotal', work: fmt.num(s('work_hours')), fd: money(its.reduce((a, i) => a + fuelDiffOf(i), 0), cur), gross: money(s('gross_amount'), cur), ded: money(s('deductions_amount'), cur), net: money(s('net_amount'), cur), _bold: true, _fill: COLORS.soft });
+    rows.push({ m: 'Lessor subtotal', ...totalsOf(its), _bold: true, _fill: COLORS.soft });
   }
-  const s = (k) => items.reduce((a, i) => a + n(i[k]), 0);
-  rows.push({ v: 'GRAND TOTAL', work: fmt.num(s('work_hours')), fd: money(items.reduce((a, i) => a + fuelDiffOf(i), 0), cur), gross: money(s('gross_amount'), cur), ded: money(s('deductions_amount'), cur), net: money(s('net_amount'), cur), _bold: true, _fill: COLORS.bandStrong });
+  rows.push({ v: 'GRAND TOTAL', ...totalsOf(items), _bold: true, _fill: COLORS.bandStrong });
   P.table(doc, {
     y, rows, rowHeight: 15, headHeight: 26, fontSize: 7.2, zebra: false, onNewPage: () => doc.page.margins.top + 4,
     columns: [
-      { key: 'v', en: 'Lessor', ar: 'الجهة المؤجرة', width: 150, align: 'left' }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 100, align: 'left' },
-      { key: 'inv', en: 'Invoice no.', ar: 'رقم الفاتورة', width: 70 }, { key: 'site', en: 'Site', ar: 'الموقع', width: 38 }, { key: 'bill', en: 'Billing', ar: 'الأساس', width: 44 },
-      { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 30 }, { key: 'work', en: 'Work h', ar: 'العمل', width: 42 }, { key: 'ot', en: 'OT h', ar: 'إضافي', width: 36 },
-      { key: 'sb', en: 'Standby h', ar: 'انتظار', width: 40 }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 56, align: 'right' },
-      { key: 'gross', en: 'Gross', ar: 'الإجمالي', width: 66, align: 'right' }, { key: 'ded', en: 'Deductions', ar: 'الحسومات', width: 60, align: 'right' },
+      { key: 'v', en: 'Lessor', ar: 'الجهة المؤجرة', width: 110, align: 'left' }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 90, align: 'left' },
+      { key: 'inv', en: 'Invoice no.', ar: 'رقم الفاتورة', width: 64 }, { key: 'site', en: 'Site', ar: 'الموقع', width: 38 }, { key: 'bill', en: 'Billing', ar: 'الأساس', width: 44 },
+      { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 30 }, { key: 'reg', en: 'Regular h', ar: 'ساعات عادية', width: 40 }, { key: 'regA', en: 'Regular amt', ar: 'مبلغ العادي', width: 60, align: 'right' },
+      { key: 'ot', en: 'OT h', ar: 'إضافي', width: 34 }, { key: 'otA', en: 'OT amt', ar: 'مبلغ الإضافي', width: 54, align: 'right' },
+      { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 48, align: 'right' },
+      { key: 'gross', en: 'Gross', ar: 'الإجمالي', width: 64, align: 'right' }, { key: 'ded', en: 'Deductions', ar: 'الحسومات', width: 57, align: 'right' },
       { key: 'net', en: 'Net', ar: 'الصافي', width: 61, align: 'right', bold: true },
     ],
   });
@@ -622,7 +659,7 @@ function drawSummary(doc, ctx, b, items) {
 // --------------------------------------------------------------- entry points
 async function render(conn, model, opts, user) {
   const ctx = { company: await settings.getString('company_name'), printedAt: businessNow().slice(0, 16), printedBy: user.full_name, requirePaper: await settings.getBool('eq_payroll_requires_paper_match'),
-    hide: opts.hide || new Set() };
+    hide: opts.hide || new Set(), sign: await F.signatories() };
   const { batch: b } = model;
   const items = model.items;
   const landscape = opts.view === 'summary';
@@ -694,52 +731,70 @@ async function batchXlsx(conn, detail) {
   s.addRows([
     ['Equipment invoice batch', `#${b.eq_batch_id} v${b.version_number}`], ['Status', statusText(b)], ['Period', `${b.start_date} to ${b.end_date}`],
     ['Scope', scopeText(b)], ['Currency', b.currency], ['Machines', Number(b.total_equipment)], ['Gross', n(b.total_gross)], ['Deductions', n(b.total_deductions)], ['Net', n(b.total_net)], [],
-    ['Vendor', 'Machines', 'Gross', 'Deductions', 'Net'],
+    ['Vendor', 'Machines', 'Regular h', 'Regular amount', 'OT h', 'OT amount', 'Gross', 'Deductions', 'Net'],
   ]);
-  s.getColumn(1).width = 28; s.getColumn(2).width = 40; s.getColumn(3).width = 16; s.getColumn(4).width = 16; s.getColumn(5).width = 16;
+  s.getColumn(1).width = 28; s.getColumn(2).width = 40;
+  for (let c = 3; c <= 9; c += 1) s.getColumn(c).width = 16;
   for (const r of [7, 8, 9]) s.getCell(`B${r}`).numFmt = moneyFmt;
   s.getRow(11).font = { bold: true };
   for (const vid of [...new Set(items.map((i) => i.vendor_id))]) {
     const its = items.filter((i) => i.vendor_id === vid);
-    const row = s.addRow([its[0].vendor_name, new Set(its.map((i) => i.equipment_id)).size, its.reduce((a, i) => a + n(i.gross_amount), 0), its.reduce((a, i) => a + n(i.deductions_amount), 0), its.reduce((a, i) => a + n(i.net_amount), 0)]);
-    [3, 4, 5].forEach((c) => { row.getCell(c).numFmt = moneyFmt; });
+    const sumH = (k) => Math.round(its.reduce((a, i) => a + F.hoursSplit(i)[k], 0) * 100) / 100;
+    const sumA = (k) => its.reduce((a, i) => a + F.amountSplit(i.lines)[k], 0);
+    const row = s.addRow([its[0].vendor_name, new Set(its.map((i) => i.equipment_id)).size, sumH('regular'), sumA('regular'), sumH('overtime'), sumA('overtime'),
+      its.reduce((a, i) => a + n(i.gross_amount), 0), its.reduce((a, i) => a + n(i.deductions_amount), 0), its.reduce((a, i) => a + n(i.net_amount), 0)]);
+    [4, 6, 7, 8, 9].forEach((c) => { row.getCell(c).numFmt = moneyFmt; });
   }
 
   const m = wb.addWorksheet('Machines');
+  // regular time and overtime apart (hours and money), the other lines, then gross / deductions / net
   head(m, [
     { header: 'Vendor', key: 'vendor', width: 26 }, { header: 'Machine', key: 'code', width: 12 }, { header: 'Type / no.', key: 'type', width: 18 },
     { header: 'Site', key: 'site', width: 8 }, { header: 'Billing', key: 'mode', width: 10 }, { header: 'Rows', key: 'rows', width: 7 },
-    { header: 'Worked shifts', key: 'days', width: 9 }, { header: 'Work h', key: 'work', width: 9 }, { header: 'OT h', key: 'ot', width: 8 },
+    { header: 'Worked shifts', key: 'days', width: 9 }, { header: 'Regular h', key: 'reg', width: 10 }, { header: 'Regular amount', key: 'regA', width: 14 },
+    { header: 'OT h', key: 'ot', width: 8 }, { header: 'OT amount', key: 'otA', width: 14 }, { header: 'Total work h', key: 'work', width: 10 },
     { header: 'Standby h', key: 'sb', width: 9 }, { header: 'Breakdown h', key: 'bd', width: 10 }, { header: 'Top-up h', key: 'tu', width: 9 },
-    { header: 'Fuel price diff.', key: 'fd', width: 14 }, { header: 'Gross', key: 'gross', width: 14 }, { header: 'Deductions', key: 'ded', width: 14 }, { header: 'Net', key: 'net', width: 14 },
+    { header: 'Other additions', key: 'oth', width: 14 }, { header: 'Other deductions', key: 'odd', width: 14 }, { header: 'Fuel issued', key: 'fuel', width: 13 },
+    { header: 'Adjustments', key: 'adj', width: 13 }, { header: 'Fuel price diff.', key: 'fd', width: 14 },
+    { header: 'Gross', key: 'gross', width: 14 }, { header: 'Deductions', key: 'ded', width: 14 }, { header: 'Net', key: 'net', width: 14 },
     { header: 'Invoice no.', key: 'inv', width: 16 }, { header: 'Fuel diff. no.', key: 'finv', width: 16 },
   ]);
+  const moneyKeys = ['regA', 'otA', 'oth', 'odd', 'fuel', 'adj', 'fd', 'gross', 'ded', 'net'];
   for (const i of items) {
+    const hs = F.hoursSplit(i); const a = F.amountSplit(i.lines);
     const r = m.addRow({ vendor: i.vendor_name, code: i.equipment_code, type: mlabel(i), site: i.site_code, mode: i.billing_mode, rows: i.days_recorded, days: i.worked_days,
-      work: n(i.work_hours), ot: n(i.overtime_hours), sb: n(i.standby_hours), bd: n(i.breakdown_hours), tu: n(i.topup_hours), fd: fuelDiffOf(i), gross: n(i.gross_amount), ded: n(i.deductions_amount), net: n(i.net_amount),
+      reg: hs.regular, regA: a.regular, ot: hs.overtime, otA: a.overtime, work: hs.total, sb: n(i.standby_hours), bd: n(i.breakdown_hours), tu: n(i.topup_hours),
+      oth: a.otherAdd, odd: a.otherDed, fuel: a.fuel, adj: a.adjustments, fd: a.fuelDiff, gross: n(i.gross_amount), ded: n(i.deductions_amount), net: n(i.net_amount),
       inv: i.invoice_no || '', finv: i.fuel_invoice_no || '' });
-    ['fd', 'gross', 'ded', 'net'].forEach((k) => { r.getCell(k).numFmt = moneyFmt; });
+    moneyKeys.forEach((k) => { r.getCell(k).numFmt = moneyFmt; });
   }
-  const totalRow = m.addRow({ vendor: 'TOTAL', work: { formula: `SUM(H2:H${items.length + 1})` }, fd: { formula: `SUM(M2:M${items.length + 1})` }, gross: { formula: `SUM(N2:N${items.length + 1})` }, ded: { formula: `SUM(O2:O${items.length + 1})` }, net: { formula: `SUM(P2:P${items.length + 1})` } });
+  const sumOf = (k) => { const L = m.getColumn(k).letter; return { formula: `SUM(${L}2:${L}${items.length + 1})` }; };
+  const sumKeys = ['reg', 'ot', 'work', 'sb', 'bd', 'tu', ...moneyKeys];
+  const totalRow = m.addRow({ vendor: 'TOTAL', ...Object.fromEntries(sumKeys.map((k) => [k, sumOf(k)])) });
   totalRow.font = { bold: true };
-  ['fd', 'gross', 'ded', 'net'].forEach((k) => { totalRow.getCell(k).numFmt = moneyFmt; });
+  moneyKeys.forEach((k) => { totalRow.getCell(k).numFmt = moneyFmt; });
 
   const l = wb.addWorksheet('Lines');
   head(l, [{ header: 'Machine', key: 'm', width: 12 }, { header: 'Site', key: 's', width: 8 }, { header: 'Line', key: 't', width: 22 }, { header: 'Description', key: 'd', width: 50 },
     { header: 'Qty', key: 'q', width: 10 }, { header: 'Unit', key: 'u', width: 7 }, { header: 'Unit price', key: 'p', width: 12 }, { header: 'Amount', key: 'a', width: 14 }]);
   for (const i of items) for (const ln of i.lines) {
-    const r = l.addRow({ m: mshort(i), s: i.site_code, t: ln.line_type, d: lineDesc(ln, i.rate), q: n(ln.quantity), u: ln.unit, p: n(ln.unit_price), a: n(ln.amount) });
+    const d = F.displayLine(ln, i);
+    const r = l.addRow({ m: mshort(i), s: i.site_code, t: ln.line_type, d: lineDesc(ln, i.rate), q: d.quantity, u: d.unit, p: d.unit_price, a: n(ln.amount) });
+    r.getCell('p').numFmt = d.decimals === 3 ? '#,##0.000' : '#,##0.00';
     r.getCell('a').numFmt = moneyFmt;
   }
 
   const rw = wb.addWorksheet('Rows');
   head(rw, [{ header: 'Machine', key: 'm', width: 12 }, { header: 'Site', key: 's', width: 8 }, { header: 'Date', key: 'd', width: 12 }, { header: 'Status', key: 'st', width: 11 },
-    { header: 'Operator', key: 'o', width: 20 }, { header: 'In', key: 'i', width: 17 }, { header: 'Out', key: 'x', width: 17 }, { header: 'Work h', key: 'w', width: 8 },
-    { header: 'OT h', key: 'ot', width: 7 }, { header: 'Standby h', key: 'sb', width: 9 }, { header: 'Breakdown h', key: 'bd', width: 10 }, { header: 'Break h', key: 'br', width: 8 },
+    { header: 'Operator', key: 'o', width: 20 }, { header: 'In', key: 'i', width: 17 }, { header: 'Out', key: 'x', width: 17 }, { header: 'Regular h', key: 'w', width: 9 },
+    { header: 'OT h', key: 'ot', width: 7 }, { header: 'Total work h', key: 'tw', width: 9 }, { header: 'Standby h', key: 'sb', width: 9 }, { header: 'Breakdown h', key: 'bd', width: 10 }, { header: 'Break h', key: 'br', width: 8 },
     { header: 'Top-up h', key: 'tu', width: 8 }, { header: 'Meter start', key: 'ms', width: 11 }, { header: 'Meter end', key: 'me', width: 11 }, { header: 'Sheet row', key: 'r', width: 8 }, { header: 'Paper', key: 'p', width: 9 }]);
   const h = (x) => Math.round(n(x) / 60 * 100) / 100;
   for (const i of items) for (const r of i.rows) {
-    rw.addRow({ m: mshort(i), s: i.site_code, d: r.record_date, st: r.day_status, o: r.operator_name, i: r.check_in_time, x: r.check_out_time, w: h(r.work_minutes), ot: h(r.overtime_minutes),
+    // a monthly machine has no overtime per day (its overtime is the extra hours of the month, see Lines): only the total
+    const mm = F.rowMinutes(r); const mo = i.billing_mode === 'Monthly';
+    rw.addRow({ m: mshort(i), s: i.site_code, d: r.record_date, st: r.day_status, o: r.operator_name, i: r.check_in_time, x: r.check_out_time,
+      w: mo ? null : h(mm.regular), ot: mo ? null : h(mm.overtime), tw: h(mm.total),
       sb: h(r.standby_minutes), bd: h(r.breakdown_minutes), br: h(r.break_minutes), tu: h(r.topup_minutes), ms: r.meter_start === null ? null : n(r.meter_start), me: r.meter_end === null ? null : n(r.meter_end), r: r.sheet_row_no, p: r.paper_status });
   }
 
@@ -753,10 +808,10 @@ async function batchXlsx(conn, detail) {
   if (fdDays.length) {
     const f = wb.addWorksheet('Fuel difference');
     head(f, [{ header: 'Machine', key: 'm', width: 12 }, { header: 'Site', key: 's', width: 8 }, { header: 'Statement no.', key: 'no', width: 16 }, { header: 'Date', key: 'd', width: 12 },
-      { header: 'Work h (incl. OT)', key: 'h', width: 12 }, { header: 'L per hour', key: 'lph', width: 10 }, { header: 'Litres', key: 'l', width: 10 },
+      { header: 'Regular h', key: 'rh', width: 10 }, { header: 'OT h', key: 'oh', width: 8 }, { header: 'Total h', key: 'h', width: 10 }, { header: 'L per hour', key: 'lph', width: 10 }, { header: 'Litres', key: 'l', width: 10 },
       { header: 'Official price', key: 'np', width: 12 }, { header: 'Base price', key: 'bp', width: 12 }, { header: 'Diff / L', key: 'df', width: 10 }, { header: 'Amount', key: 'a', width: 14 }]);
     for (const d of fdDays) {
-      const r = f.addRow({ m: d.m, s: d.s, no: d.no || '', d: d.record_date, h: d.hours, lph: d.liters_per_hour, l: d.liters, np: d.national_price, bp: d.base_price, df: d.diff, a: d.amount });
+      const r = f.addRow({ m: d.m, s: d.s, no: d.no || '', d: d.record_date, rh: d.regular_hours ?? null, oh: d.overtime_hours ?? null, h: d.hours, lph: d.liters_per_hour, l: d.liters, np: d.national_price, bp: d.base_price, df: d.diff, a: d.amount });
       r.getCell('a').numFmt = moneyFmt;
     }
   }

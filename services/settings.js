@@ -22,6 +22,11 @@ const DEFINITIONS = {
   eq_shift_continuity_minutes: { type: 'int', min: 0, max: 180, description: 'Shifts of one machine closer than this (minutes) are continuous: overtime starts after threshold x shifts' },
   eq_block_monthly_days_without_rows: { type: 'bool', description: 'Monthly machines: a deployed working day with no attendance row blocks generating (it is deducted in full as an absence); the batch can still be generated with a reason' },
   eq_late_entry_days: { type: 'int', min: 1, max: 60, description: 'A row created more than this many days after its date is flagged as a late entry (warning only; a reason is asked)' },
+  // titles under the signature lines of every invoice, statement and certificate (14 Oct 2026: one place, not in the code)
+  doc_prepared_by_en: { type: 'string', max: 80, description: 'Documents: who prepares the invoices (English)' },
+  doc_prepared_by_ar: { type: 'string', max: 80, description: 'Documents: who prepares the invoices (Arabic)' },
+  doc_approved_by_en: { type: 'string', max: 80, description: 'Documents: who approves / certifies the invoices (English)' },
+  doc_approved_by_ar: { type: 'string', max: 80, description: 'Documents: who approves / certifies the invoices (Arabic)' },
 };
 
 /** Settings that change amounts or switch a control: changing them needs a reason. */
@@ -36,6 +41,8 @@ const DEFAULTS = {
   eq_finalize_requires_scan: 'true', eq_fuel_diff_allow_negative: 'true', eq_weekly_off_day: '5',
   eq_shift_continuity_minutes: '30', eq_late_entry_days: '3',
   eq_block_monthly_days_without_rows: 'true',
+  doc_prepared_by_en: 'Plant & Equipment Department', doc_prepared_by_ar: 'إدارة الآليات والمعدات',
+  doc_approved_by_en: 'Project Director', doc_approved_by_ar: 'مدير المشروع',
 };
 
 let cache = null;
