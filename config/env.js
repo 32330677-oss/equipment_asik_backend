@@ -43,6 +43,8 @@ const env = {
   },
   loginRateLimitMax: int('LOGIN_RATE_LIMIT_MAX', 20),
   bcryptCost: int('BCRYPT_COST', 12),
+  // Shared secret for server-to-server reads by Team Flow (combined Project Daily Report). Empty = integration off.
+  integrationToken: str('INTEGRATION_TOKEN', ''),
 };
 
 function validateEnv() {
@@ -50,6 +52,7 @@ function validateEnv() {
   if (!env.jwtSecret || env.jwtSecret.length < 32) problems.push('JWT_SECRET is missing or shorter than 32 characters');
   if (!env.db.database) problems.push('DB_NAME is required');
   if (!['local', 's3'].includes(env.storage.driver)) problems.push('FILE_STORAGE_DRIVER must be local or s3');
+  if (env.integrationToken && env.integrationToken.length < 32) problems.push('INTEGRATION_TOKEN must be at least 32 characters (or empty to switch the integration off)');
   if (env.storage.driver === 's3' && !env.storage.s3.bucket) problems.push('S3_BUCKET is required with FILE_STORAGE_DRIVER=s3');
   if (problems.length) {
     const err = new Error(`Invalid configuration:\n - ${problems.join('\n - ')}`);

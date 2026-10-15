@@ -9,5 +9,6 @@ router.use('/settings', require('./settingsRoutes'));
 router.use('/audit', require('./auditRoutes'));
 router.use('/equipment', require('./equipmentRoutes'));
 router.use('/help', require('./helpRoutes'));             // Help Center (assistant/guide.md)
+router.use('/integration', require('./integrationRoutes')); // server-to-server reads by Team Flow (token auth)
 
 module.exports = router;
