@@ -479,11 +479,28 @@ function drawVendor(doc, ctx, b, items) {
     right: numberBlock(doc, b, final ? v.vendor_invoice_no : null, cur),
   });
   y = P.infoGrid(doc, [
-    { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${v.vendor_name}${v.vendor_type === 'Individual' && v.vendor_national_id ? ` | ID ${v.vendor_national_id}` : ''}` },
-    { label: 'Contract(s)', labelAr: 'العقود', value: [...new Set(items.map((i) => (i.rate && i.rate.contract_number) || i.contract_number).filter(Boolean))].join(', ') || '-' },
+    { label: 'Lessor (vendor)', labelAr: 'الجهة المؤجرة', value: `${v.vendor_name}${v.vendor_code ? ` (${v.vendor_code})` : ''}${v.vendor_type === 'Individual' && v.vendor_national_id ? ` | ID ${v.vendor_national_id}` : ''}` },
+    { label: 'Contract / LPO', labelAr: 'العقود', value: [...new Set(items.map((i) => (i.rate && i.rate.contract_number) || i.contract_number).filter(Boolean))].join(', ') || '-' },
     { label: 'Billing period', labelAr: 'فترة المطالبة', value: `${fmt.date(b.start_date)} - ${fmt.date(b.end_date)}` },
     { label: 'Issued', labelAr: 'تاريخ الإصدار', value: final && b.finalized_at ? fmt.date(String(b.finalized_at).slice(0, 10)) : (b.unapproved_rows ? `${b.unapproved_rows} attendance row(s) NOT APPROVED yet` : `${ctx.printedAt} (draft)`) },
   ], y, 4);
+  // project / site(s): once for the whole statement (15 Oct 2026, from section A of the payment certificate)
+  const sites = [...new Map(items.map((i) => [i.site_code, [i.site_code, i.site_name, i.project_name].filter(Boolean).join(' - ')])).values()];
+  // the project / site takes three quarters of the row, the currency the last quarter in a dark box (easy to see)
+  {
+    const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
+    const yy = y - 6; const cw = W * 0.75; const ch = 26;
+    const site = sites.join('  |  ') || '-';
+    doc.rect(L, yy, cw, ch).lineWidth(0.5).strokeColor(COLORS.grid).stroke();
+    P.text(doc, sites.length > 1 ? 'Projects / sites' : 'Project / site', L + 4, yy + 3, { size: 6.5, color: COLORS.muted, width: cw / 2, lineBreak: false });
+    P.text(doc, 'المشروع / الموقع', L + cw / 2, yy + 1, { size: 6.5, color: COLORS.muted, width: cw / 2 - 4, align: 'right', lineBreak: false });
+    P.text(doc, site, L + 4, yy + 12, { size: 8.5, bold: true, width: cw - 8, height: ch - 12, lineBreak: false });
+    doc.rect(L + cw, yy, W - cw, ch).fill(COLORS.navy);
+    P.text(doc, 'Currency', L + cw + 6, yy + 3, { size: 6.5, color: '#E9DDBE', width: 60, lineBreak: false });
+    P.text(doc, 'العملة', L + cw + 6, yy + 1, { size: 6.5, color: '#E9DDBE', width: W - cw - 12, align: 'right', lineBreak: false });
+    P.text(doc, cur, L + cw, yy + 9, { size: 13, bold: true, color: COLORS.gold, width: W - cw, height: ch - 9, align: 'center', lineBreak: false });
+    y = yy + ch + 6;
+  }
   y = sectionTitle(doc, y, '1. Machines summary', 'ملخص الآليات');
   // regular time and overtime apart (hours and money), then the other lines, then the net
   const rows = items.map((it) => {
@@ -551,8 +568,42 @@ function drawVendor(doc, ctx, b, items) {
     : `Only approved attendance rows are included${ctx.requirePaper ? ', matched with the signed monthly timesheets' : ''}`;
   P.text(doc, `${approvalNote}. Machine invoices: ${[...new Set(items.map((i) => i.invoice_no).filter(Boolean))].join(', ') || '-'}.`,
     doc.page.margins.left, y, { size: 6.8, color: COLORS.muted, width: doc.page.width - 48 });
-  const sg = ctx.sign;
-  signatureRow(doc, doc.y + 10, [[`Prepared by (${sg.preparedEn})`, `إعداد: ${sg.preparedAr}`], [`Approved by (${sg.approverEn})`, `اعتماد: ${sg.approverAr}`], ['Acknowledged by the lessor', 'إقرار ممثل الجهة المؤجرة']]);
+  drawAuthorisation(doc, doc.y + 8, ctx.sign, items, sec);
+}
+
+/** Signatures of the vendor statement: the six roles of the payment certificate (once), then the lessor's receipt. */
+function drawAuthorisation(doc, y, sg, items, sec) {
+  const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
+  if (y + 18 + 24 + 6 * 22 + 40 > doc.page.height - doc.page.margins.bottom - 18) { doc.addPage(); y = doc.page.margins.top + 4; }
+  y = sectionTitle(doc, y, `${sec}. Authorisation (segregation of duties)`, 'الاعتمادات');
+  const sites = [...new Set(items.map((i) => i.site_code).filter(Boolean))].join(', ');
+  const roles = [
+    [`Prepared by - ${sg.preparedEn}`, 'Compiles the timesheets and this statement'],
+    ['Verified by - Plant & Equipment Manager', 'Hours, rate, machine, breakdowns'],
+    [`Certified by - ${sg.approverEn}`, `Work done on site${sites.includes(',') ? 's' : ''} ${sites}`.trim()],
+    ['Checked by - Cost Control / QS', 'Cost code, budget, contract terms'],
+    ['Reviewed by - Accounts Payable', 'Invoice, deductions, taxes, duplicates'],
+    ['Approved for payment - Finance Manager', 'Final release per authority matrix'],
+  ];
+  y = P.table(doc, {
+    y, rowHeight: 22, headHeight: 24, fontSize: 7.2, zebra: false,
+    columns: [
+      { key: 'no', en: '#', ar: '', width: 20 }, { key: 'role', en: 'Role', ar: 'الصفة', width: 165, align: 'left' },
+      { key: 'resp', en: 'Responsibility', ar: 'المسؤولية', width: 150, align: 'left', color: COLORS.muted },
+      { key: 'name', en: 'Name', ar: 'الاسم', width: 80 }, { key: 'sig', en: 'Signature', ar: 'التوقيع', width: 80 }, { key: 'date', en: 'Date', ar: 'التاريخ', width: W - 495 },
+    ],
+    rows: roles.map(([role, resp], i) => ({ no: i + 1, role, resp })),
+  });
+  y += 10;
+  P.text(doc, 'Received by (Lessor): I confirm receipt of the net amount stated above in full settlement of this statement.', L, y, { size: 7.5, width: W * 0.68, lineBreak: false });
+  P.text(doc, 'أقر باستلام صافي المبلغ المذكور أعلاه', L + W * 0.66, y - 1, { size: 7.5, width: W * 0.34, align: 'right', lineBreak: false });
+  y += 22;
+  ['Name', 'Signature', 'Date'].forEach((t, i) => {
+    const x = L + i * (W / 3);
+    P.text(doc, `${t}:`, x, y, { size: 7.5, width: 50, lineBreak: false });
+    doc.moveTo(x + 42, y + 9).lineTo(x + W / 3 - 14, y + 9).lineWidth(0.6).strokeColor('#888').stroke();
+  });
+  return y + 20;
 }
 
 // --------------------------------------------------------------- D5 fuel price difference statement
