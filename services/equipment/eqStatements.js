@@ -501,45 +501,86 @@ function drawVendor(doc, ctx, b, items) {
     P.text(doc, cur, L + cw, yy + 9, { size: 13, bold: true, color: COLORS.gold, width: W - cw, height: ch - 9, align: 'center', lineBreak: false });
     y = yy + ch + 6;
   }
-  y = sectionTitle(doc, y, '1. Machines summary', 'ملخص الآليات');
-  // regular time and overtime apart (hours and money), then the other lines, then the net
-  const rows = items.map((it) => {
-    const h = F.hoursSplit(it); const a = F.amountSplit(it.lines);
+  // 15 Oct 2026 (landscape): ONE table for the machines - the regular time and the overtime each with its quantity,
+  // rate and amount (what the "Invoice lines" table used to show), then the other columns and the net. Only what does
+  // not fit in a column is detailed under it (other additions / deductions, several prices, fuel, adjustments).
+  const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
+  const newPage = () => doc.page.margins.top + 4;
+  const fit = (cols) => { const t = cols.reduce((a, c) => a + c.width, 0); let used = 0; return cols.map((c, i) => { const w = i === cols.length - 1 ? W - used : Math.floor((c.width * W) / t); used += w; return { ...c, width: w }; }); };
+  const qtyText = (q, unit) => `${fmt.num(q, 3).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')}${unit ? ` ${UNIT_TEXT[unit] || unit}` : ''}`;
+  /** Regular or overtime lines of a machine as one cell group: qty, rate, amount (several rates -> detailed below). */
+  const group = (it, types) => {
+    const ls = it.lines.filter((l) => types.includes(l.line_type)).map((l) => ({ l, d: F.displayLine(l, it) }));
+    if (!ls.length) return { qty: '-', rate: '-', amt: '-', amount: 0, mixed: false, units: [] };
+    const prices = [...new Set(ls.map((x) => x.d.unit_price.toFixed(6)))];
+    const units = [...new Set(ls.map((x) => x.d.unit))];
+    const amount = ls.reduce((a, x) => a + n(x.l.amount), 0);
+    const q = ls.reduce((a, x) => a + n(x.d.quantity), 0);
+    const mixed = prices.length > 1 || units.length > 1;
+    return { qty: mixed ? 'see below' : qtyText(q, units[0]), rate: mixed ? `${prices.length} rates` : fmt.num(ls[0].d.unit_price, ls[0].d.decimals), amt: money(amount, cur), amount, mixed, units, q };
+  };
+  y = sectionTitle(doc, y, '1. Machines and amounts', 'الآليات والمبالغ');
+  const detail = []; // lines shown one by one under the table
+  const g = items.map((it) => {
+    const reg = group(it, F.REGULAR_LINES); const ot = group(it, ['Overtime']);
+    for (const l of it.lines) {
+      const isReg = F.REGULAR_LINES.includes(l.line_type); const isOt = l.line_type === 'Overtime';
+      if ((isReg && reg.mixed) || (isOt && ot.mixed) || (!isReg && !isOt && !F.SPECIAL_LINES.includes(l.line_type))) detail.push({ it, l });
+    }
+    return { reg, ot };
+  });
+  const rows = items.map((it, i) => {
+    const a = F.amountSplit(it.lines); const { reg, ot } = g[i];
     const dnr = it.billing_mode === 'DNR';
     return {
-      m: `${it.equipment_code}\n${mlabel(it)}`, site: it.site_code, bill: dnr ? `DNR (${it.lines.filter((l) => l.line_type === 'DeliveryNote').length})` : it.billing_mode, days: it.worked_days,
-      reg: dnr ? '-' : fmt.num(h.regular), regA: a.regular ? money(a.regular, cur) : '-', ot: h.overtime ? fmt.num(h.overtime) : '-', otA: a.overtime ? money(a.overtime, cur) : '-',
+      no: i + 1, m: `${it.equipment_code}\n${mlabel(it)}`, site: it.site_code, bill: dnr ? `DNR (${it.lines.filter((l) => l.line_type === 'DeliveryNote').length})` : it.billing_mode, days: it.worked_days,
+      rq: reg.qty, rr: reg.rate, ra: reg.amt, oq: ot.qty, or: ot.rate, oa: ot.amt,
       oth: a.otherAdd ? money(a.otherAdd, cur) : '-', fd: a.fuelDiff ? money(a.fuelDiff, cur) : '-', fuel: a.fuel ? money(a.fuel, cur) : '-',
       adj: a.adjustments ? money(a.adjustments, cur) : '-', ded: a.otherDed ? money(a.otherDed, cur) : '-', net: money(it.net_amount, cur),
+      _color: n(it.net_amount) < 0 ? COLORS.red : undefined,
     };
   });
   const tot = (f) => items.reduce((a, it) => a + f(it), 0);
   const ta = (k) => tot((it) => F.amountSplit(it.lines)[k]);
-  rows.push({ m: 'Totals', reg: fmt.num(tot((it) => F.hoursSplit(it).regular)), regA: money(ta('regular'), cur), ot: fmt.num(tot((it) => F.hoursSplit(it).overtime)), otA: money(ta('overtime'), cur),
+  // a quantity total only when every machine counts in the same unit (hours with hours)
+  const qTotal = (k) => { const gs = g.map((x) => x[k]).filter((x) => x.units.length); const u = [...new Set(gs.flatMap((x) => x.units))]; return gs.length && u.length === 1 && !gs.some((x) => x.mixed) ? qtyText(gs.reduce((a, x) => a + x.q, 0), u[0]) : ''; };
+  rows.push({ m: 'Totals', rq: qTotal('reg'), ra: money(ta('regular'), cur), oq: qTotal('ot'), oa: money(ta('overtime'), cur),
     oth: money(ta('otherAdd'), cur), fd: money(ta('fuelDiff'), cur), fuel: money(ta('fuel'), cur), adj: money(ta('adjustments'), cur), ded: money(ta('otherDed'), cur),
-    net: money(tot((i) => n(i.net_amount)), cur), _bold: true, _fill: COLORS.soft });
+    net: money(tot((i) => n(i.net_amount)), cur), _bold: true, _fill: COLORS.soft, _height: 18 });
+  const REG = '#EFE7D3'; const OT = '#F7F2E6'; // light bands so the regular / overtime groups read together
   y = P.table(doc, {
-    y, rows, rowHeight: 16, headHeight: 26, fontSize: 6.8,
-    columns: [
-      { key: 'm', en: 'Machine', ar: 'الآلية', width: 58, align: 'left', wrap: true }, { key: 'site', en: 'Site', ar: 'الموقع', width: 28 },
-      { key: 'bill', en: 'Billing', ar: 'الأساس', width: 32 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 26 },
-      { key: 'reg', en: 'Regular h', ar: 'ساعات عادية', width: 32 }, { key: 'regA', en: 'Regular amt', ar: 'مبلغ العادي', width: 48, align: 'right' },
-      { key: 'ot', en: 'OT h', ar: 'ساعات إضافي', width: 28 }, { key: 'otA', en: 'OT amt', ar: 'مبلغ الإضافي', width: 42, align: 'right' },
-      { key: 'oth', en: 'Other add.', ar: 'إضافات أخرى', width: 42, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 40, align: 'right' },
-      { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 38, align: 'right' }, { key: 'adj', en: 'Adjust.', ar: 'تسويات', width: 38, align: 'right' },
-      { key: 'ded', en: 'Other ded.', ar: 'حسومات', width: 38, align: 'right' }, { key: 'net', en: 'Net', ar: 'الصافي', width: 57, align: 'right', bold: true },
-    ],
-    onNewPage: () => doc.page.margins.top + 4,
+    y, rows: rows.map((r) => (r._fill ? r : { ...r, _height: 20 })), rowHeight: 20, headHeight: 26, fontSize: 7.2, onNewPage: newPage,
+    columns: fit([
+      { key: 'no', en: '#', ar: '', width: 16 }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 96, align: 'left', wrap: true },
+      { key: 'site', en: 'Site', ar: 'الموقع', width: 34 }, { key: 'bill', en: 'Billing', ar: 'الأساس', width: 40 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 32 },
+      { key: 'rq', en: 'Regular qty', ar: 'الكمية العادية', width: 48 }, { key: 'rr', en: 'Regular rate', ar: 'السعر العادي', width: 46, align: 'right' },
+      { key: 'ra', en: 'Regular amount', ar: 'مبلغ العادي', width: 60, align: 'right', bold: true },
+      { key: 'oq', en: 'OT qty', ar: 'كمية الإضافي', width: 44 }, { key: 'or', en: 'OT rate', ar: 'سعر الإضافي', width: 44, align: 'right' },
+      { key: 'oa', en: 'OT amount', ar: 'مبلغ الإضافي', width: 56, align: 'right', bold: true },
+      { key: 'oth', en: 'Other add.', ar: 'إضافات أخرى', width: 50, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 48, align: 'right' },
+      { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 46, align: 'right' }, { key: 'adj', en: 'Adjust.', ar: 'تسويات', width: 46, align: 'right' },
+      { key: 'ded', en: 'Other ded.', ar: 'حسومات', width: 48, align: 'right' }, { key: 'net', en: `Net (${cur})`, ar: 'الصافي', width: 64, align: 'right', bold: true },
+    ]),
   });
   let sec = 2;
-  y = sectionTitle(doc, y + 6, `${sec++}. Invoice lines`, 'تفاصيل البنود');
-  y = drawLines(doc, y, items, cur, true, hide);
+  if (detail.length) {
+    y = sectionTitle(doc, y + 6, `${sec++}. Other additions and deductions (detail of the columns above)`, 'تفاصيل الإضافات والحسومات الأخرى');
+    y = P.table(doc, {
+      y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: newPage,
+      columns: fit([{ key: 'm', en: 'Machine', ar: 'الآلية', width: 70 }, { key: 'desc', en: 'Description', ar: 'البيان', width: 330, align: 'left' }, { key: 'qty', en: 'Qty', ar: 'الكمية', width: 60 },
+        { key: 'price', en: 'Unit price', ar: 'سعر الوحدة', width: 70, align: 'right' }, { key: 'amount', en: `Amount (${cur})`, ar: 'المبلغ', width: 80, align: 'right', bold: true }]),
+      rows: detail.map(({ it, l }) => {
+        const d = F.displayLine(l, it);
+        return { m: mshort(it), desc: lineDesc(l, it.rate, hide), qty: qtyText(d.quantity, d.unit), price: fmt.num(d.unit_price, d.decimals), amount: money(l.amount, cur), _color: n(l.amount) < 0 ? COLORS.red : undefined };
+      }),
+    }) + 4;
+  }
   const fdItems = items.filter((it) => fuelDiffOf(it));
   if (fdItems.length) {
     y = sectionTitle(doc, y + 4, `${sec++}. Fuel price difference (attached statements)`, 'فروقات أسعار المحروقات');
-    y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
-      columns: [{ key: 'm', en: 'Machine', ar: 'الآلية', width: 90 }, { key: 'no', en: 'Statement no.', ar: 'رقم البيان', width: 110 },
-        { key: 'l', en: 'Litres', ar: 'الليترات', width: 80 }, { key: 'note', en: 'Basis', ar: 'الأساس', width: 170, align: 'left' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 97, align: 'right' }],
+    y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: newPage,
+      columns: fit([{ key: 'm', en: 'Machine', ar: 'الآلية', width: 90 }, { key: 'no', en: 'Statement no.', ar: 'رقم البيان', width: 110 },
+        { key: 'l', en: 'Litres', ar: 'الليترات', width: 80 }, { key: 'note', en: 'Basis', ar: 'الأساس', width: 170, align: 'left' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 97, align: 'right' }]),
       rows: fdItems.map((it) => {
         const ls = it.lines.filter((l) => l.line_type === 'FuelPriceDifference');
         return { m: mshort(it), no: it.fuel_invoice_no || (final ? '-' : 'draft'), l: fmt.num(ls.reduce((a, l) => a + n(l.quantity), 0)),
@@ -549,32 +590,36 @@ function drawVendor(doc, ctx, b, items) {
   const fuelLines = items.flatMap((it) => it.lines.filter((l) => l.line_type === 'Fuel').map((l) => ({ ...l, m: mshort(it), site: it.site_code })));
   if (fuelLines.length) {
     y = sectionTitle(doc, y + 4, `${sec++}. Fuel supplied by the company`, 'المحروقات المسلمة من الشركة');
-    y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
-      columns: [{ key: 'm', en: 'Machine', ar: 'الآلية', width: 70 }, { key: 'site', en: 'Site', ar: 'الموقع', width: 50 }, { key: 'note', en: 'Date / receipt', ar: 'التاريخ والإيصال', width: 150, align: 'left' },
-        { key: 'qty', en: 'Litres', ar: 'الليترات', width: 60 }, { key: 'price', en: 'Price/L', ar: 'سعر الليتر', width: 70, align: 'right' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 147, align: 'right' }],
+    y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: newPage,
+      columns: fit([{ key: 'm', en: 'Machine', ar: 'الآلية', width: 70 }, { key: 'site', en: 'Site', ar: 'الموقع', width: 50 }, { key: 'note', en: 'Date / receipt', ar: 'التاريخ والإيصال', width: 150, align: 'left' },
+        { key: 'qty', en: 'Litres', ar: 'الليترات', width: 60 }, { key: 'price', en: 'Price/L', ar: 'سعر الليتر', width: 70, align: 'right' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 147, align: 'right' }]),
       rows: fuelLines.map((l) => ({ m: l.m, site: l.site, note: l.note || '', qty: fmt.num(l.quantity), price: fmt.num(l.unit_price, 3), amount: money(l.amount, cur), _color: COLORS.red })) }) + 4;
   }
   const adjLines = items.flatMap((it) => it.lines.filter((l) => l.line_type === 'Adjustment').map((l) => ({ ...l, m: mshort(it) })));
   if (adjLines.length) {
-    y = sectionTitle(doc, y + 4, `${sec++}. Additions and deductions`, 'الإضافات والحسومات');
-    y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
-      columns: [{ key: 'm', en: 'Machine', ar: 'الآلية', width: 70 }, { key: 'note', en: 'Type: reason', ar: 'النوع والسبب', width: 380, align: 'left' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 97, align: 'right' }],
+    y = sectionTitle(doc, y + 4, `${sec++}. Adjustments`, 'التسويات');
+    y = P.table(doc, { y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: newPage,
+      columns: fit([{ key: 'm', en: 'Machine', ar: 'الآلية', width: 70 }, { key: 'note', en: 'Type: reason', ar: 'النوع والسبب', width: 380, align: 'left' }, { key: 'amount', en: 'Amount', ar: 'المبلغ', width: 97, align: 'right' }]),
       rows: adjLines.map((l) => ({ m: l.m, note: hide.has('reasons') ? String(l.note || '').split(':')[0] : l.note || '', amount: money(l.amount, cur), _color: n(l.amount) < 0 ? COLORS.red : undefined })) }) + 4;
   }
   const sum = (k) => items.reduce((a, i) => a + n(i[k]), 0);
-  y = totalsBox(doc, y + 6, { gross: sum('gross_amount'), deductions: sum('deductions_amount'), net: sum('net_amount'), currency: cur });
+  // the totals on the right, the lessor's receipt on the left of them (same height)
+  let ty = y + 6;
+  if (ty + 74 > doc.page.height - doc.page.margins.bottom - 14) { doc.addPage(); ty = doc.page.margins.top + 4; }
+  drawReceipt(doc, L, ty, W - 290 - 20);
+  y = totalsBox(doc, ty, { gross: sum('gross_amount'), deductions: sum('deductions_amount'), net: sum('net_amount'), currency: cur });
   const approvalNote = b.provisional && b.unapproved_rows
     ? `Includes ${b.unapproved_rows} attendance row(s) NOT approved yet: amounts may change after approval`
     : `Only approved attendance rows are included${ctx.requirePaper ? ', matched with the signed monthly timesheets' : ''}`;
   P.text(doc, `${approvalNote}. Machine invoices: ${[...new Set(items.map((i) => i.invoice_no).filter(Boolean))].join(', ') || '-'}.`,
     doc.page.margins.left, y, { size: 6.8, color: COLORS.muted, width: doc.page.width - 48 });
-  drawAuthorisation(doc, doc.y + 8, ctx.sign, items, sec);
+  drawAuthorisation(doc, doc.y + 6, ctx.sign, items, sec);
 }
 
-/** Signatures of the vendor statement: the six roles of the payment certificate (once), then the lessor's receipt. */
+/** Signatures of the vendor statement: the six roles of the payment certificate (once; the lessor's receipt is next to the totals). */
 function drawAuthorisation(doc, y, sg, items, sec) {
   const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
-  if (y + 18 + 24 + 6 * 22 + 40 > doc.page.height - doc.page.margins.bottom - 18) { doc.addPage(); y = doc.page.margins.top + 4; }
+  if (y + 18 + 24 + 6 * 17 + 4 > doc.page.height - doc.page.margins.bottom - 18) { doc.addPage(); y = doc.page.margins.top + 4; }
   y = sectionTitle(doc, y, `${sec}. Authorisation (segregation of duties)`, 'الاعتمادات');
   const sites = [...new Set(items.map((i) => i.site_code).filter(Boolean))].join(', ');
   const roles = [
@@ -586,24 +631,31 @@ function drawAuthorisation(doc, y, sg, items, sec) {
     ['Approved for payment - Finance Manager', 'Final release per authority matrix'],
   ];
   y = P.table(doc, {
-    y, rowHeight: 22, headHeight: 24, fontSize: 7.2, zebra: false,
-    columns: [
-      { key: 'no', en: '#', ar: '', width: 20 }, { key: 'role', en: 'Role', ar: 'الصفة', width: 165, align: 'left' },
-      { key: 'resp', en: 'Responsibility', ar: 'المسؤولية', width: 150, align: 'left', color: COLORS.muted },
-      { key: 'name', en: 'Name', ar: 'الاسم', width: 80 }, { key: 'sig', en: 'Signature', ar: 'التوقيع', width: 80 }, { key: 'date', en: 'Date', ar: 'التاريخ', width: W - 495 },
-    ],
+    y, rowHeight: 17, headHeight: 22, fontSize: 7.2, zebra: false,
+    // widths in parts of the page width (portrait or landscape)
+    columns: [[20, '#', '', 'no'], [165, 'Role', 'الصفة', 'role'], [150, 'Responsibility', 'المسؤولية', 'resp'], [80, 'Name', 'الاسم', 'name'], [80, 'Signature', 'التوقيع', 'sig'], [52, 'Date', 'التاريخ', 'date']]
+      .map(([w, en, ar, key]) => ({ key, en, ar, width: Math.floor((w * W) / 547), align: key === 'role' || key === 'resp' ? 'left' : undefined, color: key === 'resp' ? COLORS.muted : undefined })),
     rows: roles.map(([role, resp], i) => ({ no: i + 1, role, resp })),
   });
-  y += 10;
-  P.text(doc, 'Received by (Lessor): I confirm receipt of the net amount stated above in full settlement of this statement.', L, y, { size: 7.5, width: W * 0.68, lineBreak: false });
-  P.text(doc, 'أقر باستلام صافي المبلغ المذكور أعلاه', L + W * 0.66, y - 1, { size: 7.5, width: W * 0.34, align: 'right', lineBreak: false });
-  y += 22;
+  return y + 6;
+}
+
+/** The lessor's receipt of the net amount: a box with the statement (EN / AR) and name, signature, date. */
+function drawReceipt(doc, x, y, w) {
+  const h = 70;
+  doc.rect(x, y, w, h).lineWidth(0.5).strokeColor(COLORS.grid).stroke();
+  doc.rect(x, y, 3, h).fill(COLORS.gold);
+  P.text(doc, 'Received by (Lessor)', x + 9, y + 5, { size: 8, bold: true, color: COLORS.navy, width: w / 2, lineBreak: false });
+  P.text(doc, 'استلام الجهة المؤجرة', x + w / 2, y + 3, { size: 8, color: COLORS.navy, width: w / 2 - 6, align: 'right', lineBreak: false });
+  P.text(doc, 'I confirm receipt of the net amount stated in this statement in full settlement.', x + 9, y + 18, { size: 7, color: COLORS.muted, width: w * 0.6, lineBreak: false });
+  P.text(doc, 'أقر باستلام صافي المبلغ المذكور أعلاه', x + w * 0.55, y + 16, { size: 7, color: COLORS.muted, width: w * 0.45 - 6, align: 'right', lineBreak: false });
+  const cw = (w - 18) / 3;
   ['Name', 'Signature', 'Date'].forEach((t, i) => {
-    const x = L + i * (W / 3);
-    P.text(doc, `${t}:`, x, y, { size: 7.5, width: 50, lineBreak: false });
-    doc.moveTo(x + 42, y + 9).lineTo(x + W / 3 - 14, y + 9).lineWidth(0.6).strokeColor('#888').stroke();
+    const xx = x + 9 + i * cw;
+    P.text(doc, `${t}:`, xx, y + 46, { size: 7.5, width: 48, lineBreak: false });
+    doc.moveTo(xx + (t === 'Signature' ? 44 : 28), y + 55).lineTo(xx + cw - 10, y + 55).lineWidth(0.6).strokeColor('#888').stroke();
   });
-  return y + 20;
+  return y + h;
 }
 
 // --------------------------------------------------------------- D5 fuel price difference statement
@@ -713,7 +765,7 @@ async function render(conn, model, opts, user) {
     hide: opts.hide || new Set(), sign: await F.signatories() };
   const { batch: b } = model;
   const items = model.items;
-  const landscape = opts.view === 'summary';
+  const landscape = opts.view === 'summary' || opts.view === 'vendor'; // 15 Oct 2026: the vendor statement is landscape
   const doc = P.createDoc({ layout: landscape ? 'landscape' : 'portrait', info: { Title: `Equipment invoice ${opts.view}` } });
   let fileName;
   const tag = b.provisional ? `provisional-${b.start_date}_${b.end_date}` : `batch-${b.eq_batch_id}-v${b.version_number}`;
