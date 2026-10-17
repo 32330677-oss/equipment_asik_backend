@@ -67,6 +67,22 @@ test('daily plant summary: best state per machine, per type', async () => {
   assert.ok(!d9.types.some((x) => x.type_name === 'Excavator'));
 });
 
+test('plant-days: machines on site per day, type and vendor (Working / Standby / Breakdown only)', async () => {
+  const d = await ok(h.api().get('/api/integration/plant-days?from=2026-10-19&to=2026-10-20&site_ids=8,9').set(KEY));
+  const byType = Object.fromEntries(d.rows.map((x) => [x.type_name, x]));
+  assert.strictEqual(byType.Excavator.working, 1);
+  assert.strictEqual(byType['Wheel Loader'].breakdown, 1);
+  assert.strictEqual(byType.Roller.standby, 1);
+  assert.ok(!byType['Mobile Crane'], 'pending is not on the list');
+  assert.ok(d.rows.every((x) => x.date === '2026-10-20' && x.vendor_name));
+  const vendors = await ok(h.api().get('/api/integration/vendors').set(KEY));
+  assert.ok(vendors.some((v) => v.vendor_id === byType.Excavator.vendor_id));
+  for (const q of ['from=2026-10-20&to=2026-10-19&site_ids=8', 'from=2022-01-01&to=2026-10-20&site_ids=8', 'from=2026-10-20&to=2026-10-20']) {
+    const r = await h.api().get(`/api/integration/plant-days?${q}`).set(KEY);
+    assert.strictEqual(r.status, 400, q);
+  }
+});
+
 test('a cancelled row does not count, the deployment makes it Pending again', async () => {
   const [[row]] = await require('../config/db').pool.query(
     "SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-20'", [F.exc.equipment_id]);

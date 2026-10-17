@@ -106,10 +106,52 @@ async function dailyPlantSummary({ date, siteIds }) {
   };
 }
 
+async function listVendors() {
+  const [rows] = await pool.query('SELECT vendor_id, vendor_code, vendor_name, status FROM eq_vendors ORDER BY vendor_name');
+  return rows.map((r) => ({ vendor_id: Number(r.vendor_id), vendor_code: r.vendor_code, vendor_name: r.vendor_name, status: r.status }));
+}
+
+/**
+ * Machines per day, type and vendor over a date range (for cumulative equipment-days).
+ * Same rules as dailyPlantSummary for the RECORDED rows: a machine counts once a day with its best
+ * state; Cancelled rows never count; a Working row without a check-in is Pending. Only Working,
+ * Standby and Breakdown are returned (a machine on site that day). Pending / Absent / Holiday are not.
+ * @param {{from: string, to: string, siteIds: number[]}} p  validated by the route
+ */
+async function plantDays({ from, to, siteIds }) {
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(ea.record_date, '%Y-%m-%d') AS d, ea.equipment_id, ea.day_status, ea.check_in_time,
+            t.type_id, t.type_name, v.vendor_id, v.vendor_name
+     FROM eq_attendance ea
+     JOIN eq_equipment e ON e.equipment_id = ea.equipment_id
+     JOIN eq_types t ON t.type_id = e.type_id
+     JOIN eq_vendors v ON v.vendor_id = e.vendor_id
+     WHERE ea.record_date BETWEEN ? AND ? AND ea.site_id IN (?) AND ea.status <> 'Cancelled'`, [from, to, siteIds]);
+  const best = new Map();
+  for (const r of rows) {
+    const state = r.day_status === 'Working' ? (r.check_in_time ? 'Working' : 'Pending') : r.day_status;
+    const k = `${r.d}|${r.equipment_id}`;
+    const cur = best.get(k);
+    if (!cur || (RANK[state] || 0) > (RANK[cur.state] || 0)) best.set(k, { ...r, state });
+  }
+  const out = new Map();
+  for (const m of best.values()) {
+    if (!['Working', 'Standby', 'Breakdown'].includes(m.state)) continue;
+    const k = `${m.d}|${m.type_id}|${m.vendor_id}`;
+    const o = out.get(k) || { date: m.d, type_id: Number(m.type_id), type_name: m.type_name,
+      vendor_id: Number(m.vendor_id), vendor_name: m.vendor_name, working: 0, standby: 0, breakdown: 0, machines: 0 };
+    o[m.state.toLowerCase()] += 1;
+    o.machines += 1;
+    out.set(k, o);
+  }
+  return [...out.values()].sort((a, b) => a.date.localeCompare(b.date) || a.type_name.localeCompare(b.type_name)
+    || a.vendor_name.localeCompare(b.vendor_name));
+}
+
 function emptyCounts() {
   const c = { machines: 0 };
   for (const s of STATES) c[s.toLowerCase()] = 0;
   return c;
 }
 
-module.exports = { listSites, listTypes, dailyPlantSummary, STATES };
+module.exports = { listSites, listTypes, listVendors, dailyPlantSummary, plantDays, STATES };
