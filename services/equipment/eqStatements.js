@@ -549,14 +549,14 @@ function drawVendor(doc, ctx, b, items) {
     net: money(tot((i) => n(i.net_amount)), cur), _bold: true, _fill: COLORS.soft, _height: 18 });
   const REG = '#EFE7D3'; const OT = '#F7F2E6'; // light bands so the regular / overtime groups read together
   y = P.table(doc, {
-    y, rows: rows.map((r) => (r._fill ? r : { ...r, _height: 20 })), rowHeight: 20, headHeight: 26, fontSize: 7.2, onNewPage: newPage,
+    y, rows: rows.map((r) => (r._fill ? r : { ...r, _height: 20 })), rowHeight: 20, headHeight: 34, fontSize: 7.2, onNewPage: newPage,
     columns: fit([
       { key: 'no', en: '#', ar: '', width: 16 }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 96, align: 'left', wrap: true },
       { key: 'site', en: 'Site', ar: 'الموقع', width: 34 }, { key: 'bill', en: 'Billing', ar: 'الأساس', width: 40 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 32 },
-      { key: 'rq', en: 'Regular hours', ar: 'الساعات العادية', width: 48 }, { key: 'rr', en: 'Regular hour rate', ar: 'سعر الساعة العادية', width: 46, align: 'right' },
-      { key: 'ra', en: 'Regular hour amount', ar: 'مبلغ الساعات العادية', width: 60, align: 'right', bold: true },
-      { key: 'oq', en: 'OT hours', ar: 'ساعات الإضافي', width: 44 }, { key: 'or', en: 'OT hour rate', ar: 'سعر ساعة الإضافي', width: 44, align: 'right' },
-      { key: 'oa', en: 'OT hour amount', ar: 'مبلغ ساعات الإضافي', width: 56, align: 'right', bold: true },
+      { key: 'rq', en: 'Regular hours', ar: 'الساعات العادية', width: 48 }, { key: 'rr', en: 'Regular hour rate', ar: 'السعر العادي', width: 46, align: 'right' },
+      { key: 'ra', en: 'Regular hour amount', ar: 'مبلغ العادي', width: 60, align: 'right', bold: true },
+      { key: 'oq', en: 'OT hours', ar: 'ساعات الإضافي', width: 44 }, { key: 'or', en: 'OT hour rate', ar: 'سعر الإضافي', width: 44, align: 'right' },
+      { key: 'oa', en: 'OT hour amount', ar: 'مبلغ الإضافي', width: 56, align: 'right', bold: true },
       { key: 'oth', en: 'Other add.', ar: 'إضافات أخرى', width: 50, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 48, align: 'right' },
       { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 46, align: 'right' }, { key: 'adj', en: 'Adjust.', ar: 'تسويات', width: 46, align: 'right' },
       { key: 'ded', en: 'Other ded.', ar: 'حسومات', width: 48, align: 'right' }, { key: 'net', en: `Net (${cur})`, ar: 'الصافي', width: 64, align: 'right', bold: true },
