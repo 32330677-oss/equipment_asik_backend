@@ -1,0 +1,54 @@
+{
+  "_about": "ASIK legacy import (Feb-Sep 2026). Decisions of 21 Oct 2026. Machine identity = vendor + Excel name WITH its number; the system number (type_seq) must be the same number.",
+  "sites": { "T2": "S-T2", "BRIDGES": "S-BRIDGES" },
+  "types": {
+    "WHEEL LOADER": "Wheel Loader",
+    "ROLLER": "Roller",
+    "BOBCAT": "Bobcat",
+    "MOBILE CRANE": "Mobile Crane",
+    "GRADER": "Grader",
+    "EXCAVETOR": "Excavator",
+    "MINI EXCAVETOR": "Mini Excavator",
+    "GCB": "GCB",
+    "TELEHANDLER": "Telehandler",
+    "PICK UP": "Pick-up",
+    "WATER TANKER": "Water Tanker",
+    "SMALL ROLLER": "Small Roller",
+    "SMALL LOADER": "Small Loader",
+    "DUMPER": "Dumper"
+  },
+  "new_types": ["Small Roller", "Small Loader", "Dumper"],
+  "vendors": {
+    "AL DEEB": { "live_name": "Al-Deeb", "currency": "USD" },
+    "AL SHAHEM COMPANY": { "live_name": "Al-Shahem", "currency": "USD" },
+    "AHMAD HAMSHARI": { "live_name": "Al-Hamshari", "currency": "USD" },
+    "BILAL ABD AL NABEE": { "live_name": "Bilal Abed-Alnabi", "currency": "SYP" },
+    "ABO OMRAN FAYEZ MOUSA": { "live_name": "Fayez Moussa-Abo Omran", "currency": "SYP" },
+    "ABO FAHED AKEL": { "live_name": "Abo Fahed Akeel", "currency": "USD" },
+    "MOHAMAD AL SAGHER": { "live_name": "Mohammad Alsagheer", "currency": "USD" },
+    "ABD AL MONEM AL NOAIMI": { "new_name": "Abd Al-Monem Al-Noaimi", "currency": "SYP" },
+    "ANAS DARWISH": { "new_name": "Anas Darwish", "currency": "USD" },
+    "AHMAD KHALAF": { "new_name": "Ahmad Khalaf", "currency": "USD" },
+    "ABD ALLA MUBARK": { "new_name": "Abd Alla Mubark", "currency": "USD" },
+    "AL ASDEQAA COMPANY": { "new_name": "Al-Asdeqaa Company", "currency": "USD" },
+    "AHMAD ABBAS": { "new_name": "Ahmad Abbas", "currency": "USD" },
+    "BILAL QUIEDER": { "new_name": "Bilal Quieder", "currency": "USD" },
+    "AHMAD QUIEDER": { "new_name": "Ahmad Quieder", "currency": "USD" },
+    "HUSSAIN MOATE": { "new_name": "Hussain Moate", "currency": "USD" },
+    "KHALDON ALOR": { "new_name": "Khaldon Alor", "currency": "USD" },
+    "MOHAMAD QETAZ": { "new_name": "Mohamad Qetaz", "currency": "USD" },
+    "AL HAWARI COMPANY": { "new_name": "Al-Hawari Company", "currency": "USD" },
+    "MOHAMAD ALQABOUNI": { "new_name": "Mohamad Alqabouni", "currency": "USD" }
+  },
+  "daily_machines": {
+    "BILAL ABD AL NABEE|WATER TANKER1": { "daily_partial_rule": "FullDayIfWorked", "hours_per_day": 8 }
+  },
+  "shift_start": { "Day": "07:00", "Night": "18:00" },
+  "late_reason_prefix": "Legacy import",
+  "adjustment": {
+    "type": "Other",
+    "reason": "Legacy import {month}: accountant price rounding (Excel rate {rate}, system keeps 2 decimals; minutes rounding)",
+    "max_abs_fraction": 0.01,
+    "max_abs_floor": 2
+  }
+}

@@ -553,10 +553,10 @@ function drawVendor(doc, ctx, b, items) {
     columns: fit([
       { key: 'no', en: '#', ar: '', width: 16 }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 96, align: 'left', wrap: true },
       { key: 'site', en: 'Site', ar: 'الموقع', width: 34 }, { key: 'bill', en: 'Billing', ar: 'الأساس', width: 40 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 32 },
-      { key: 'rq', en: 'Regular qty', ar: 'الكمية العادية', width: 48 }, { key: 'rr', en: 'Regular rate', ar: 'السعر العادي', width: 46, align: 'right' },
-      { key: 'ra', en: 'Regular amount', ar: 'مبلغ العادي', width: 60, align: 'right', bold: true },
-      { key: 'oq', en: 'OT qty', ar: 'كمية الإضافي', width: 44 }, { key: 'or', en: 'OT rate', ar: 'سعر الإضافي', width: 44, align: 'right' },
-      { key: 'oa', en: 'OT amount', ar: 'مبلغ الإضافي', width: 56, align: 'right', bold: true },
+      { key: 'rq', en: 'Regular hours', ar: 'الساعات العادية', width: 48 }, { key: 'rr', en: 'Regular hour rate', ar: 'سعر الساعة العادية', width: 46, align: 'right' },
+      { key: 'ra', en: 'Regular hour amount', ar: 'مبلغ الساعات العادية', width: 60, align: 'right', bold: true },
+      { key: 'oq', en: 'OT hours', ar: 'ساعات الإضافي', width: 44 }, { key: 'or', en: 'OT hour rate', ar: 'سعر ساعة الإضافي', width: 44, align: 'right' },
+      { key: 'oa', en: 'OT hour amount', ar: 'مبلغ ساعات الإضافي', width: 56, align: 'right', bold: true },
       { key: 'oth', en: 'Other add.', ar: 'إضافات أخرى', width: 50, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 48, align: 'right' },
       { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 46, align: 'right' }, { key: 'adj', en: 'Adjust.', ar: 'تسويات', width: 46, align: 'right' },
       { key: 'ded', en: 'Other ded.', ar: 'حسومات', width: 48, align: 'right' }, { key: 'net', en: `Net (${cur})`, ar: 'الصافي', width: 64, align: 'right', bold: true },
@@ -834,7 +834,7 @@ async function batchXlsx(conn, detail) {
   s.addRows([
     ['Equipment invoice batch', `#${b.eq_batch_id} v${b.version_number}`], ['Status', statusText(b)], ['Period', `${b.start_date} to ${b.end_date}`],
     ['Scope', scopeText(b)], ['Currency', b.currency], ['Machines', Number(b.total_equipment)], ['Gross', n(b.total_gross)], ['Deductions', n(b.total_deductions)], ['Net', n(b.total_net)], [],
-    ['Vendor', 'Machines', 'Regular h', 'Regular amount', 'OT h', 'OT amount', 'Gross', 'Deductions', 'Net'],
+    ['Vendor', 'Machines', 'Regular h', 'Regular hour amount', 'OT h', 'OT hour amount', 'Gross', 'Deductions', 'Net'],
   ]);
   s.getColumn(1).width = 28; s.getColumn(2).width = 40;
   for (let c = 3; c <= 9; c += 1) s.getColumn(c).width = 16;
@@ -854,8 +854,8 @@ async function batchXlsx(conn, detail) {
   head(m, [
     { header: 'Vendor', key: 'vendor', width: 26 }, { header: 'Machine', key: 'code', width: 12 }, { header: 'Type / no.', key: 'type', width: 18 },
     { header: 'Site', key: 'site', width: 8 }, { header: 'Billing', key: 'mode', width: 10 }, { header: 'Rows', key: 'rows', width: 7 },
-    { header: 'Worked shifts', key: 'days', width: 9 }, { header: 'Regular h', key: 'reg', width: 10 }, { header: 'Regular amount', key: 'regA', width: 14 },
-    { header: 'OT h', key: 'ot', width: 8 }, { header: 'OT amount', key: 'otA', width: 14 }, { header: 'Total work h', key: 'work', width: 10 },
+    { header: 'Worked shifts', key: 'days', width: 9 }, { header: 'Regular h', key: 'reg', width: 10 }, { header: 'Regular hour amount', key: 'regA', width: 14 },
+    { header: 'OT h', key: 'ot', width: 8 }, { header: 'OT hour amount', key: 'otA', width: 14 }, { header: 'Total work h', key: 'work', width: 10 },
     { header: 'Standby h', key: 'sb', width: 9 }, { header: 'Breakdown h', key: 'bd', width: 10 }, { header: 'Top-up h', key: 'tu', width: 9 },
     { header: 'Other additions', key: 'oth', width: 14 }, { header: 'Other deductions', key: 'odd', width: 14 }, { header: 'Fuel issued', key: 'fuel', width: 13 },
     { header: 'Adjustments', key: 'adj', width: 13 }, { header: 'Fuel price diff.', key: 'fd', width: 14 },

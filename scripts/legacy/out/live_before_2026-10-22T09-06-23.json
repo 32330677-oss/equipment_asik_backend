@@ -1,0 +1,42 @@
+{
+ "eq_attendance": {
+  "rows": 250,
+  "sha256": "117f2722ac6b4c6d8fd811620704fde924ead17dc9c9dfbbf394535f8217e8c4"
+ },
+ "eq_downtime_periods": {
+  "rows": 147,
+  "sha256": "12d5b321e7723ca7824907d60b2d961b9b1112a6b14a87e6c64a7e902c9c679f"
+ },
+ "eq_rate_cards": {
+  "rows": 17,
+  "sha256": "a3ba2d884149216073768fa388ee7657616937dd8d790b4fdb3ad3a498dd7eb0"
+ },
+ "eq_site_assignments": {
+  "rows": 17,
+  "sha256": "ba8f94931fa35eb8afaaeeaedaa55e3f91c244b7b243afd7c7cb4dfa55470a3d"
+ },
+ "eq_payroll_batches": {
+  "rows": 3,
+  "sha256": "3c3bf87a96a76d97f3b429462d0d599e0d1be3320074f78f2b896d9fc0c802e4"
+ },
+ "eq_payroll_items": {
+  "rows": 15,
+  "sha256": "8722c1294b1fde46826fc86dcb781c24cde2408ef8acb37056812d9b5a910553"
+ },
+ "eq_invoices": {
+  "rows": 0,
+  "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+ },
+ "eq_adjustments": {
+  "rows": 1,
+  "sha256": "7db812ac6d46c9a116bc19cb353501629648be7b98189a6e6cddcfe0cd3ae53e"
+ },
+ "eq_fuel_issues": {
+  "rows": 2,
+  "sha256": "06b073bda362c1126da6981a1dd61df70eafad31faa37c41c1fcfeee09077979"
+ },
+ "eq_timesheets": {
+  "rows": 16,
+  "sha256": "e28d82d25cdb9b617a35a47bb7a0c86ec6db156279f417e95ccaa85ee265b3c5"
+ }
+}

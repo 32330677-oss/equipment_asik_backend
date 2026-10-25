@@ -457,7 +457,7 @@ function vendorSheet(wb, logoId, ctx, items) {
   put(ws, 'C8:M8', STATE_TEXT[ctx.state] || ctx.state, { bold: true, color: ['draft', 'cancelled', 'replaced', 'superseded'].includes(ctx.state) ? BRAND.red : BRAND.ink });
 
   section(ws, 10, 'MACHINES', 'الآليات', 'G', 'M');
-  const head = ['#', 'Machine invoice', 'Machine', 'Site', 'Basis', 'Shifts', 'Regular h', `Regular amount (${cur})`, 'OT h', `OT amount (${cur})`,
+  const head = ['#', 'Machine invoice', 'Machine', 'Site', 'Basis', 'Shifts', 'Regular h', `Regular hour amount (${cur})`, 'OT h', `OT hour amount (${cur})`,
     `Other additions (${cur})`, `Deductions (${cur})`, `Net (${cur})`];
   head.forEach((h, i) => put(ws, `${COLS[i]}11`, h, { bold: true, size: 8.5, color: BRAND.white, fill: BRAND.charcoal, align: 'center' }));
   ws.getRow(11).height = 30;

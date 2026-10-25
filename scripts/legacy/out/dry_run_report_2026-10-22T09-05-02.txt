@@ -1,0 +1,192 @@
+ASIK legacy import — DRY RUN 2026-10-22T09-05-02 — equipment_asik@equipment-asik-mysql-team-flow-trial.g.aivencloud.com
+
+Counts: {"vendors":20,"vendors_new":13,"machines":44,"machines_live":16,"types_new":3,"cards":86,"deployments":66,"attendance":2226,"long_sessions":1,"invoices":65}
+
+PROBLEMS (0) — the --run refuses to start while there is one:
+
+Types to create:
+  Small Roller
+  Small Loader
+  Dumper
+
+Vendors:
+  NEW  ABD AL MONEM AL NOAIMI -> Abd Al-Monem Al-Noaimi SYP; contract create from 2026-03-16; worked 2026-03-16 to 2026-04-26
+  NEW  ABD ALLA MUBARK -> Abd Alla Mubark USD; contract create from 2026-07-05; worked 2026-07-05 to 2026-08-04
+  LIVE ABO FAHED AKEL -> Abo Fahed Akeel (#7) USD; contract move_start from 2026-05-20; worked 2026-05-20 to 2026-09-30
+  LIVE ABO OMRAN FAYEZ MOUSA -> Fayez Moussa-Abo Omran (#6) SYP; contract move_start from 2026-04-01; worked 2026-04-01 to 2026-09-08
+  NEW  AHMAD ABBAS -> Ahmad Abbas USD; contract create from 2026-07-18; worked 2026-07-18 to 2026-07-30
+  LIVE AHMAD HAMSHARI -> Al-Hamshari (#4) USD; contract move_start from 2026-09-22; worked 2026-09-22 to 2026-09-30
+  NEW  AHMAD KHALAF -> Ahmad Khalaf USD; contract create from 2026-04-27; worked 2026-04-27 to 2026-06-18
+  NEW  AHMAD QUIEDER -> Ahmad Quieder USD; contract create from 2026-08-05; worked 2026-08-05 to 2026-09-10
+  NEW  AL ASDEQAA COMPANY -> Al-Asdeqaa Company USD; contract create from 2026-05-12; worked 2026-05-12 to 2026-09-02
+  LIVE AL DEEB -> Al-Deeb (#2) USD; contract move_start from 2026-04-28; worked 2026-04-28 to 2026-09-30
+  NEW  AL HAWARI COMPANY -> Al-Hawari Company USD; contract create from 2026-06-08; worked 2026-06-08 to 2026-06-08
+  LIVE AL SHAHEM COMPANY -> Al-Shahem (#3) USD; contract move_start from 2026-03-16; worked 2026-03-16 to 2026-09-30
+  NEW  ANAS DARWISH -> Anas Darwish USD; contract create from 2026-04-01; worked 2026-04-01 to 2026-09-17
+  LIVE BILAL ABD AL NABEE -> Bilal Abed-Alnabi (#5) SYP; contract move_start from 2026-09-01; worked 2026-09-01 to 2026-09-30
+  NEW  BILAL QUIEDER -> Bilal Quieder USD; contract create from 2026-07-11; worked 2026-07-11 to 2026-07-19
+  NEW  HUSSAIN MOATE -> Hussain Moate USD; contract create from 2026-08-01; worked 2026-08-01 to 2026-09-10
+  NEW  KHALDON ALOR -> Khaldon Alor USD; contract create from 2026-05-02; worked 2026-05-02 to 2026-08-03
+  LIVE MOHAMAD AL SAGHER -> Mohammad Alsagheer (#8) USD; contract move_start from 2026-02-25; worked 2026-02-25 to 2026-09-30
+  NEW  MOHAMAD ALQABOUNI -> Mohamad Alqabouni USD; contract create from 2026-09-10; worked 2026-09-10 to 2026-09-14
+  NEW  MOHAMAD QETAZ -> Mohamad Qetaz USD; contract create from 2026-05-10; worked 2026-05-10 to 2026-05-15
+
+Machines:
+  NEW  ABD AL MONEM AL NOAIMI|GRADER1 -> to create Grader #1; worked 2026-03-16 to 2026-04-26 -> Inactive at the end
+  NEW  ABD AL MONEM AL NOAIMI|ROLLER1 -> to create Roller #1; worked 2026-03-16 to 2026-04-26 -> Inactive at the end
+  NEW  ABD ALLA MUBARK|BOBCAT1 -> to create Bobcat #1; worked 2026-07-29 to 2026-08-04 -> Inactive at the end
+  NEW  ABD ALLA MUBARK|BOBCAT2 -> to create Bobcat #2; worked 2026-07-05 to 2026-08-02 -> Inactive at the end
+  NEW  ABO FAHED AKEL|BOBCAT1 -> to create Bobcat #1; worked 2026-07-06 to 2026-07-08 -> Inactive at the end
+  NEW  ABO FAHED AKEL|SMALL LOADER1 -> to create Small Loader #1; worked 2026-08-31 to 2026-08-31 -> Inactive at the end
+  LIVE ABO FAHED AKEL|TELEHANDLER1 -> EQ-0015 Telehandler #1; worked 2026-05-20 to 2026-09-30
+  LIVE ABO OMRAN FAYEZ MOUSA|GRADER1 -> EQ-0014 Grader #1; worked 2026-04-01 to 2026-09-08
+  NEW  ABO OMRAN FAYEZ MOUSA|GRADER2 -> to create Grader #2; worked 2026-04-25 to 2026-06-17 -> Inactive at the end
+  LIVE ABO OMRAN FAYEZ MOUSA|ROLLER1 -> EQ-0013 Roller #1; worked 2026-04-19 to 2026-08-08
+  NEW  AHMAD ABBAS|BOBCAT1 -> to create Bobcat #1; worked 2026-07-18 to 2026-07-30 -> Inactive at the end
+  LIVE AHMAD HAMSHARI|BOBCAT1 -> EQ-0010 Bobcat #1; worked 2026-09-22 to 2026-09-30
+  LIVE AHMAD HAMSHARI|BOBCAT2 -> EQ-0011 Bobcat #2; worked 2026-09-30 to 2026-09-30
+  NEW  AHMAD KHALAF|BOBCAT1 -> to create Bobcat #1; worked 2026-04-27 to 2026-06-18 -> Inactive at the end
+  NEW  AHMAD QUIEDER|BOBCAT1 -> to create Bobcat #1; worked 2026-08-05 to 2026-09-10 -> Inactive at the end
+  NEW  AL ASDEQAA COMPANY|SMALL ROLLER1 -> to create Small Roller #1; worked 2026-05-12 to 2026-09-02 -> Inactive at the end
+  LIVE AL DEEB|BOBCAT1 -> EQ-0002 Bobcat #1; worked 2026-05-04 to 2026-09-30
+  NEW  AL DEEB|BOBCAT2 -> to create Bobcat #2; worked 2026-05-04 to 2026-09-30 -> Inactive at the end
+  NEW  AL DEEB|GRADER1 -> to create Grader #1; worked 2026-06-15 to 2026-06-17 -> Inactive at the end
+  LIVE AL DEEB|MOBILE CRANE1 -> EQ-0004 Mobile Crane #1; worked 2026-06-08 to 2026-09-30
+  LIVE AL DEEB|ROLLER1 -> EQ-0003 Roller #1; worked 2026-04-28 to 2026-09-30
+  NEW  AL DEEB|SMALL ROLLER1 -> to create Small Roller #1; worked 2026-06-01 to 2026-06-23 -> Inactive at the end
+  LIVE AL DEEB|WHEEL LOADER1 -> EQ-0001 Wheel Loader #1; worked 2026-04-28 to 2026-09-30
+  NEW  AL HAWARI COMPANY|MOBILE CRANE1 -> to create Mobile Crane #1; worked 2026-06-08 to 2026-06-08 -> Inactive at the end
+  LIVE AL SHAHEM COMPANY|EXCAVETOR1 -> EQ-0008 Excavator #1; worked 2026-04-25 to 2026-09-30
+  LIVE AL SHAHEM COMPANY|GCB1 -> EQ-0006 GCB #1; worked 2026-03-17 to 2026-09-30
+  LIVE AL SHAHEM COMPANY|GCB2 -> EQ-0009 GCB #2; worked 2026-04-01 to 2026-09-30
+  LIVE AL SHAHEM COMPANY|MINI EXCAVETOR1 -> EQ-0007 Mini Excavator #1; worked 2026-03-24 to 2026-09-28
+  NEW  AL SHAHEM COMPANY|MINI EXCAVETOR2 -> to create Mini Excavator #2; worked 2026-07-16 to 2026-07-30 -> Inactive at the end
+  LIVE AL SHAHEM COMPANY|WHEEL LOADER1 -> EQ-0005 Wheel Loader #1; worked 2026-03-16 to 2026-09-30
+  NEW  AL SHAHEM COMPANY|WHEEL LOADER2 -> to create Wheel Loader #2; worked 2026-05-15 to 2026-05-31 -> Inactive at the end
+  NEW  ANAS DARWISH|BOBCAT1 -> to create Bobcat #1; worked 2026-04-01 to 2026-09-17 -> Inactive at the end
+  NEW  ANAS DARWISH|BOBCAT2 -> to create Bobcat #2; worked 2026-04-06 to 2026-06-16 -> Inactive at the end
+  NEW  ANAS DARWISH|DUMPER1 -> to create Dumper #1; worked 2026-08-19 to 2026-08-20 -> Inactive at the end
+  NEW  ANAS DARWISH|EXCAVETOR1 -> to create Excavator #1; worked 2026-04-22 to 2026-06-16 -> Inactive at the end
+  NEW  ANAS DARWISH|MINI EXCAVETOR1 -> to create Mini Excavator #1; worked 2026-05-16 to 2026-08-22 -> Inactive at the end
+  NEW  ANAS DARWISH|WHEEL LOADER1 -> to create Wheel Loader #1; worked 2026-04-01 to 2026-06-18 -> Inactive at the end
+  LIVE BILAL ABD AL NABEE|WATER TANKER1 -> EQ-0012 Water Tanker #1; worked 2026-09-01 to 2026-09-30
+  NEW  BILAL QUIEDER|BOBCAT1 -> to create Bobcat #1; worked 2026-07-11 to 2026-07-19 -> Inactive at the end
+  NEW  HUSSAIN MOATE|BOBCAT1 -> to create Bobcat #1; worked 2026-08-01 to 2026-09-10 -> Inactive at the end
+  NEW  KHALDON ALOR|PICK UP1 -> to create Pick-up #1; worked 2026-05-02 to 2026-08-03 -> Inactive at the end
+  LIVE MOHAMAD AL SAGHER|PICK UP1 -> EQ-0016 Pick-up #1; worked 2026-02-25 to 2026-09-30
+  NEW  MOHAMAD ALQABOUNI|SMALL ROLLER1 -> to create Small Roller #1; worked 2026-09-10 to 2026-09-14 -> Inactive at the end
+  NEW  MOHAMAD QETAZ|GCB1 -> to create GCB #1; worked 2026-05-10 to 2026-05-15 -> Inactive at the end
+
+Rate cards: 86, deployments: 66, attendance rows: 2226 (long sessions to acknowledge: 1), invoices: 65
+
+Rounding adjustments predicted (73 of 148 invoice items):
+  2026-04|AL SHAHEM COMPANY|WHEEL LOADER1|T2|0: system 12209.00 accountant 12208.80 -> adjustment -0.20 USD
+  2026-04|ANAS DARWISH|BOBCAT1|T2|0: system 569.18 accountant 568.92 -> adjustment -0.26 USD
+  2026-04|ANAS DARWISH|BOBCAT2|BRIDGES|0: system 1308.32 accountant 1307.64 -> adjustment -0.68 USD
+  2026-04|ABO OMRAN FAYEZ MOUSA|GRADER2|T2|0: system 82250.00 accountant 82215.00 -> adjustment -35.00 SYP
+  2026-04|AL SHAHEM COMPANY|EXCAVETOR1|T2|0: system 975.12 accountant 975.00 -> adjustment -0.12 USD
+  2026-04|AHMAD KHALAF|BOBCAT1|T2|0: system 347.92 accountant 347.77 -> adjustment -0.15 USD
+  2026-05|AHMAD KHALAF|BOBCAT1|T2|0: system 2277.54 accountant 2276.35 -> adjustment -1.19 USD
+  2026-05|AL SHAHEM COMPANY|GCB1|T2|0: system 5328.31 accountant 5328.25 -> adjustment -0.06 USD
+  2026-05|AL SHAHEM COMPANY|MINI EXCAVETOR1|T2|1: system 3645.69 accountant 3645.62 -> adjustment -0.07 USD
+  2026-05|KHALDON ALOR|PICK UP1|BRIDGES|0: system 1674.85 accountant 1675.49 -> adjustment 0.64 USD
+  2026-05|AL SHAHEM COMPANY|EXCAVETOR1|T2|0: system 8877.66 accountant 8876.56 -> adjustment -1.10 USD
+  2026-05|ANAS DARWISH|BOBCAT1|T2|1: system 1401.17 accountant 1400.44 -> adjustment -0.73 USD
+  2026-05|AL DEEB|BOBCAT1|T2|0: system 1709.33 accountant 1708.44 -> adjustment -0.89 USD
+  2026-05|AL DEEB|BOBCAT2|T2|0: system 1324.13 accountant 1323.44 -> adjustment -0.69 USD
+  2026-05|MOHAMAD QETAZ|GCB1|BRIDGES|0: system 204.72 accountant 204.66 -> adjustment -0.06 USD
+  2026-06|AHMAD KHALAF|BOBCAT1|T2|1: system 1601.63 accountant 1600.83 -> adjustment -0.80 USD
+  2026-06|AL DEEB|BOBCAT1|T2|0: system 3305.50 accountant 3303.78 -> adjustment -1.72 USD
+  2026-06|AL DEEB|BOBCAT2|T2|0: system 2270.27 accountant 2269.09 -> adjustment -1.18 USD
+  2026-06|AL SHAHEM COMPANY|EXCAVETOR1|T2|0: system 6196.08 accountant 6195.31 -> adjustment -0.77 USD
+  2026-06|ANAS DARWISH|BOBCAT1|T2|1: system 1584.14 accountant 1583.31 -> adjustment -0.83 USD
+  2026-06|ANAS DARWISH|MINI EXCAVETOR1|T2|1: system 2911.59 accountant 2911.06 -> adjustment -0.53 USD
+  2026-06|KHALDON ALOR|PICK UP1|BRIDGES|1: system 1670.77 accountant 1671.38 -> adjustment 0.61 USD
+  2026-06|ANAS DARWISH|EXCAVETOR1|T2|1: system 2424.26 accountant 2424.09 -> adjustment -0.17 USD
+  2026-06|ANAS DARWISH|BOBCAT2|BRIDGES|1: system 339.46 accountant 339.28 -> adjustment -0.18 USD
+  2026-06|AL HAWARI COMPANY|MOBILE CRANE1|T2|0: system 299.97 accountant 300.00 -> adjustment 0.03 USD
+  2026-07|AL ASDEQAA COMPANY|SMALL ROLLER1|T2|0: system 2220.70 accountant 2220.69 -> adjustment -0.01 USD
+  2026-07|AL DEEB|BOBCAT1|T2|0: system 4190.66 accountant 4188.51 -> adjustment -2.15 USD
+  2026-07|AL DEEB|ROLLER1|T2|0: system 6491.67 accountant 6491.75 -> adjustment 0.08 USD
+  2026-07|AL SHAHEM COMPANY|WHEEL LOADER1|T2|1: system 8997.08 accountant 8996.90 -> adjustment -0.18 USD
+  2026-07|ANAS DARWISH|BOBCAT1|T2|1: system 1758.92 accountant 1758.01 -> adjustment -0.91 USD
+  2026-07|KHALDON ALOR|PICK UP1|BRIDGES|2: system 1699.36 accountant 1700.00 -> adjustment 0.64 USD
+  2026-07|ABD ALLA MUBARK|BOBCAT2|T2|0: system 500.24 accountant 499.98 -> adjustment -0.26 USD
+  2026-07|ABO FAHED AKEL|BOBCAT1|T2|0: system 240.50 accountant 240.38 -> adjustment -0.12 USD
+  2026-07|AL DEEB|BOBCAT2|T2|0: system 240.75 accountant 240.63 -> adjustment -0.12 USD
+  2026-07|AL DEEB|MOBILE CRANE1|T2|0: system 5220.83 accountant 5220.69 -> adjustment -0.14 USD
+  2026-07|BILAL QUIEDER|BOBCAT1|T2|0: system 548.34 accountant 548.05 -> adjustment -0.29 USD
+  2026-07|AHMAD ABBAS|BOBCAT1|T2|0: system 711.88 accountant 711.51 -> adjustment -0.37 USD
+  2026-07|ABD ALLA MUBARK|BOBCAT1|T2|0: system 91.39 accountant 91.34 -> adjustment -0.05 USD
+  2026-08|ABD ALLA MUBARK|BOBCAT2|T2|1: system 98.77 accountant 98.80 -> adjustment 0.03 USD
+  2026-08|ABO OMRAN FAYEZ MOUSA|GRADER1|T2|1: system 740687.50 accountant 740670.00 -> adjustment -17.50 SYP
+  2026-08|AL ASDEQAA COMPANY|SMALL ROLLER1|T2|1: system 3100.57 accountant 3100.53 -> adjustment -0.04 USD
+  2026-08|AL SHAHEM COMPANY|GCB1|T2|1: system 3323.78 accountant 3323.84 -> adjustment 0.06 USD
+  2026-08|AL SHAHEM COMPANY|MINI EXCAVETOR1|T2|4: system 3105.36 accountant 3105.42 -> adjustment 0.06 USD
+  2026-08|AL SHAHEM COMPANY|WHEEL LOADER1|T2|1: system 10948.67 accountant 10948.30 -> adjustment -0.37 USD
+  2026-08|ANAS DARWISH|MINI EXCAVETOR1|T2|3: system 2554.20 accountant 2554.25 -> adjustment 0.05 USD
+  2026-08|HUSSAIN MOATE|BOBCAT1|T2|0: system 1817.12 accountant 1817.09 -> adjustment -0.03 USD
+  2026-08|MOHAMAD AL SAGHER|PICK UP1|BRIDGES|1: system 1300.32 accountant 1300.00 -> adjustment -0.32 USD
+  2026-08|ABO OMRAN FAYEZ MOUSA|ROLLER1|T2|0: system 127458.33 accountant 127448.75 -> adjustment -9.58 SYP
+  2026-08|ANAS DARWISH|BOBCAT1|T2|2: system 1761.41 accountant 1761.44 -> adjustment 0.03 USD
+  2026-08|AHMAD QUIEDER|BOBCAT1|T2|0: system 1691.96 accountant 1691.99 -> adjustment 0.03 USD
+  2026-08|AL DEEB|BOBCAT1|T2|1: system 2038.59 accountant 2038.50 -> adjustment -0.09 USD
+  2026-08|AL DEEB|ROLLER1|T2|0: system 5432.08 accountant 5432.25 -> adjustment 0.17 USD
+  2026-08|AL DEEB|WHEEL LOADER1|T2|0: system 10783.67 accountant 10783.30 -> adjustment -0.37 USD
+  2026-08|AL DEEB|MOBILE CRANE1|T2|0: system 5450.52 accountant 5450.81 -> adjustment 0.29 USD
+  2026-08|ANAS DARWISH|DUMPER1|T2|0: system 412.56 accountant 412.50 -> adjustment -0.06 USD
+  2026-09|AL ASDEQAA COMPANY|SMALL ROLLER1|T2|2: system 288.48 accountant 288.46 -> adjustment -0.02 USD
+  2026-09|AL DEEB|BOBCAT1|T2|2: system 968.89 accountant 968.33 -> adjustment -0.56 USD
+  2026-09|AL DEEB|BOBCAT2|T2|2: system 828.28 accountant 827.85 -> adjustment -0.43 USD
+  2026-09|AL DEEB|MOBILE CRANE1|T2|0: system 1600.52 accountant 1600.38 -> adjustment -0.14 USD
+  2026-09|AL DEEB|ROLLER1|T2|0: system 2145.83 accountant 2145.75 -> adjustment -0.08 USD
+  2026-09|AL DEEB|WHEEL LOADER1|T2|0: system 4938.08 accountant 4937.90 -> adjustment -0.18 USD
+  2026-09|AL SHAHEM COMPANY|GCB1|T2|2: system 4533.47 accountant 4533.65 -> adjustment 0.18 USD
+  2026-09|ANAS DARWISH|BOBCAT1|T2|3: system 993.91 accountant 993.46 -> adjustment -0.45 USD
+  2026-09|HUSSAIN MOATE|BOBCAT1|T2|1: system 573.19 accountant 572.96 -> adjustment -0.23 USD
+  2026-09|AHMAD QUIEDER|BOBCAT1|T2|1: system 406.45 accountant 406.23 -> adjustment -0.22 USD
+  2026-09|AL SHAHEM COMPANY|MINI EXCAVETOR1|T2|5: system 3226.79 accountant 3226.92 -> adjustment 0.13 USD
+  2026-09|MOHAMAD ALQABOUNI|SMALL ROLLER1|T2|0: system 166.28 accountant 166.23 -> adjustment -0.05 USD
+  2026-09|AL DEEB|BOBCAT2|T2|3: system 1517.97 accountant 1518.01 -> adjustment 0.04 USD
+  2026-09|AL DEEB|MOBILE CRANE1|T2|1: system 6602.29 accountant 6601.31 -> adjustment -0.98 USD
+  2026-09|AHMAD HAMSHARI|BOBCAT1|T2|0: system 804.34 accountant 804.33 -> adjustment -0.01 USD
+  2026-09|AL SHAHEM COMPANY|EXCAVETOR1|T2|0: system 1218.90 accountant 1218.75 -> adjustment -0.15 USD
+  2026-09|AL SHAHEM COMPANY|GCB2|T2|2: system 576.90 accountant 576.92 -> adjustment 0.02 USD
+  2026-09|AHMAD HAMSHARI|BOBCAT2|T2|0: system 90.15 accountant 90.14 -> adjustment -0.01 USD
+
+Accountant rates kept with 2 decimals by the system:
+  ABD ALLA MUBARK|BOBCAT1 from 2026-07-29: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  ABD ALLA MUBARK|BOBCAT2 from 2026-07-05: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  ABO FAHED AKEL|BOBCAT1 from 2026-07-06: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  AHMAD ABBAS|BOBCAT1 from 2026-07-18: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  AHMAD HAMSHARI|BOBCAT1 from 2026-09-22: accountant rate 12.01923076923077 -> system 12.02 (difference settled by an adjustment line).
+  AHMAD HAMSHARI|BOBCAT2 from 2026-09-30: accountant rate 12.01923076923077 -> system 12.02 (difference settled by an adjustment line).
+  AHMAD KHALAF|BOBCAT1 from 2026-04-27: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  AHMAD KHALAF|BOBCAT1 from 2026-06-01: accountant rate 9.625 -> system 9.63 (difference settled by an adjustment line).
+  AHMAD QUIEDER|BOBCAT1 from 2026-09-02: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  AL ASDEQAA COMPANY|SMALL ROLLER1 from 2026-09-01: accountant rate 12.01923076923077 -> system 12.02 (difference settled by an adjustment line).
+  AL DEEB|BOBCAT1 from 2026-05-04: accountant rate 9.625 -> system 9.63 (difference settled by an adjustment line).
+  AL DEEB|BOBCAT1 from 2026-09-01: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  AL DEEB|BOBCAT2 from 2026-05-04: accountant rate 9.625 -> system 9.63 (difference settled by an adjustment line).
+  AL DEEB|BOBCAT2 from 2026-09-01: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  AL DEEB|MOBILE CRANE1 from 2026-09-14: accountant rate 53.125 -> system 53.13 (difference settled by an adjustment line).
+  AL HAWARI COMPANY|MOBILE CRANE1 from 2026-06-08: accountant rate 33.333333333333336 -> system 33.33 (difference settled by an adjustment line).
+  AL SHAHEM COMPANY|EXCAVETOR1 from 2026-04-25: accountant rate 40.625 -> system 40.63 (difference settled by an adjustment line).
+  AL SHAHEM COMPANY|GCB1 from 2026-09-01: accountant rate 19.23076923076923 -> system 19.23 (difference settled by an adjustment line).
+  AL SHAHEM COMPANY|GCB2 from 2026-09-28: accountant rate 19.23076923076923 -> system 19.23 (difference settled by an adjustment line).
+  AL SHAHEM COMPANY|MINI EXCAVETOR1 from 2026-09-03: accountant rate 19.23076923076923 -> system 19.23 (difference settled by an adjustment line).
+  ANAS DARWISH|BOBCAT1 from 2026-04-01: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  ANAS DARWISH|BOBCAT1 from 2026-05-03: accountant rate 9.625 -> system 9.63 (difference settled by an adjustment line).
+  ANAS DARWISH|BOBCAT1 from 2026-09-01: accountant rate 9.615384615384615 -> system 9.62 (difference settled by an adjustment line).
+  ANAS DARWISH|BOBCAT2 from 2026-04-06: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  ANAS DARWISH|BOBCAT2 from 2026-06-07: accountant rate 9.625 -> system 9.63 (difference settled by an adjustment line).
+  ANAS DARWISH|DUMPER1 from 2026-08-19: accountant rate 34.375 -> system 34.38 (difference settled by an adjustment line).
+  ANAS DARWISH|EXCAVETOR1 from 2026-06-02: accountant rate 40.625 -> system 40.63 (difference settled by an adjustment line).
+  ANAS DARWISH|MINI EXCAVETOR1 from 2026-06-01: accountant rate 16.826923076923077 -> system 16.83 (difference settled by an adjustment line).
+  BILAL QUIEDER|BOBCAT1 from 2026-07-11: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  HUSSAIN MOATE|BOBCAT1 from 2026-09-01: accountant rate 9.615 -> system 9.62 (difference settled by an adjustment line).
+  KHALDON ALOR|PICK UP1 from 2026-05-02: accountant rate 8.1731 -> system 8.17 (difference settled by an adjustment line).
+  KHALDON ALOR|PICK UP1 from 2026-06-01: accountant rate 8.173 -> system 8.17 (difference settled by an adjustment line).
+  KHALDON ALOR|PICK UP1 from 2026-07-01: accountant rate 8.1731 -> system 8.17 (difference settled by an adjustment line).
+  MOHAMAD AL SAGHER|PICK UP1 from 2026-08-01: accountant rate 6.018518518518518 -> system 6.02 (difference settled by an adjustment line).
+  MOHAMAD ALQABOUNI|SMALL ROLLER1 from 2026-09-10: accountant rate 12.01923076923077 -> system 12.02 (difference settled by an adjustment line).
