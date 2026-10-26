@@ -49,6 +49,23 @@ test('hours report: invoiced + not invoiced, OT split, totals per vendor', async
   assert.ok(ld.not_invoiced_hours > 0 && ld.invoiced_hours === 0);
   for (const g of d.vendors) assert.strictEqual(g.totals.total_hours, Math.round(g.machines.reduce((a, m) => a + m.total_hours, 0) * 100) / 100);
   assert.deepStrictEqual(d.errors, []);
+  // amounts: invoiced net = the invoices, not invoiced = the provisional calculation, parts add up, totals per currency
+  const net = await h.query('SELECT i.equipment_id, b.currency, SUM(i.net_amount) n FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id GROUP BY i.equipment_id, b.currency');
+  const PS = require('../services/equipment/eqPayrollService');
+  const { pool } = require('../config/db');
+  const { items: pend } = await PS.calculate(pool, { start_date: '2026-01-01', end_date: '2026-11-20' });
+  for (const m of all) {
+    for (const x of m.money) {
+      const inv = net.filter((r) => r.equipment_id === m.equipment_id && r.currency === x.currency).reduce((a, r) => a + Number(r.n), 0);
+      const p = pend.filter((i) => i.equipment_id === m.equipment_id && i.currency === x.currency).reduce((a, i) => a + i.net_cents, 0) / 100;
+      assert.strictEqual(x.invoiced_net, inv, `invoiced ${m.equipment_code}`);
+      assert.strictEqual(x.not_invoiced_net, p, `not invoiced ${m.equipment_code}`);
+      assert.strictEqual(Math.round((x.regular + x.overtime + x.other) * 100), Math.round(x.total * 100));
+      assert.strictEqual(Math.round((x.invoiced_net + x.not_invoiced_net) * 100), Math.round(x.total * 100));
+    }
+  }
+  assert.ok(exc.money[0].overtime > 0 && exc.money[0].regular > 0);
+  for (const g of d.vendors) for (const t of g.money) assert.strictEqual(Math.round(t.total * 100), Math.round(g.machines.flatMap((m) => m.money).filter((x) => x.currency === t.currency).reduce((a, x) => a + x.total, 0) * 100));
   // vendor filter
   const v = await ok(h.api().get('/api/equipment/reports/hours').query({ vendor_id: F.vendor.vendor_id }).set(ACC()));
   assert.ok(v.vendors.every((g) => g.vendor_id === F.vendor.vendor_id));
