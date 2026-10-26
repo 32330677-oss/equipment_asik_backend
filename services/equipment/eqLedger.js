@@ -53,7 +53,7 @@ async function vendorMovements(conn, vendorId) {
   const out = [];
   // vendor invoices of finalized batches
   const [inv] = await conn.query(
-    `SELECT b.eq_batch_id, b.start_date, b.end_date, b.currency, b.finalized_at, b.status, b.version_number, SUM(i.net_amount) AS net, COUNT(*) AS items
+    `SELECT b.eq_batch_id, b.start_date, b.end_date, b.currency, b.finalized_at, b.status, b.version_number, SUM(i.net_amount) AS net, COUNT(DISTINCT i.equipment_id) AS items
      FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
      WHERE i.vendor_id = ? AND ${ACTIVE} AND b.is_finalized = 1
      GROUP BY b.eq_batch_id, b.start_date, b.end_date, b.currency, b.finalized_at, b.status, b.version_number`, [vendorId]);
