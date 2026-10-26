@@ -125,6 +125,7 @@ function infoGrid(doc, cells, y, cols = 4) {
 
 /**
  * Table with repeating header. columns: [{ key, en, ar, width, align }], rows: array of objects or { _blank, _style }.
+ * A row with _keep = n starts a group of n rows kept on one page when the group fits on a page.
  * Returns y after the table. onNewPage(doc) must redraw the page header and return the y to continue at.
  */
 function table(doc, { columns, rows, y, rowHeight = 18, headHeight = 24, onNewPage, bottom, zebra = true, fontSize = 7.5 }) {
@@ -143,7 +144,10 @@ function table(doc, { columns, rows, y, rowHeight = 18, headHeight = 24, onNewPa
   let yy = drawHead(y);
   rows.forEach((r, i) => {
     const h = r._height || rowHeight;
-    if (yy + h > limit()) {
+    // r._keep = n: this row and the n - 1 next ones stay on one page (a group: vendor + its machines + its total)
+    const keepH = r._keep > 1 ? rows.slice(i, i + r._keep).reduce((s, x) => s + (x._height || rowHeight), 0) : h;
+    const fitsOnePage = keepH <= limit() - doc.page.margins.top - headHeight - 4;
+    if (yy + h > limit() || (fitsOnePage && yy + keepH > limit())) {
       doc.addPage();
       yy = drawHead(onNewPage ? onNewPage(doc) : doc.page.margins.top);
     }

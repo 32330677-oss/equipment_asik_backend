@@ -8,6 +8,7 @@
 // Amounts (per currency, never added across currencies): regular, overtime, other additions and deductions (everything
 // else: standby, top-up, deductions, fuel, adjustments, fuel difference...), net invoiced, net not invoiced yet, total.
 // Debit / credit notes are not in these amounts (see the vendor statement).
+// view=invoiced (26 Oct 2026): only what is invoiced, one line per machine with hours AND amounts (invoicedReport).
 'use strict';
 
 const ExcelJS = require('exceljs');
@@ -305,4 +306,222 @@ async function hoursReportXlsx(data) {
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
-module.exports = { hoursReport, hoursReportPdf, hoursReportXlsx };
+// ============================================================================ invoiced, all in one line (26 Oct 2026)
+// Everything INVOICED since the start (active invoices: issued, handed over, withdrawn, and drafts), ONE line per
+// machine and currency: invoices, invoiced period, worked days, hours (regular / OT / total), amounts (regular, OT,
+// additions, deductions, net). Vendors one under the other with their total; a grand total per currency.
+// Additions = every other positive line (standby, top-up, positive adjustments, fuel difference...);
+// deductions = every other negative line (absence / missing hours / breakdown, fuel, negative adjustments...).
+
+async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteId = null, equipment_id: equipmentId = null } = {}) {
+  const today = businessToday();
+  const w = []; const p = [];
+  if (vendorId) { w.push('i.vendor_id = ?'); p.push(vendorId); }
+  if (siteId) { w.push('i.site_id = ?'); p.push(siteId); }
+  if (equipmentId) { w.push('i.equipment_id = ?'); p.push(equipmentId); }
+  const [items] = await conn.query(
+    `SELECT i.eq_item_id, i.eq_batch_id, i.net_amount, b.currency, b.is_finalized, i.equipment_id, i.vendor_id, i.billing_mode, i.worked_days,
+       i.work_hours, i.overtime_hours, b.start_date, b.end_date,
+       (SELECT MIN(ps.record_date) FROM eq_payroll_attendance_snapshot ps WHERE ps.eq_item_id = i.eq_item_id) AS r_from,
+       (SELECT MAX(ps.record_date) FROM eq_payroll_attendance_snapshot ps WHERE ps.eq_item_id = i.eq_item_id) AS r_to,
+       (SELECT MIN(md.day) FROM eq_payroll_monthly_days md WHERE md.eq_item_id = i.eq_item_id) AS m_from,
+       (SELECT MAX(md.day) FROM eq_payroll_monthly_days md WHERE md.eq_item_id = i.eq_item_id) AS m_to
+     FROM eq_payroll_items i JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
+     WHERE ${PS.ACTIVE_BATCH}${w.length ? ` AND ${w.join(' AND ')}` : ''}`, p);
+  const linesOf = new Map();
+  if (items.length) {
+    const [ls] = await conn.query('SELECT eq_item_id, line_type, amount FROM eq_payroll_lines WHERE eq_item_id IN (?)', [items.map((i) => i.eq_item_id)]);
+    for (const l of ls) { if (!linesOf.has(l.eq_item_id)) linesOf.set(l.eq_item_id, []); linesOf.get(l.eq_item_id).push(l); }
+  }
+  const key = (it) => `${it.equipment_id}|${it.currency || '-'}`;
+  const rows = new Map();
+  const batches = { all: new Set(), drafts: new Set() };
+  let first = null; let last = null;
+  for (const it of items) {
+    const k = key(it);
+    if (!rows.has(k)) {
+      rows.set(k, { equipment_id: it.equipment_id, vendor_id: it.vendor_id, currency: it.currency || '-', modes: new Set(), batches: new Set(),
+        first: null, last: null, worked_days: 0, reg_h: 0, ot_h: 0, reg: 0, ot: 0, add: 0, ded: 0, net: 0 });
+    }
+    const r = rows.get(k);
+    r.batches.add(it.eq_batch_id);
+    batches.all.add(it.eq_batch_id);
+    if (!Number(it.is_finalized)) batches.drafts.add(it.eq_batch_id);
+    if (it.billing_mode) r.modes.add(it.billing_mode);
+    const ot = Math.max(0, n(it.overtime_hours));
+    r.worked_days += n(it.worked_days);
+    r.reg_h += Math.max(0, n(it.work_hours) - ot);
+    r.ot_h += ot;
+    let reg = 0; let otc = 0; let add = 0; let ded = 0;
+    for (const l of linesOf.get(it.eq_item_id) || []) {
+      const a = c(l.amount);
+      if (F.REGULAR_LINES.includes(l.line_type)) reg += a;
+      else if (l.line_type === 'Overtime') otc += a;
+      else if (a > 0) add += a;
+      else ded += a;
+    }
+    const net = c(it.net_amount);
+    ded += net - reg - otc - add - ded; // the stored net always wins: any rounding left goes with the deductions
+    r.reg += reg; r.ot += otc; r.add += add; r.ded += ded; r.net += net;
+    const days = [day(it.r_from), day(it.r_to), day(it.m_from), day(it.m_to)].filter(Boolean);
+    const span = days.length ? days : [day(it.start_date), day(it.end_date)];
+    for (const d of span) {
+      if (!r.first || d < r.first) r.first = d; if (!r.last || d > r.last) r.last = d;
+      if (!first || d < first) first = d; if (!last || d > last) last = d;
+    }
+  }
+  const ids = [...new Set([...rows.values()].map((r) => r.equipment_id))];
+  const empty = { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, first_day: null, last_day: null,
+    invoices: 0, draft_invoices: 0, vendors: [], totals: { machines: 0, worked_days: 0, regular_hours: 0, overtime_hours: 0, total_hours: 0 }, money: [] };
+  if (!ids.length) return empty;
+  const [machines] = await conn.query(
+    `SELECT e.equipment_id, e.equipment_code, e.machine_label, e.plate_number, e.vendor_id, t.type_name FROM eq_equipment e
+     JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)`, [ids]);
+  const info = new Map(machines.map((x) => [x.equipment_id, x]));
+  const vids = [...new Set([...rows.values()].map((r) => r.vendor_id || (info.get(r.equipment_id) || {}).vendor_id).filter(Boolean))];
+  const [vendors] = vids.length ? await conn.query('SELECT vendor_id, vendor_code, vendor_name FROM eq_vendors WHERE vendor_id IN (?)', [vids]) : [[]];
+  const vInfo = new Map(vendors.map((x) => [x.vendor_id, x]));
+  const out = (r) => {
+    const mi = info.get(r.equipment_id) || {};
+    return {
+      equipment_id: r.equipment_id, equipment_code: mi.equipment_code || `#${r.equipment_id}`, machine_label: mi.machine_label || null, type_name: mi.type_name || null,
+      plate_number: mi.plate_number || null, currency: r.currency, billing_modes: [...r.modes].sort().join(', '), invoices: r.batches.size,
+      first_day: r.first, last_day: r.last, worked_days: r.worked_days, regular_hours: r2(r.reg_h), overtime_hours: r2(r.ot_h), total_hours: r2(r.reg_h + r.ot_h),
+      regular: r.reg / 100, overtime: r.ot / 100, additions: r.add / 100, deductions: r.ded / 100, net: r.net / 100,
+    };
+  };
+  const totalsOf = (list) => {
+    const t = { machines: new Set(list.map((m) => m.equipment_id)).size, worked_days: 0, regular_hours: 0, overtime_hours: 0, total_hours: 0 };
+    for (const m of list) { t.worked_days += m.worked_days; t.regular_hours += m.regular_hours; t.overtime_hours += m.overtime_hours; t.total_hours += m.total_hours; }
+    for (const k of ['regular_hours', 'overtime_hours', 'total_hours']) t[k] = r2(t[k]);
+    return t;
+  };
+  const moneyOf = (list) => {
+    const by = new Map();
+    for (const m of list) {
+      if (!by.has(m.currency)) by.set(m.currency, { currency: m.currency, machines: new Set(), worked_days: 0, regular_hours: 0, overtime_hours: 0, regular: 0, overtime: 0, additions: 0, deductions: 0, net: 0 });
+      const t = by.get(m.currency);
+      t.machines.add(m.equipment_id); t.worked_days += m.worked_days; t.regular_hours += m.regular_hours; t.overtime_hours += m.overtime_hours;
+      for (const k of ['regular', 'overtime', 'additions', 'deductions', 'net']) t[k] += c(m[k]);
+    }
+    return [...by.values()].sort((a, b) => a.currency.localeCompare(b.currency)).map((t) => ({
+      currency: t.currency, machines: t.machines.size, worked_days: t.worked_days, regular_hours: r2(t.regular_hours), overtime_hours: r2(t.overtime_hours),
+      total_hours: r2(t.regular_hours + t.overtime_hours), regular: t.regular / 100, overtime: t.overtime / 100, additions: t.additions / 100, deductions: t.deductions / 100, net: t.net / 100,
+    }));
+  };
+  const groups = new Map();
+  for (const r of rows.values()) {
+    const vid = r.vendor_id || (info.get(r.equipment_id) || {}).vendor_id;
+    if (!groups.has(vid)) { const vi = vInfo.get(vid) || {}; groups.set(vid, { vendor_id: vid, vendor_code: vi.vendor_code || '', vendor_name: vi.vendor_name || `Vendor #${vid}`, machines: [] }); }
+    groups.get(vid).machines.push(out(r));
+  }
+  const list = [...groups.values()].sort((a, b) => a.vendor_name.localeCompare(b.vendor_name));
+  for (const g of list) {
+    g.machines.sort((a, b) => a.equipment_code.localeCompare(b.equipment_code) || a.currency.localeCompare(b.currency));
+    g.totals = totalsOf(g.machines); g.money = moneyOf(g.machines);
+  }
+  const all = list.flatMap((g) => g.machines);
+  return { ...empty, first_day: first, last_day: last, invoices: batches.all.size, draft_invoices: batches.drafts.size, vendors: list, totals: totalsOf(all), money: moneyOf(all) };
+}
+
+async function invoicedReportPdf(data, { siteLabel } = {}) {
+  const company = await settings.getString('company_name');
+  const doc = P.createDoc({ layout: 'landscape', info: { Title: 'Equipment invoiced since the start' } });
+  const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
+  const one = data.equipment_id && data.vendors.length === 1 && data.vendors[0].machines.length === 1 ? data.vendors[0].machines[0] : null;
+  const scope = [one ? `${machineName(one)} - ${data.vendors[0].vendor_name}` : data.vendors.length === 1 && data.vendor_id ? data.vendors[0].vendor_name : 'All vendors', siteLabel || 'All sites'].join(' | ');
+  const period = data.first_day ? `${fmt.date(data.first_day)} - ${fmt.date(data.last_day)}` : '-';
+  let y = P.header(doc, {
+    title: 'EQUIPMENT INVOICED SINCE THE START', titleAr: 'كشف فوترة الآليات منذ بداية المشروع', subtitle: company,
+    right: (xr, top) => [`Printed ${fmt.date(data.generated_on)}`, scope].forEach((t, k) => P.text(doc, t, xr - 230, top + k * 11, { size: k ? 7 : 8, bold: !k, color: k ? COLORS.ink : COLORS.navy, width: 230, align: 'right', lineBreak: false })),
+  });
+  const T = data.totals;
+  const invoices = `${data.invoices}${data.draft_invoices ? ` (${data.draft_invoices} draft)` : ''}`;
+  const nets = data.money.map((x) => `${fmt.money(c(x.net), x.currency)} ${x.currency}`).join('  +  ') || '-';
+  y = P.infoGrid(doc, [
+    { label: 'Invoiced period', labelAr: 'الفترة المفوترة', value: period },
+    { label: 'Vendors / machines', labelAr: 'الموردون / الآليات', value: `${data.vendors.length} / ${T.machines}` },
+    { label: 'Invoices', labelAr: 'الفواتير', value: invoices },
+    { label: 'Invoiced hours', labelAr: 'الساعات المفوترة', value: h(T.total_hours) },
+    { label: 'Net invoiced', labelAr: 'صافي المفوتر', value: nets },
+  ], y + 2, 5);
+
+  const mm = (v, cur) => (v ? fmt.money(c(v), cur) : '-');
+  const line = (base, x, extra = {}) => ({
+    ...base, cur: x.currency, days: String(x.worked_days), reg_h: h(x.regular_hours), ot_h: x.overtime_hours ? h(x.overtime_hours) : '-', tot_h: h(x.total_hours),
+    reg: mm(x.regular, x.currency), ot: mm(x.overtime, x.currency), add: x.additions ? `+${fmt.money(c(x.additions), x.currency)}` : '-',
+    ded: mm(x.deductions, x.currency), net: fmt.money(c(x.net), x.currency), ...extra,
+  });
+  const rows = [];
+  for (const g of data.vendors) {
+    rows.push({ m: `${g.vendor_name}${g.vendor_code ? `   ${g.vendor_code}` : ''}`, _bold: true, _fill: COLORS.band, _height: 17, _keep: 1 + g.machines.length + g.money.length });
+    let i = 0;
+    for (const r of g.machines) {
+      i += 1;
+      rows.push(line({ no: String(i), m: machineName(r), mode: r.billing_modes, period: r.first_day ? `${fmt.date(r.first_day)} - ${fmt.date(r.last_day)}` : '-', inv: String(r.invoices) }, r));
+    }
+    for (const x of g.money) rows.push(line({ m: `Total ${g.vendor_name} (${x.machines} machine${x.machines === 1 ? '' : 's'})` }, x, { _bold: true, _fill: COLORS.soft }));
+  }
+  if (data.vendors.length > 1 || data.money.length > 1) {
+    data.money.forEach((x, k) => rows.push(line({ m: `GRAND TOTAL ${x.currency} (${x.machines} machines)` }, x,
+      { _bold: true, _fill: COLORS.bandStrong, _height: 19, ...(k ? {} : { _keep: data.money.length }) })));
+  }
+  if (!rows.length) rows.push({ m: 'No invoice for this selection.' });
+  const columns = [
+    { key: 'no', en: '#', ar: '', width: 16 },
+    { key: 'm', en: 'Machine', ar: 'الآلية', width: 132, align: 'left' },
+    { key: 'mode', en: 'Billing', ar: 'الأساس', width: 44, size: 6.6 },
+    { key: 'period', en: 'Invoiced period', ar: 'الفترة المفوترة', width: 88, size: 6.8 },
+    { key: 'inv', en: 'Invoices', ar: 'فواتير', width: 30 },
+    { key: 'days', en: 'Worked days', ar: 'أيام العمل', width: 32 },
+    { key: 'reg_h', en: 'Regular h', ar: 'ساعات عادية', width: 46, align: 'right' },
+    { key: 'ot_h', en: 'OT h', ar: 'إضافي', width: 38, align: 'right' },
+    { key: 'tot_h', en: 'Total h', ar: 'إجمالي الساعات', width: 48, align: 'right', bold: true },
+    { key: 'cur', en: 'Cur.', ar: 'العملة', width: 30 },
+    { key: 'reg', en: 'Regular amount', ar: 'مبلغ العادي', width: 64, align: 'right' },
+    { key: 'ot', en: 'OT amount', ar: 'مبلغ الإضافي', width: 54, align: 'right' },
+    { key: 'add', en: 'Additions', ar: 'إضافات', width: 52, align: 'right' },
+    { key: 'ded', en: 'Deductions', ar: 'حسومات', width: 58, align: 'right', color: COLORS.red },
+    { key: 'net', en: 'Net invoiced', ar: 'الصافي المفوتر', width: W - 732, align: 'right', bold: true },
+  ];
+  const topOfPage = () => doc.page.margins.top + 4;
+  y = P.table(doc, { y: y + 2, rows, rowHeight: 15, headHeight: 32, fontSize: 7, onNewPage: topOfPage, columns });
+  const notes = [
+    'Invoiced = active invoices (issued, handed over, withdrawn) and drafts; cancelled / replaced invoices and days not invoiced yet are not counted. One line per machine and currency; currencies are never added together.',
+    'Additions: standby, minimum top-up, positive adjustments, fuel price difference. Deductions: absence / missing hours / breakdown of monthly machines, fuel issued, negative adjustments. Debit / credit notes are not included (see the vendor statement).',
+  ];
+  if (y + 26 > doc.page.height - doc.page.margins.bottom - 14) { doc.addPage(); y = doc.page.margins.top; }
+  P.text(doc, notes.join('\n'), L, y + 6, { size: 6.6, color: COLORS.muted, width: W });
+  P.footers(doc, `${company} | Equipment Flow | invoiced since the start | printed ${businessNow().slice(0, 16)}`);
+  return P.toBuffer(doc);
+}
+
+async function invoicedReportXlsx(data) {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Invoiced since start', { views: [{ state: 'frozen', ySplit: 1 }], pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
+  ws.columns = [
+    { header: 'Vendor', key: 'vendor', width: 28 }, { header: 'Machine', key: 'code', width: 11 }, { header: 'Type / machine no.', key: 'name', width: 20 },
+    { header: 'Plate', key: 'plate', width: 11 }, { header: 'Billing', key: 'mode', width: 14 }, { header: 'First day', key: 'first', width: 11 }, { header: 'Last day', key: 'last', width: 11 },
+    { header: 'Invoices', key: 'inv', width: 9 }, { header: 'Worked days', key: 'days', width: 10 }, { header: 'Regular hours', key: 'reg_h', width: 12 },
+    { header: 'OT hours', key: 'ot_h', width: 10 }, { header: 'Total hours', key: 'tot_h', width: 11 }, { header: 'Currency', key: 'cur', width: 9 },
+    { header: 'Regular amount', key: 'reg', width: 15 }, { header: 'OT amount', key: 'ot', width: 13 }, { header: 'Additions', key: 'add', width: 13 },
+    { header: 'Deductions', key: 'ded', width: 13 }, { header: 'Net invoiced', key: 'net', width: 16 },
+  ];
+  ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF3B3B3B' } };
+  const vals = (x) => ({ days: x.worked_days, reg_h: x.regular_hours, ot_h: x.overtime_hours, tot_h: x.total_hours, cur: x.currency,
+    reg: x.regular, ot: x.overtime, add: x.additions, ded: x.deductions, net: x.net });
+  const tot = (label, x, fill) => { const row = ws.addRow({ vendor: label, ...vals(x) }); row.font = { bold: true }; row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } }; };
+  for (const g of data.vendors) {
+    for (const r of g.machines) {
+      ws.addRow({ vendor: g.vendor_name, code: r.equipment_code, name: r.machine_label || r.type_name, plate: r.plate_number, mode: r.billing_modes,
+        first: r.first_day, last: r.last_day, inv: r.invoices, ...vals(r) });
+    }
+    for (const x of g.money) tot(`Total ${g.vendor_name}`, x, 'FFF3EEE2');
+  }
+  for (const x of data.money) tot(`GRAND TOTAL ${x.currency}`, x, 'FFE6DCC3');
+  for (const k of ['reg_h', 'ot_h', 'tot_h', 'reg', 'ot', 'add', 'ded', 'net']) ws.getColumn(k).numFmt = '#,##0.00;[Red]-#,##0.00;-';
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+module.exports = { hoursReport, hoursReportPdf, hoursReportXlsx, invoicedReport, invoicedReportPdf, invoicedReportXlsx };
