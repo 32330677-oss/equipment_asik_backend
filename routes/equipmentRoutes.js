@@ -209,5 +209,6 @@ router.get('/live/sites/:siteId', ACS, liveC.liveSite);
 router.get('/reports/daily.pdf', ACS, liveC.dailyPdf);
 router.get('/reports/client-daily.pdf', ACS, clientRep.clientDailyPdf);
 router.get('/reports/utilization', AC, liveC.utilization);
+router.get('/reports/hours', AC, require('../controllers/equipment/hoursReportController').hours);
 
 module.exports = router;
