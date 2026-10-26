@@ -69,6 +69,11 @@ test('hours report: invoiced + not invoiced, OT split, totals per vendor', async
   // vendor filter
   const v = await ok(h.api().get('/api/equipment/reports/hours').query({ vendor_id: F.vendor.vendor_id }).set(ACC()));
   assert.ok(v.vendors.every((g) => g.vendor_id === F.vendor.vendor_id));
+  // one machine
+  const one = await ok(h.api().get('/api/equipment/reports/hours').query({ equipment_id: F.exc.equipment_id }).set(ACC()));
+  assert.strictEqual(one.vendors.length, 1);
+  assert.strictEqual(one.vendors[0].machines.length, 1);
+  assert.deepStrictEqual(one.vendors[0].machines[0], exc);
 });
 
 test('hours report: PDF and Excel', async () => {
@@ -76,6 +81,9 @@ test('hours report: PDF and Excel', async () => {
   assert.strictEqual(pdf.status, 200);
   assert.strictEqual(pdf.body.slice(0, 4).toString(), '%PDF');
   require('fs').writeFileSync('/tmp/hours.pdf', pdf.body);
+  const p1 = await bin(h.api().get('/api/equipment/reports/hours').query({ format: 'pdf', equipment_id: F.exc.equipment_id }).set(ACC()));
+  assert.strictEqual(p1.status, 200);
+  require('fs').writeFileSync('/tmp/hours1.pdf', p1.body);
   const x = await bin(h.api().get('/api/equipment/reports/hours').query({ format: 'xlsx' }).set(ACC()));
   assert.strictEqual(x.status, 200);
   assert.strictEqual(x.body.slice(0, 2).toString(), 'PK');

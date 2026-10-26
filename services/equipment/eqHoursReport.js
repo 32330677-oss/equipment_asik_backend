@@ -34,7 +34,7 @@ function addMoney(m, currency, lines, netCents, invoiced) {
   if (invoiced) x.invoiced_net += netCents; else x.not_invoiced_net += netCents;
 }
 
-async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId = null } = {}) {
+async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId = null, equipment_id: equipmentId = null } = {}) {
   const today = businessToday();
   const byMachine = new Map();
   const get = (id) => {
@@ -47,6 +47,7 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   const w = []; const p = [];
   if (vendorId) { w.push('i.vendor_id = ?'); p.push(vendorId); }
   if (siteId) { w.push('i.site_id = ?'); p.push(siteId); }
+  if (equipmentId) { w.push('i.equipment_id = ?'); p.push(equipmentId); }
   const [items] = await conn.query(
     `SELECT i.eq_item_id, i.net_amount, b.currency, i.equipment_id, i.vendor_id, i.billing_mode, i.worked_days, i.work_hours, i.overtime_hours, b.start_date, b.end_date,
        (SELECT MIN(ps.record_date) FROM eq_payroll_attendance_snapshot ps WHERE ps.eq_item_id = i.eq_item_id) AS r_from,
@@ -76,8 +77,9 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   }
 
   // 2. not invoiced yet: from the first attendance row / deployment of the scope, one calendar year at a time
-  const s = PS.scopeSql({ vendor_id: vendorId, site_id: siteId });
-  const ds = PS.scopeSql({ vendor_id: vendorId, site_id: siteId }, 'a');
+  const scope = { vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId };
+  const s = PS.scopeSql(scope);
+  const ds = PS.scopeSql(scope, 'a');
   const [[r1]] = await conn.query(`SELECT MIN(ea.record_date) AS d FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id WHERE ea.status = 'Approved'${s.sql}`, s.params);
   const [[r2_]] = await conn.query(`SELECT MIN(a.assigned_date) AS d FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id WHERE 1 = 1${ds.sql}`, ds.params);
   const start = [day(r1.d), day(r2_.d)].filter(Boolean).sort()[0] || null;
@@ -87,7 +89,7 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
       const from = y === Number(start.slice(0, 4)) ? start : `${y}-01-01`;
       const to = y === Number(today.slice(0, 4)) ? today : `${y}-12-31`;
       try {
-        const { items: its } = await PS.calculate(conn, { start_date: from, end_date: to, vendor_id: vendorId, site_id: siteId });
+        const { items: its } = await PS.calculate(conn, { start_date: from, end_date: to, ...scope });
         for (const it of its) {
           const work = n(it.work_minutes) / 60; const ot = Math.max(0, n(it.overtime_minutes) / 60);
           const lines = (it.lines || []).map((l) => ({ line_type: l.line_type, amount: n(l.amount_cents) / 100 }));
@@ -115,7 +117,7 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   for (const r of subs) { const m = get(r.equipment_id); m.vendor_id = m.vendor_id || r.vendor_id; m.pending_rows += n(r.c); }
 
   const ids = [...byMachine.keys()];
-  if (!ids.length) return { generated_on: today, vendor_id: vendorId, site_id: siteId, vendors: [], totals: emptyTotals(), money: [], errors };
+  if (!ids.length) return { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, vendors: [], totals: emptyTotals(), money: [], errors };
   const [machines] = await conn.query(
     `SELECT e.equipment_id, e.equipment_code, e.machine_label, e.plate_number, e.vendor_id, t.type_name FROM eq_equipment e
      JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)`, [ids]);
@@ -142,7 +144,7 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   const out = [...groups.values()].sort((a, b) => a.vendor_name.localeCompare(b.vendor_name));
   for (const g of out) { g.machines.sort((a, b) => a.equipment_code.localeCompare(b.equipment_code)); g.totals = sum(g.machines); g.money = sumMoney(g.machines); }
   const all = out.flatMap((g) => g.machines);
-  return { generated_on: today, vendor_id: vendorId, site_id: siteId, vendors: out, totals: sum(all), money: sumMoney(all), errors };
+  return { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, vendors: out, totals: sum(all), money: sumMoney(all), errors };
 }
 
 /** Money of one currency in units (2 decimals): regular, overtime, other, invoiced_net, not_invoiced_net, total. */
@@ -178,7 +180,8 @@ const h = (v) => fmt.num(v, 2);
 async function hoursReportPdf(data, { siteLabel } = {}) {
   const company = await settings.getString('company_name');
   const doc = P.createDoc({ layout: 'landscape', info: { Title: 'Equipment hours since the start' } });
-  const scope = [data.vendors.length === 1 && data.vendor_id ? data.vendors[0].vendor_name : 'All vendors', siteLabel || 'All sites'].join(' | ');
+  const one = data.equipment_id && data.vendors.length === 1 && data.vendors[0].machines.length === 1 ? data.vendors[0].machines[0] : null;
+  const scope = [one ? `${machineName(one)} - ${data.vendors[0].vendor_name}` : data.vendors.length === 1 && data.vendor_id ? data.vendors[0].vendor_name : 'All vendors', siteLabel || 'All sites'].join(' | ');
   let y = P.header(doc, {
     title: 'EQUIPMENT HOURS SINCE THE START', titleAr: 'ساعات الآليات منذ بداية المشروع', subtitle: company,
     right: (xr, top) => [`Up to ${fmt.date(data.generated_on)}`, scope].forEach((t, k) => P.text(doc, t, xr - 220, top + k * 11, { size: k ? 7 : 8, bold: !k, color: k ? COLORS.ink : COLORS.navy, width: 220, align: 'right', lineBreak: false })),

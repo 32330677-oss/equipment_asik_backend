@@ -1,5 +1,5 @@
 // GET /api/equipment/reports/hours  — hours since the start of the project per machine, grouped by vendor (read only).
-// Query: vendor_id, site_id (optional), format = json | pdf | xlsx.
+// Query: vendor_id, site_id, equipment_id (optional), format = json | pdf | xlsx.
 'use strict';
 
 const { pool } = require('../../config/db');
@@ -7,8 +7,8 @@ const { v, validate } = require('../../utils/validate');
 const H = require('../../services/equipment/eqHoursReport');
 
 exports.hours = async (req, res) => {
-  const q = validate(req.query, { vendor_id: v.id(), site_id: v.id(), format: v.enumOf(['json', 'xlsx', 'pdf'], { default: 'json' }) });
-  const data = await H.hoursReport(pool, { vendor_id: q.vendor_id || null, site_id: q.site_id || null });
+  const q = validate(req.query, { vendor_id: v.id(), site_id: v.id(), equipment_id: v.id(), format: v.enumOf(['json', 'xlsx', 'pdf'], { default: 'json' }) });
+  const data = await H.hoursReport(pool, { vendor_id: q.vendor_id || null, site_id: q.site_id || null, equipment_id: q.equipment_id || null });
   if (q.format === 'json') return res.json({ status: 'success', data });
   const name = `equipment-hours-since-start-${data.generated_on}`;
   if (q.format === 'xlsx') {
