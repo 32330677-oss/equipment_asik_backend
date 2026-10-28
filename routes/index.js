@@ -10,5 +10,6 @@ router.use('/audit', require('./auditRoutes'));
 router.use('/equipment', require('./equipmentRoutes'));
 router.use('/help', require('./helpRoutes'));             // Help Center (assistant/guide.md)
 router.use('/integration', require('./integrationRoutes')); // server-to-server reads by Team Flow (token auth)
+router.use('/telegram', require('./telegramRoutes'));       // supervisors' Telegram bot (webhook has its own secret)
 
 module.exports = router;
