@@ -186,8 +186,8 @@ test('setup-webhook (Admin): registers the public URL with the secret', async ()
   assert.strictEqual((await h.api().post('/api/telegram/setup-webhook').set(S8())).status, 403);
 });
 
-test('loopback: only the listed routes (reading only in phase 2)', async () => {
-  await assert.rejects(() => loopback.call(3, 'POST', '/api/equipment/attendance/check-in', { body: {} }), /not allowed/);
+test('loopback: only the listed routes', async () => {
+  await assert.rejects(() => loopback.call(3, 'POST', '/api/equipment/attendance/submit', { body: {} }), /not allowed/);
   await assert.rejects(() => loopback.call(3, 'GET', '/api/equipment/payroll/batches'), /not allowed/);
   const r = await loopback.call(3, 'GET', '/api/equipment/my-sites', { query: { date: '2026-10-20' } });
   assert.strictEqual(r.ok, true);

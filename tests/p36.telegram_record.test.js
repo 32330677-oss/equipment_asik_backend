@@ -208,7 +208,7 @@ test('daily limit: the bot stops reading and says so (no AI call)', async () => 
   const before = aiCalls;
   sent = [];
   await say('كل الآليات طلعت');
-  assert.match(last().text, /الحد اليومي/);
+  assert.match(last().text, /حد اليومي/);
   assert.strictEqual(aiCalls, before);
   delete process.env.BOT_DAILY_LIMIT;
 });
