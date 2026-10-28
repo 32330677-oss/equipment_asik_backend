@@ -45,6 +45,18 @@ const env = {
   bcryptCost: int('BCRYPT_COST', 12),
   // Shared secret for server-to-server reads by Team Flow (combined Project Daily Report). Empty = integration off.
   integrationToken: str('INTEGRATION_TOKEN', ''),
+  // Telegram bot for site supervisors (its own bot, not Team Flow's). Off unless TELEGRAM_BOT_ENABLED=true and the
+  // token + webhook secret are set; when off, the bot routes answer 503 and nothing else changes.
+  telegram: {
+    enabled: bool('TELEGRAM_BOT_ENABLED', false),
+    botToken: str('TELEGRAM_BOT_TOKEN', ''),
+    botUsername: str('TELEGRAM_BOT_USERNAME', '').replace(/^@/, ''),
+    webhookSecret: str('TELEGRAM_WEBHOOK_SECRET', ''),
+    // the public address of this server (e.g. https://equipment-asik.onrender.com), used to register the webhook
+    publicUrl: str('PUBLIC_BASE_URL', '').replace(/\/+$/, ''),
+    // where the bot calls this server's own API (default http://127.0.0.1:PORT)
+    loopbackUrl: str('TELEGRAM_LOOPBACK_URL', '').replace(/\/+$/, ''),
+  },
 };
 
 function validateEnv() {
