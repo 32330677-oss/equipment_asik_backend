@@ -3,7 +3,9 @@
 // Every request goes over HTTP to this server with a JWT of the supervisor that lives 60 seconds (with his password
 // version, like a normal sign-in). So it passes through everything the app passes through: requireAuth (account
 // Active, role re-read), requireRole, the site / shift / deployment checks, the locks, the transactions.
-// The bot never writes SQL for attendance. Only the routes in ALLOWED can be called (phase 2: reading only).
+// The bot never writes SQL for attendance. Only the routes in ALLOWED can be called: reading the supervisor's sites
+// and day board, and recording a day the way the app does (check-in, check-out, day status, a stop inside the day,
+// changing the times of a Draft row). No submit, no recall, no delete, no change request, nothing of invoices.
 const jwt = require('jsonwebtoken');
 const { env } = require('../../config/env');
 const { pool } = require('../../config/db');
@@ -12,6 +14,11 @@ const { passwordVersion } = require('../../middleware/requireAuth');
 const ALLOWED = [
   { method: 'GET', path: /^\/api\/equipment\/my-sites$/ },
   { method: 'GET', path: /^\/api\/equipment\/attendance\/site\/\d+$/ },
+  { method: 'POST', path: /^\/api\/equipment\/attendance\/check-in$/ },
+  { method: 'POST', path: /^\/api\/equipment\/attendance\/\d+\/check-out$/ },
+  { method: 'POST', path: /^\/api\/equipment\/attendance\/day-status$/ },
+  { method: 'POST', path: /^\/api\/equipment\/attendance\/\d+\/downtime\/start$/ },
+  { method: 'PATCH', path: /^\/api\/equipment\/attendance\/\d+$/ },
 ];
 
 const TIMEOUT_MS = 20000;
@@ -44,7 +51,7 @@ async function call(userId, method, path, { query, body } = {}) {
       signal: ctrl.signal,
     });
     const json = await res.json().catch(() => ({}));
-    return { ok: res.ok, status: res.status, data: json.data, code: json.code || null, message: json.message || null, details: json.details };
+    return { ok: res.ok, status: res.status, data: json.data, code: json.code || null, message: json.message || null, details: json.details, warnings: json.warnings || [] };
   } catch (e) {
     return { ok: false, status: 0, data: null, code: e.name === 'AbortError' ? 'TIMEOUT' : 'UNREACHABLE', message: e.message };
   } finally {

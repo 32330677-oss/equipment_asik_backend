@@ -51,9 +51,41 @@ async function sendMessage(chatId, text, extra = {}) {
   }
 }
 
+/** Replaces the text (and buttons) of a message the bot sent; sends a new one when that fails. */
+async function editMessage(chatId, messageId, text, extra = {}) {
+  let t = String(text || '');
+  if (t.length > MAX_TEXT) t = `${t.slice(0, MAX_TEXT - 1)}…`;
+  if (messageId) {
+    try {
+      return await callApi('editMessageText', { chat_id: chatId, message_id: messageId, text: t, parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
+    } catch (e) {
+      if (/not modified/i.test(e.message)) return null;
+    }
+  }
+  return sendMessage(chatId, t, extra);
+}
+
+/** Stops the spinner on a tapped button (optionally with a short toast). Never throws. */
+async function answerCallback(id, text = '') {
+  try { await callApi('answerCallbackQuery', { callback_query_id: id, ...(text ? { text } : {}) }); } catch (_) { /* expired: fine */ }
+}
+
+let downloader = null;
+/** Tests: fn(fileId) -> Buffer. */
+function setDownloader(fn) { downloader = fn; }
+
+/** Downloads a file the supervisor sent (a voice note) into memory. Throws on failure. */
+async function downloadFile(fileId) {
+  if (downloader) return downloader(fileId);
+  const file = await callApi('getFile', { file_id: fileId });
+  const res = await fetch(`https://api.telegram.org/file/bot${env.telegram.botToken}/${file.file_path}`, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
 /** Escapes text put inside an HTML message. */
 function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-module.exports = { callApi, sendMessage, esc, configured, enabled, setTransport, MAX_TEXT };
+module.exports = { callApi, sendMessage, editMessage, answerCallback, downloadFile, setDownloader, esc, configured, enabled, setTransport, MAX_TEXT };
