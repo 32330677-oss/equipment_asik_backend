@@ -76,7 +76,7 @@ test('/start <code> links the chat and shows today\'s machines read through the 
   assert.match(texts[1], /S08/);
   assert.match(texts[1], /نهاري/);
   assert.match(texts[1], /3 آلية: 3 بدون سجل/);
-  assert.match(texts[2], /التسجيل بالكلام/);
+  assert.match(texts[2], /بكلامك العادي/);
   const me = await ok(h.api().get('/api/telegram/me').set(S8()));
   assert.strictEqual(me.linked, true);
   sent = [];
@@ -99,7 +99,7 @@ test('a status shows the recorded machines; an unlinked chat and a group get a c
   // the excavator works today (a Draft check-in through the app)
   await ok(h.api().post('/api/equipment/attendance/check-in').set(S8()).send({ equipment_id: F.exc.equipment_id, site_id: 8, check_in_time: '2026-10-20 07:00' }));
   sent = [];
-  await hook(msg(555, 'شو الوضع'));
+  await hook(msg(555, '/status'));
   assert.match(textsTo(555)[0], /3 آلية: 1 شغّالة، 2 بدون سجل/);
   sent = [];
   await hook(msg(888, 'مرحبا'));
@@ -114,7 +114,7 @@ test('language: /en switches to English and is kept', async () => {
   await hook(msg(555, '/en'));
   assert.match(textsTo(555)[0], /English/);
   sent = [];
-  await hook(msg(555, 'status'));
+  await hook(msg(555, '/status'));
   assert.match(textsTo(555)[0], /Your machines today/);
   assert.match(textsTo(555)[0], /Day/);
   await hook(msg(555, '/ar'));
@@ -186,8 +186,8 @@ test('setup-webhook (Admin): registers the public URL with the secret', async ()
   assert.strictEqual((await h.api().post('/api/telegram/setup-webhook').set(S8())).status, 403);
 });
 
-test('loopback: only the listed routes (reading only in phase 2)', async () => {
-  await assert.rejects(() => loopback.call(3, 'POST', '/api/equipment/attendance/check-in', { body: {} }), /not allowed/);
+test('loopback: only the listed routes', async () => {
+  await assert.rejects(() => loopback.call(3, 'POST', '/api/equipment/attendance/submit', { body: {} }), /not allowed/);
   await assert.rejects(() => loopback.call(3, 'GET', '/api/equipment/payroll/batches'), /not allowed/);
   const r = await loopback.call(3, 'GET', '/api/equipment/my-sites', { query: { date: '2026-10-20' } });
   assert.strictEqual(r.ok, true);
