@@ -18,6 +18,7 @@ const executor = require('./executor');
 const aliases = require('./aliases');
 const usage = require('./usage');
 const transcriber = require('./transcriber');
+const answerer = require('./answer');
 
 const STATES = ['working', 'on_break', 'breakdown', 'standby', 'finished', 'not_arrived', 'absent', 'holiday'];
 const RETRY = new Set(['TIMEOUT', 'BUSY', 'BAD_REPLY', 'UNREACHABLE']);
@@ -67,6 +68,26 @@ function guessDate(text, today, nowHHMM) {
   // a night shift reported in the morning belongs to the evening before
   if (nowHHMM < '12:00' && /(الليلي|ليلي|المسائي|night)/i.test(s)) return addDays(today, -1);
   return today;
+}
+
+// Short known replies, understood by the code alone (no AI call: instant, free, always the same answer).
+// Anything else, or the same thing said another way, still goes to the AI.
+function plain(text) {
+  return String(text || '').replace(/[\u064B-\u0652\u0640]/g, '').replace(/[أإآ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي')
+    .replace(/[!.؟?،,\s]+$/g, '').replace(/^[\s]+/, '').replace(/\s+/g, ' ').toLowerCase();
+}
+const QUICK = [
+  ['confirm', /^(اي|ايه|ايوه|ايوا|اكيد|تمام|ماشي|سجل|سجلها|سجلهم|اوكي|اوك|تم|نعم|ok|okay|yes|y)$/],
+  ['cancel', /^(لا|لاء|الغي|الغيها|الغيهم|بلاها|بلا|الغاء|cancel|no)$/],
+  ['status', /^(شو الوضع|كيف الوضع|وين صرنا|الوضع|شو صار|status)$/],
+  ['not_recorded', /^(شو ناقص|مين ما تسجل|شو باقي|مين باقي|الناقص|شو ما تسجل|missing)$/],
+  ['machines', /^(شو الياتي|الياتي|شو عندي اليات|شو الاليات|شو الاليات الموجوده|الاليات الموجوده|my machines)$/],
+];
+function quickIntent(text) {
+  const p = plain(text);
+  if (!p || p.length > 40) return null;
+  const hit = QUICK.find(([, re]) => re.test(p));
+  return hit ? hit[0] : null;
 }
 
 /** One AI read, logged; one retry on a passing error. Returns the parse result or null (the error was sent). */
@@ -123,6 +144,23 @@ async function next(chatId, messageId, p, link) {
   return showProposal(chatId, messageId, p, ctx, plan, link.language);
 }
 
+/** A question about his machines: read through his own routes, answered from that data only. */
+async function onQuestion(link, chatId, text) {
+  const lang = link.language;
+  const log = (kind, r) => usage.log(link.user_id, kind, { model: r.model, latencyMs: r.latencyMs, usage: r.usage });
+  try {
+    const r = await answerer.answer({ userId: link.user_id, text, today: businessToday(), lang, log });
+    if (r.text) return tg.sendMessage(chatId, tg.esc(r.text));
+    return tg.sendMessage(chatId, t(lang, r.key, r.vars || {}));
+  } catch (e) {
+    const code = e.code || 'ERROR';
+    await usage.log(link.user_id, 'question', { ok: false, code });
+    if (!e.code) console.error('Telegram question failed:', e.message);
+    const key = ['NOT_CONFIGURED', 'TIMEOUT', 'BUSY', 'TRUNCATED'].includes(code) ? `ai_${code}` : 'ai_other';
+    return tg.sendMessage(chatId, t(lang, key, { code }));
+  }
+}
+
 async function cancelOpen(link, chatId) {
   const p = await pending.get(link.user_id);
   if (!p) return tg.sendMessage(chatId, t(link.language, 'nothing_open'));
@@ -152,6 +190,9 @@ async function onText(link, chat, text, kind = 'text', preCtx = null) {
   }
   if (r.intent === 'status') return tg.sendMessage(chat.id, await todayText(link));
   if (r.intent === 'not_recorded') return tg.sendMessage(chat.id, view.notRecorded(ctx, lang));
+  if (r.intent === 'machines') return tg.sendMessage(chat.id, view.machineList(ctx, lang));
+  if (r.intent === 'question' && !r.entries.length) return onQuestion(link, chat.id, text);
+  if (r.intent === 'confirm' && !r.entries.length) return confirmByText(link, chat.id);
   if (r.intent === 'help') return tg.sendMessage(chat.id, t(lang, 'help'));
   if (r.intent === 'cancel' && !r.entries.length) return cancelOpen(link, chat.id);
 
@@ -168,11 +209,11 @@ async function onText(link, chat, text, kind = 'text', preCtx = null) {
     }
   }
   if (!ctx.machines.length) return tg.sendMessage(chat.id, t(lang, 'no_machines', { date: ctx.date }));
-  if (!r.entries.length) {
-    return tg.sendMessage(chat.id, [t(lang, 'nothing'), r.note ? t(lang, 'note', { note: tg.esc(r.note) }) : ''].filter(Boolean).join('\n\n'));
-  }
+  const nothing = () => tg.sendMessage(chat.id, [t(lang, r.intent === 'record' ? 'nothing' : 'nothing_for'), r.note ? t(lang, 'note', { note: tg.esc(r.note) }) : ''].filter(Boolean).join('\n\n'));
+  if (!r.entries.length) return nothing();
   const payload = { date: ctx.date, lang, reading: r, answers: {}, waiting: null };
   const plan = builder.build({ reading: r, ctx, answers: {}, nowStamp: businessNow() });
+  if (!plan.lines.length && !plan.steps.length && !plan.questions.length && !plan.skipped.length) return nothing();
   const id = await pending.open(link.user_id, chat.id, payload);
   if (!plan.steps.length && !plan.questions.length) await pending.close(id, 'Cancelled');
   return showProposal(chat.id, null, { id, payload }, ctx, plan, lang, r.note);
@@ -212,6 +253,26 @@ async function onStart(chat, from, code) {
   if (why) return tg.sendMessage(chat.id, t(link.language, why));
   await tg.sendMessage(chat.id, await todayText(link));
   return tg.sendMessage(chat.id, t(link.language, 'coming_soon'));
+}
+
+/** Confirm: claims the proposal (a second tap finds nothing), checks it again, records through the app's routes. */
+async function confirm(chatId, messageId, p, link) {
+  const lang = link.language;
+  if (!(await pending.claim(p.id))) return tg.editMessage(chatId, messageId, t(lang, 'expired'));
+  const { ctx, plan } = await rebuild(link, p.payload);
+  if (!plan) return tg.editMessage(chatId, messageId, t(lang, 'server_error', { why: errWhy(ctx) }));
+  const run = await executor.run(link.user_id, plan.steps);
+  const keys = { inline_keyboard: [[{ text: t(lang, 'btn_why'), callback_data: `w|${p.id}` }]] };
+  return tg.editMessage(chatId, messageId, view.result(run, plan, ctx, lang), { reply_markup: keys });
+}
+
+/** A typed "yes": confirms the open proposal when nothing is left to answer, else shows what is left. */
+async function confirmByText(link, chatId) {
+  const p = await pending.get(link.user_id);
+  if (!p || !p.fresh) return tg.sendMessage(chatId, t(link.language, 'nothing_open'));
+  const { ctx, plan } = await rebuild(link, p.payload);
+  if (plan && plan.questions.length) return showQuestion(chatId, null, p, ctx, plan, link.language);
+  return confirm(chatId, p.messageId, p, link);
 }
 
 async function onCallback(cb) {
@@ -258,14 +319,7 @@ async function onCallback(cb) {
     }
     return next(chatId, messageId, p, link);
   }
-  if (kind === 'c') {
-    if (!(await pending.claim(p.id))) return tg.editMessage(chatId, messageId, t(lang, 'expired'));
-    const { ctx, plan } = await rebuild(link, p.payload);
-    if (!plan) return tg.editMessage(chatId, messageId, t(lang, 'server_error', { why: errWhy(ctx) }));
-    const run = await executor.run(link.user_id, plan.steps);
-    const keys = { inline_keyboard: [[{ text: t(lang, 'btn_why'), callback_data: `w|${p.id}` }]] };
-    return tg.editMessage(chatId, messageId, view.result(run, plan, ctx, lang), { reply_markup: keys });
-  }
+  if (kind === 'c') return confirm(chatId, messageId, p, link);
   return null;
 }
 
@@ -303,6 +357,10 @@ async function handleUpdate(update) {
   if (msg.voice || msg.audio) return onVoice(link, chat, msg.voice || msg.audio);
   if (!text) return tg.sendMessage(chat.id, t(link.language, 'help'));
 
+  // "yes" / "cancel" first: never taken as the reason of a breakdown
+  const quick = quickIntent(text);
+  if (quick === 'confirm') return confirmByText(link, chat.id);
+  if (quick === 'cancel') return cancelOpen(link, chat.id);
   // the reason of a breakdown / standby the bot asked for
   const open = await pending.get(link.user_id);
   if (open && open.fresh && open.payload && open.payload.waiting && text.length <= 300) {
@@ -311,7 +369,13 @@ async function handleUpdate(update) {
     await pending.save(open.id, open.payload);
     return next(chat.id, null, open, link);
   }
+  if (quick === 'status') return tg.sendMessage(chat.id, await todayText(link));
+  if (quick === 'not_recorded' || quick === 'machines') {
+    const ctx = await context.load(link.user_id, businessToday());
+    if (!ctx.ok) return tg.sendMessage(chat.id, t(link.language, 'server_error', { why: errWhy(ctx) }));
+    return tg.sendMessage(chat.id, quick === 'machines' ? view.machineList(ctx, link.language) : view.notRecorded(ctx, link.language));
+  }
   return onText(link, chat, text, 'text');
 }
 
-module.exports = { handleUpdate, todayText, guessDate };
+module.exports = { handleUpdate, todayText, guessDate, quickIntent };

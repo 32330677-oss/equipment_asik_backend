@@ -116,4 +116,20 @@ function notRecorded(ctx, lang) {
   return out.join('\n\n');
 }
 
-module.exports = { proposal, question, result, notRecorded, name };
+const STATE_KEY = { Working: 'working', OnBreak: 'on_break', Breakdown: 'breakdown', Standby: 'standby', NotArrived: 'not_arrived', Finished: 'finished', Absent: 'absent', Holiday: 'holiday' };
+
+/** "Which machines do I have": per site / shift, every machine with its vendor and its state today. */
+function machineList(ctx, lang) {
+  const out = [t(lang, 'ml_title', { date: ctx.date })];
+  if (!ctx.machines.length) out.push(t(lang, 'no_machines', { date: ctx.date }));
+  for (const b of ctx.boards) {
+    const ms = ctx.machines.filter((m) => m.site_id === b.site_id && m.shift === b.shift);
+    if (!ms.length) continue;
+    const head = t(lang, 'proposal_board', { site: esc(`${b.site_code} ${b.site_name || ''}`.trim()), shift: t(lang, `shift_${b.shift}`) });
+    const lines = ms.map((m) => `• ${esc(machineName(m, lang))}${m.plate ? ` · ${esc(m.plate)}` : ''} — ${t(lang, `st_${STATE_KEY[m.state] || 'not_arrived'}`)}`);
+    out.push(`${head} (${ms.length})\n${cut(lines).join('\n')}`);
+  }
+  return out.join('\n\n');
+}
+
+module.exports = { proposal, question, result, notRecorded, machineList, name };

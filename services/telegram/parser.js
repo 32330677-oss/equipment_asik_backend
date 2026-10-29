@@ -11,7 +11,7 @@ const TOOL = {
   input_schema: {
     type: 'object',
     properties: {
-      intent: { type: 'string', enum: ['record', 'status', 'not_recorded', 'help', 'cancel', 'other'] },
+      intent: { type: 'string', enum: ['record', 'status', 'not_recorded', 'machines', 'question', 'confirm', 'help', 'cancel', 'other'] },
       work_date: { type: 'string', description: "'' (not said), 'today', 'yesterday', 'YYYY-MM-DD', or a day of the month like '15'" },
       site: { type: 'string', description: 'site code or name if he said one, else empty' },
       shift: { type: 'string', enum: ['', 'Day', 'Night'] },
@@ -50,7 +50,8 @@ const SYSTEM = `You read messages from a construction site supervisor (Syrian Ar
 
 Understand the intent in any wording; the examples are not a fixed list of commands.
 - intent 'record': he says machines started, finished, did not come, broke down, stopped... (most messages)
-- 'status': he asks how things are now ("شو الوضع", "وين صرنا"). 'not_recorded': who is not recorded / what is missing ("مين ما تسجل", "شو ناقص"). 'help': how to use the bot. 'cancel': cancel what was proposed ("الغي", "لا"). 'other': anything else.
+- 'status': he asks how things are now ("شو الوضع", "وين صرنا"). 'not_recorded': who is not recorded / what is missing ("مين ما تسجل", "شو ناقص"). 'machines': he asks WHICH machines he has / are on a site ("شو الآليات الموجودة", "شو عندي آليات", "شو في بالـ T2"). 'confirm': a short yes to what was proposed ("اي", "تمام", "سجّل", "أكيد", "ok"). 'question': any other QUESTION about his machines, their days, hours, stops, drivers, rejected rows, change requests or timesheets ("قديش اشتغلت الحفارة مبارح", "مين كان معطل يوم 15", "شو رفضولي", "مين سائق البوكلين") — also when it asks about prices or money (the bot will say it cannot). 'help': how to use the bot. 'cancel': cancel what was proposed ("الغي", "لا", "بلاها"). 'other': anything else.
+- entries ONLY for intent 'record' (a question, a yes / no or a greeting has entries = []).
 
 Machines: each list line is "n. TYPE NUMBER · VENDOR | code, plate, driver, site, shift, state today". Machines are numbered PER VENDOR and TYPE: "حفارة 2" may exist at two vendors.
 - He names a machine by type + number ("الحفارة 2", "البوكلين التاني" = 2, "اللودر الأول" = 1), by vendor ("حفارة 2 تبع X", "شاحنة X"), by plate, by code (EQ-0012), by driver name ("حفارة أبو أحمد"), or by one of HIS names listed under "His names".
@@ -126,9 +127,11 @@ function normalize(input, n) {
     downtime_end: time(e.downtime_end),
     meter_start: num(e.meter_start),
     meter_end: num(e.meter_end),
-  })).filter((e) => e.action);
+  })).filter((e) => e.action && (
+    (e.action === 'check_in' && e.check_in) || (e.action === 'check_out' && e.check_out) || (e.action === 'in_out' && (e.check_in || e.check_out))
+    || (e.action === 'day_status' && e.day_status) || (e.action === 'downtime' && e.downtime_type)));
   return {
-    intent: ['record', 'status', 'not_recorded', 'help', 'cancel', 'other'].includes(input.intent) ? input.intent : 'other',
+    intent: ['record', 'status', 'not_recorded', 'machines', 'question', 'confirm', 'help', 'cancel', 'other'].includes(input.intent) ? input.intent : 'other',
     work_date: String(input.work_date || '').trim(),
     site: String(input.site || '').trim().slice(0, 60),
     shift: ['Day', 'Night'].includes(input.shift) ? input.shift : '',
