@@ -51,6 +51,7 @@ async function todayText(link) {
 
 function blockedReason(link) {
   if (!link.eligible) return 'account_inactive';
+  if (!link.allowed) return 'blocked_by_admin';
   if (Number(link.must_change_password) === 1) return 'change_password';
   return null;
 }
@@ -201,7 +202,7 @@ async function onVoice(link, chat, voice) {
 async function onStart(chat, from, code) {
   if (code) {
     const r = await links.linkWithCode(code, chat, from);
-    if (!r.ok) return tg.sendMessage(chat.id, t('ar', r.reason === 'invalid' ? 'link_invalid' : 'not_eligible'));
+    if (!r.ok) return tg.sendMessage(chat.id, t('ar', { invalid: 'link_invalid', blocked: 'blocked_by_admin' }[r.reason] || 'not_eligible'));
     if (r.previousChatId) await tg.sendMessage(r.previousChatId, t(r.language, 'moved'));
     await tg.sendMessage(chat.id, t(r.language, 'welcome', { name: tg.esc(String(r.user.full_name || '').split(' ')[0]) }));
   }

@@ -193,3 +193,41 @@ test('loopback: only the listed routes', async () => {
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.data[0].site_code, 'S08');
 });
+
+test('the Admin switches the bot off for one supervisor (open by default) and back on', async () => {
+  assert.strictEqual((await ok(h.api().get('/api/telegram/me').set(S8()))).allowed, true, 'open by default');
+  // he links chat 700, and keeps an unused code
+  const d = await linkCode();
+  await hook(msg(700, `/start ${codeOf(d.url)}`));
+  const unused = await linkCode();
+  // only the Admin, only for supervisors, allowed must be true / false
+  assert.strictEqual((await h.api().put('/api/telegram/access/3').set(S8()).send({ allowed: false })).status, 403);
+  assert.strictEqual((await h.api().put('/api/telegram/access/1').set(A()).send({ allowed: false })).status, 400);
+  assert.strictEqual((await h.api().put('/api/telegram/access/3').set(A()).send({ allowed: 'no' })).status, 400);
+  sent = [];
+  await ok(h.api().put('/api/telegram/access/3').set(A()).send({ allowed: false, reason: 'testing period over' }));
+  assert.match(textsTo(700)[0], /وقّفت البوت لحسابك/, 'the linked chat is told');
+  assert.deepStrictEqual((await ok(h.api().get('/api/telegram/access').set(A()))).map((r) => r.user_id), [3]);
+  assert.strictEqual((await ok(h.api().get('/api/telegram/me').set(S8()))).allowed, false);
+  // blocked: no new link, the old unused code is gone, the chat gets the reason and nothing is read
+  const refused = await h.api().post('/api/telegram/link-code').set(S8());
+  assert.strictEqual(refused.status, 403);
+  assert.strictEqual(refused.body.code, 'TELEGRAM_BLOCKED');
+  sent = [];
+  await hook(msg(701, `/start ${codeOf(unused.url)}`));
+  assert.match(textsTo(701)[0], /غلط أو انتهت صلاحيته/);
+  sent = [];
+  await hook(msg(700, '/status'));
+  assert.strictEqual(textsTo(700).length, 1);
+  assert.match(textsTo(700)[0], /وقّفت البوت لحسابك/);
+  // back on: the chat is told and works again
+  sent = [];
+  await ok(h.api().put('/api/telegram/access/3').set(A()).send({ allowed: true }));
+  assert.match(textsTo(700)[0], /رجّعت البوت/);
+  sent = [];
+  await hook(msg(700, '/status'));
+  assert.match(textsTo(700)[0], /وضع آلياتك اليوم/);
+  assert.deepStrictEqual(await ok(h.api().get('/api/telegram/access').set(A())), []);
+  const acts = (await h.query("SELECT action_type, reason FROM audit_logs WHERE table_name = 'tg_links' AND record_id = 3 AND action_type IN ('block', 'allow') ORDER BY log_id")).map((a) => a.action_type);
+  assert.deepStrictEqual(acts, ['block', 'allow']);
+});
