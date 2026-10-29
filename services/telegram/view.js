@@ -94,6 +94,7 @@ function question(q, ctx, lang, id) {
     return { text: t(lang, 'q_scope'), keyboard: { inline_keyboard: keys } };
   }
   if (q.kind === 'times') {
+    if (q.key === '*') return { text: t(lang, 'q_times_all', { n: q.count }), keyboard: { inline_keyboard: [[skip]] } };
     return { text: t(lang, 'q_times', { name: esc(nameByKey(ctx, q.key, lang)) }), keyboard: { inline_keyboard: [[skip]] } };
   }
   const what = t(lang, q.downtime ? `dt_${q.status}` : `ds_${q.status}`);
@@ -165,12 +166,14 @@ function boardPicker(ctx, lang) {
 }
 
 /** Guided mode: the board chosen; what next. */
-function boardIntro(draft, ctx, lang, id) {
+function boardIntro(draft, ctx, lang, id, past = false) {
   const ms = ctx.machines.filter((m) => m.site_id === draft.siteId && m.shift === draft.shift);
   const b = ctx.boards.find((x) => x.site_id === draft.siteId && x.shift === draft.shift) || {};
   const free = ms.filter((m) => !m.row).length;
   const keys = [];
-  if (b.start && free) keys.push([{ text: t(lang, 'btn_all_in', { t: b.start, n: free }), callback_data: `ai|${id}` }]);
+  // today: they came at the shift start (still working); an old day: one question for both times
+  if (past && free) keys.push([{ text: t(lang, 'btn_all_in_past', { n: free }), callback_data: `ai|${id}` }]);
+  else if (b.start && free) keys.push([{ text: t(lang, 'btn_all_in', { t: b.start, n: free }), callback_data: `ai|${id}` }]);
   keys.push([{ text: t(lang, 'btn_each'), callback_data: `ml|${id}` }]);
   return { text: `${header(draft, ctx, lang)}\n${t(lang, 'g_intro', { n: ms.length, free })}`, keyboard: { inline_keyboard: keys } };
 }

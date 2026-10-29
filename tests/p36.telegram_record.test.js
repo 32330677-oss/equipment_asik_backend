@@ -214,7 +214,7 @@ test('the session: the day said once is kept for the next messages; a missing ti
   await say('بدي دخّل حضور الآليات لتاريخ 19 أكتوبر');
   assert.match(last().text, /شغّال على/);
   assert.match(last().text, /2026-10-19/);
-  assert.ok(buttons(last()).some((b) => /كلها إجت 07:00/.test(b.text)));
+  assert.ok(buttons(last()).some((b) => /كلها اشتغلت… من أي ساعة لأي ساعة/.test(b.text)), 'an old day: both times asked');
 
   // no date in this message: it is for the 19th
   reply = () => ({ intent: 'record', entries: [E({ said: 'الحفارة تبع البنيان', mention: { type: 'حفارة', vendor: 'البنيان' }, action: 'in_out', check_in: '08:00', check_out: '17:00' })] });
@@ -255,33 +255,41 @@ test('a break said without times is never a stop (the office applies the break p
   await tap(button(/إلغاء/, p));
 });
 
-test('guided mode: Record a day -> day -> all came at the usual time -> one machine did not come -> Confirm', async () => {
+test('guided mode, an old day: Record a day -> day -> "all worked from .. to .." (one answer for all) -> one did not come, one removed -> Confirm', async () => {
   sent = [];
   await say('📋 سجّل يوم');
-  await tap(`d|2026-10-18`);
+  await tap('d|2026-10-18');
   assert.match(last().text, /2026-10-18/);
-  await tap(button(/كلها إجت 07:00 \(4\)/));
+  await tap(button(/كلها اشتغلت… من أي ساعة لأي ساعة؟ \(4\)/));
+  assert.match(last().text, /كل الآليات \(4\): من أي ساعة لأي ساعة/, 'ONE question for all of them');
+  const before = aiCalls;
+  sent = [];
+  await say('7 لـ 5');
+  assert.strictEqual(aiCalls, before, 'read by the code');
   let p = find(/رح سجّل/);
-  assert.strictEqual((p.text.match(/دخول 07:00/g) || []).length, 4);
+  assert.strictEqual((p.text.match(/دخول 07:00، خروج 17:00/g) || []).length, 4);
   await tap(button(/كل آلية لحالها/, p));
-  const craneBtn = buttons(last()).find((b) => /رافعة متحركة/.test(b.text));
-  await tap(craneBtn.callback_data);
+  // the crane did not come
+  await tap(buttons(last()).find((b) => /رافعة متحركة/.test(b.text)).callback_data);
   await tap(button(/ما إجت/));
   assert.ok(buttons(last()).some((b) => /❌ رافعة متحركة/.test(b.text)));
+  // the Al-Bunyan excavator is still checked in on the 20th: take it out (the app would refuse it, BR-12)
+  await tap(buttons(last()).find((b) => /حفارة 1 · Al-Bunyan/.test(b.text)).callback_data);
+  await tap(button(/شيلها/));
   await tap(button(/شوف المسودة/));
   p = find(/رح سجّل/);
   assert.match(p.text, /رافعة متحركة 1 · Al-Bunyan[^:\n]*: غايبة/);
-  await tap(button(/سجّل \(4\)/, p));
+  assert.doesNotMatch(p.text, /حفارة 1 · Al-Bunyan/);
+  await tap(button(/سجّل \(3\)/, p));
+  assert.match(last().text, /سجّلت 3 آلية/);
+  for (const m of [F.loader, excB]) {
+    const r = await row(m.equipment_id, '2026-10-18');
+    assert.strictEqual(r.check_in_time, '2026-10-18 07:00:00');
+    assert.strictEqual(r.check_out_time, '2026-10-18 17:00:00');
+  }
   assert.strictEqual((await row(F.crane.equipment_id, '2026-10-18')).day_status, 'Absent');
-  // an open check-in on a past day meets the app's own rules (nothing decided by the bot):
-  //   the Al-Bunyan excavator is still checked in on the 20th (BR-12: one open session per machine);
-  //   the loader and the second excavator have sessions after the 18th, and an open session would overlap them (BR-13)
-  const res = last().text;
-  assert.match(res, /سجّلت 1 آلية/);
-  assert.match(res, /still checked in/);
-  assert.match(res, /overlap/);
-  for (const m of [F.exc, F.loader, excB]) assert.strictEqual(await row(m.equipment_id, '2026-10-18'), undefined, 'refused: nothing half written');
-  assert.strictEqual(await count('2026-10-18'), 1);
+  assert.strictEqual(await row(F.exc.equipment_id, '2026-10-18'), undefined);
+  assert.strictEqual(await count('2026-10-18'), 3);
 });
 
 test('"today" brings the session back to today; short replies are read by the code alone', async () => {

@@ -311,7 +311,7 @@ async function onText(link, chat, text, kind = 'text', preCtx = null) {
   if (!r.entries.length) {
     await saveDraft(link, p);
     if (r.intent === 'set_context' || said || r.site || r.shift) {
-      const b = siteId && shift ? view.boardIntro(p.payload, ctx, lang, p.id) : null;
+      const b = siteId && shift ? view.boardIntro(p.payload, ctx, lang, p.id, ctx.date < today) : null;
       if (b) return tg.sendMessage(chat.id, t(lang, 'ctx_set', { header: view.header(p.payload, ctx, lang) }), { reply_markup: b.keyboard });
       return send(chat.id, null, view.boardPicker(ctx, lang));
     }
@@ -346,7 +346,7 @@ async function onAnswer(link, chatId, text) {
   const w = p.payload.waiting;
   if (w.startsWith('t:')) {
     const key = w.slice(2);
-    const shift = key.split(':')[2] || 'Day';
+    const shift = (key === '*' ? p.payload.shift : key.split(':')[2]) || 'Day';
     const times = parseTimes(text, shift);
     if (!times) return false; // not a time answer: read it as a new message (the question stays)
     draftLib.answerTimes(p.payload, key, times);
@@ -417,7 +417,7 @@ async function pickDay(link, chatId, messageId, date) {
   if (!ctx.machines.length) return tg.editMessage(chatId, messageId, t(lang, 'no_machines', { date: d.date }));
   const one = ctx.boards.length === 1 ? ctx.boards[0] : null;
   const p = await newDraft(link, chatId, { date: d.date, siteId: one ? one.site_id : null, shift: one ? one.shift : null });
-  if (one) return send(chatId, messageId, view.boardIntro(p.payload, ctx, lang, p.id));
+  if (one) return send(chatId, messageId, view.boardIntro(p.payload, ctx, lang, p.id, d.date < businessToday()));
   return send(chatId, messageId, view.boardPicker(ctx, lang));
 }
 
@@ -432,7 +432,7 @@ async function pickBoard(link, chatId, messageId, boardKey) {
   p.payload.siteId = Number(siteId);
   p.payload.shift = shift;
   await saveDraft(link, p);
-  return send(chatId, messageId, view.boardIntro(p.payload, ctx, lang, p.id));
+  return send(chatId, messageId, view.boardIntro(p.payload, ctx, lang, p.id, date < businessToday()));
 }
 
 // ------------------------------------------------------------------ buttons
@@ -484,11 +484,17 @@ async function onCallback(cb) {
     return send(chatId, messageId, view.machineButtons(p.payload, ctx, lang, p.id));
   }
   if (kind === 'ai') {
+    // today: in at the shift start (still working). An old day: both times are asked once for all of them, because
+    // an open session on an old day overlaps the machine's later days (the app refuses it, BR-12 / BR-13).
+    const past = p.payload.date < businessToday();
     const ms = draftLib.scope(p.payload, ctx);
     for (const m of ms) {
       const b = ctx.boards.find((x) => x.site_id === m.site_id && x.shift === m.shift) || {};
-      if (!m.row && b.start && !p.payload.items.some((x) => x.key === m.key)) draftLib.tap(p.payload, m, 'in', b.start);
+      if (m.row || p.payload.items.some((x) => x.key === m.key)) continue;
+      if (past) draftLib.tap(p.payload, m, 'time');
+      else if (b.start) draftLib.tap(p.payload, m, 'in', b.start);
     }
+    if (past) p.payload.allTimes = true;
     await saveDraft(link, p);
     return showDraft(chatId, messageId, p, link);
   }
@@ -505,7 +511,8 @@ async function onCallback(cb) {
     } else if (q && q.kind === 'scope') {
       draftLib.answerScope(p.payload, q.id, a3 === 'all' || a3 === 's' ? 'all' : q.options[Number(String(a3).slice(1))], ctx, await aliases.forUser(link.user_id));
     } else if (q && q.kind === 'times' && a3 === 's') {
-      p.payload.items = p.payload.items.filter((x) => x.key !== q.key);
+      p.payload.items = p.payload.items.filter((x) => (q.key === '*' ? !x.needTimes : x.key !== q.key));
+      if (q.key === '*') p.payload.allTimes = false;
     } else if (q && q.kind === 'reason' && a3 === 's') {
       p.payload.items = p.payload.items.filter((x) => x.key !== q.key);
     }

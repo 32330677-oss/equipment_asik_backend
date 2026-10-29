@@ -123,11 +123,13 @@ function answerScope(draft, qid, boardKey, ctx, aliases = []) {
 }
 
 function answerTimes(draft, key, times) {
-  const it = draft.items.find((x) => x.key === key);
-  if (!it) return;
-  if (times.in) it.in = times.in;
-  if (times.out) it.out = times.out;
-  if (it.in || it.out) { it.needTimes = false; it.status = ''; }
+  const its = key === '*' ? draft.items.filter((x) => x.needTimes) : draft.items.filter((x) => x.key === key);
+  for (const it of its) {
+    if (times.in) it.in = times.in;
+    if (times.out) it.out = times.out;
+    if (it.in || it.out) { it.needTimes = false; it.status = ''; }
+  }
+  if (key === '*') draft.allTimes = false;
 }
 
 function answerReason(draft, key, k, text) {
@@ -157,7 +159,7 @@ function plan(draft, ctx, nowStamp) {
   for (const it of draft.items) {
     const m = ctx.machines.find((x) => x.key === it.key);
     if (!m) { missing.push({ n: null, said: it.said || it.key, why: 'not_found' }); continue; }
-    if (it.needTimes) { extra.push({ id: `t:${it.key}`, kind: 'times', key: it.key, n: m.n }); continue; }
+    if (it.needTimes) { extra.push({ id: `t:${it.key}`, kind: 'times', key: it.key, n: m.n }); continue; }  // one per machine, or one for all (below)
     const base = { said: it.said, all: false, targets: [m.n], ambiguous: false, except: [], not_found: false, meter_start: it.meterStart, meter_end: it.meterEnd };
     if (it.status) entries.push({ ...base, action: 'day_status', day_status: it.status, reason: it.reason, check_in: '', check_out: '', downtime_type: '', downtime_start: '', downtime_end: '' });
     else if (it.in || it.out) entries.push({ ...base, action: 'in_out', day_status: '', reason: '', check_in: it.in, check_out: it.out, downtime_type: '', downtime_start: '', downtime_end: '' });
@@ -171,6 +173,8 @@ function plan(draft, ctx, nowStamp) {
     return { ...q, key: m ? m.key : null, k: k === undefined ? null : k };
   });
   const open = [...draft.open.filter((q) => q.kind === 'scope'), ...draft.open.filter((q) => q.kind === 'pick')];
+  // "all came" on an old day: ONE question "from what time to what time?" for all of them
+  if (draft.allTimes && extra.length > 1) extra.splice(0, extra.length, { id: 't:*', kind: 'times', key: '*', n: null, count: extra.length });
   return { ...p, skipped: [...missing, ...p.skipped], questions: [...open, ...extra, ...reasons] };
 }
 
