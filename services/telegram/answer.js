@@ -22,6 +22,7 @@ const PLAN_TOOL = {
       from: { type: 'string', description: "first day 'YYYY-MM-DD' of the day boards to read ('' = none)" },
       to: { type: 'string', description: "last day 'YYYY-MM-DD' ('' = same as from)" },
       boards: { type: 'boolean', description: 'read the day boards from..to (machines, times, states, hours, stops, drivers)' },
+      latest: { type: 'boolean', description: 'the question asks WHEN something happened LAST ("آخر يوم", "آخر مرة", "إيمتى آخر submit", "last time"): all the last 14 days are read' },
       site: { type: 'string', description: 'site code / name if he named one, else empty' },
       shift: { type: 'string', enum: ['', 'Day', 'Night'] },
       rejected: { type: 'boolean', description: 'his rows the office rejected, with the reason' },
@@ -36,6 +37,7 @@ const PLAN_TOOL = {
 const PLAN_SYSTEM = `A construction site supervisor asks a question (Syrian Arabic dialect or English) about the RENTED MACHINES of his sites. Choose what must be read to answer it, from this menu only:
 - boards: the day board of each day from..to (at most ${MAX_DAYS} days): every machine deployed to his sites that day, its check-in / check-out, state (working, breakdown, standby, absent, holiday, no record), worked minutes, breakdown / standby minutes, stops, driver, remarks, row status (Draft / Submitted / Approved / Rejected).
 - rejected: his rows the office rejected and why. change_requests: his requests to the office to change a row, and their state. timesheets: the paper timesheets of his sites. operators: the drivers.
+Questions about the LAST time something happened ("شو آخر يوم عملنا submit", "آخر مرة تعطلت الرافعة", "إيمتى آخر يوم اشتغل البوبكات"): latest = true and boards = true (the code reads the last ${MAX_DAYS} days).
 Dates: today is given; "مبارح" = yesterday, "هالأسبوع" = from the last Saturday to today, "آخر أسبوع" = the last 7 days, "يوم 15" = the latest 15th not after today. Use the smallest range that answers.
 scope 'out_of_scope' when the menu cannot answer: prices, rates, invoices, payments, payroll, fuel cost, other people's data, or anything not about his machines (weather, jokes, general questions).`;
 
@@ -50,6 +52,7 @@ const ANSWER_SYSTEM = `You answer a construction site supervisor about the rente
 - His language: Syrian Arabic dialect if he wrote Arabic, else English. Short and clear: at most 12 lines, a short list when there are several machines.
 - Machines by their name as in the DATA (type, number, vendor). Times as HH:MM. Hours from minutes: "9 ساعات و20 دقيقة" / "9 h 20 min". worked = worked_min (already without breaks and stops).
 - Days with no record for a machine: say "ما إلها سجل". Draft rows are not sent to the office yet; say so when it matters.
+- When SEARCHED says the last ${MAX_DAYS} days were searched for the LAST time something happened: give the latest day in the DATA where it happened. If it is not in the DATA, say it did not happen in the last ${MAX_DAYS} days (give the first and last day searched), so if it was before that he looks it up in the app. Row status Submitted / Approved / Rejected means it was sent (submit); Draft means not sent.
 - Never talk about prices, invoices or money. Do not give advice beyond the question. Plain text only (no markdown).`;
 
 const hhmm = (dt) => (dt ? String(dt).slice(11, 16) : null);
@@ -118,11 +121,17 @@ async function answer({ userId, text, today, lang, log }) {
 
   const data = {};
   const valid = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')) && d <= today;
+  let searched = '';
+  if (p.latest) { // "when was the last ...": the whole window, newest first in the answer
+    Object.assign(p, { boards: true, from: addDays(today, -(MAX_DAYS - 1)), to: today });
+    searched = `\nSEARCHED: the last ${MAX_DAYS} days, ${p.from} to ${p.to} (nothing older was read).`;
+  }
   if (p.boards && valid(p.from)) {
     const to = valid(p.to) && p.to >= p.from ? p.to : p.from;
     const dates = datesBetween(p.from, to);
     if (dates.length > MAX_DAYS) return { key: 'ask_too_long', vars: { n: MAX_DAYS } };
     data.days = await readBoards(userId, dates, String(p.site || '').trim(), ['Day', 'Night'].includes(p.shift) ? p.shift : '');
+    if (p.latest) data.days.reverse(); // newest first: if the data is too long, the oldest days are the ones cut
   }
   if (p.rejected) {
     data.rejected = await readList(userId, '/api/equipment/attendance/rejected', null, (r) => ({
@@ -152,7 +161,7 @@ async function answer({ userId, text, today, lang, log }) {
   if (json.length > MAX_DATA) json = `${json.slice(0, MAX_DATA)}… (cut: too much data, answer from what is here and say the rest was too long)`;
   const ans = await ai.callTool({
     system: ANSWER_SYSTEM, tool: ANSWER_TOOL, maxTokens: 900,
-    user: `Today: ${today}. His language: ${lang === 'en' ? 'English' : 'Arabic'}.\nQuestion:\n${String(text).slice(0, 1500)}\n\nDATA:\n${json}`,
+    user: `Today: ${today}. His language: ${lang === 'en' ? 'English' : 'Arabic'}.\nQuestion:\n${String(text).slice(0, 1500)}${searched}\n\nDATA:\n${json}`,
   });
   await log('answer', ans);
   const out = String((ans.input && ans.input.answer) || '').trim();
