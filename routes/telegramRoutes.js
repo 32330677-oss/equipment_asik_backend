@@ -5,6 +5,8 @@
 //   DELETE /me                  Supervisor: unlink my Telegram
 //   GET    /links               Admin: linked accounts
 //   DELETE /links/:userId       Admin: unlink an account (reason optional)
+//   GET    /access              Admin: supervisors the bot is switched off for (open by default)
+//   PUT    /access/:userId      Admin: { allowed: true|false, reason? }
 //   POST   /setup-webhook       Admin: registers <PUBLIC_BASE_URL>/api/telegram/webhook with Telegram
 const crypto = require('crypto');
 const router = require('express').Router();
@@ -70,6 +72,24 @@ router.delete('/links/:userId', A, async (req, res) => {
   const chatId = await links.unlink(userId, req.user.user_id, reason);
   if (chatId) await tg.sendMessage(chatId, t('ar', 'unlinked_by_admin'));
   res.json({ status: 'success', data: { unlinked: Boolean(chatId) } });
+});
+
+// The Admin switches the bot off (or back on) for one supervisor. Open by default.
+router.get('/access', A, async (req, res) => {
+  res.json({ status: 'success', data: await links.listBlocked() });
+});
+
+router.put('/access/:userId', A, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId) || userId < 1) throw AppError.validation({ userId: 'must be a positive integer' });
+  if (typeof (req.body && req.body.allowed) !== 'boolean') throw AppError.validation({ allowed: 'true or false' });
+  const reason = req.body.reason ? String(req.body.reason).trim().slice(0, 500) || null : null;
+  const r = await links.setAccess(userId, req.body.allowed, req.user.user_id, reason);
+  if (r.chat_id && r.changed) {
+    const [[l]] = await require('../config/db').pool.execute('SELECT language FROM tg_links WHERE user_id = ?', [userId]);
+    await tg.sendMessage(r.chat_id, t(l ? l.language : 'ar', r.allowed ? 'access_back' : 'blocked_by_admin'));
+  }
+  res.json({ status: 'success', data: { user_id: userId, allowed: r.allowed } });
 });
 
 router.post('/setup-webhook', A, async (req, res) => {

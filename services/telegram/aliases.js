@@ -9,6 +9,25 @@ function normalize(s) {
     .replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 120);
 }
 
+// Words that only say WHICH KIND and WHICH NUMBER ("الحفارة 1", "excavator two"): such a name fits every vendor's
+// machine of that type and number, so it is never learned (the bot keeps asking which one).
+const TYPE_WORDS = ['حفاره', 'بوكلين', 'باكر', 'لودر', 'تركس', 'شيول', 'قلاب', 'شاحنه', 'تريلا', 'كرين', 'رافعه', 'بلدوزر', 'دوزر',
+  'كومبرسه', 'مدحله', 'رصاصه', 'جريدر', 'بوبكات', 'مولده', 'تيليهاندلر', 'تلي', 'هاندلر', 'تلسكوبي', 'تلسكوبيه', 'اليه', 'ماكينه', 'مكنه'];
+const NUMBER_WORDS = ['واحد', 'وحده', 'اول', 'الاول', 'اولي', 'اتنين', 'تنين', 'اثنين', 'تاني', 'ثاني', 'تلاته', 'ثلاثه', 'تالت', 'ثالث',
+  'اربعه', 'رابع', 'خمسه', 'خامس', 'سته', 'سادس', 'سبعه', 'سابع', 'تمانه', 'ثمانيه', 'تامن', 'تسعه', 'تاسع', 'عشره', 'عاشر',
+  'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'first', 'second', 'third', 'no', 'number', 'رقم'];
+
+/** True when the words say only a type and / or a number (nothing that names ONE machine). */
+function isGeneric(said, machines = []) {
+  const types = new Set(TYPE_WORDS);
+  for (const m of machines) {
+    for (const w of normalize(`${m.type_name || ''} ${m.type_name_ar || ''}`).split(' ')) if (w) types.add(w.replace(/^ال/, ''));
+  }
+  const words = normalize(said).split(' ').filter(Boolean).map((w) => w.replace(/^ال(?=..)/, ''));
+  if (!words.length) return true;
+  return words.every((w) => /^\d+$/.test(w) || types.has(w) || NUMBER_WORDS.includes(w) || NUMBER_WORDS.includes(`ال${w}`));
+}
+
 async function save(userId, said, equipmentId) {
   const text = normalize(said);
   if (!text || text.length < 2) return;
@@ -26,4 +45,4 @@ async function forUser(userId) {
   } catch (_) { return []; }
 }
 
-module.exports = { save, forUser, normalize };
+module.exports = { save, forUser, normalize, isGeneric };
