@@ -2,7 +2,7 @@
 // Nothing is written to attendance before he confirms; an open proposal expires after EXPIRE_MINUTES.
 const { pool } = require('../../config/db');
 
-const EXPIRE_MINUTES = 60;
+const EXPIRE_MINUTES = 180; // a draft lives as long as the session (3 hours without a message)
 
 async function open(userId, chatId, payload) {
   await pool.execute("UPDATE tg_pending SET status = 'Cancelled' WHERE user_id = ? AND status = 'Open'", [userId]);

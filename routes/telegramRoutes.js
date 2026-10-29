@@ -92,6 +92,13 @@ router.put('/access/:userId', A, async (req, res) => {
   res.json({ status: 'success', data: { user_id: userId, allowed: r.allowed } });
 });
 
+// The conversation of one supervisor with the bot (kept BOT_KEEP_CHAT_DAYS days), for the Admin to check mistakes.
+router.get('/chat-log/:userId', A, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId) || userId < 1) throw AppError.validation({ userId: 'must be a positive integer' });
+  res.json({ status: 'success', data: await require('../services/telegram/chatlog').list(userId, req.query.limit) });
+});
+
 router.post('/setup-webhook', A, async (req, res) => {
   if (!tg.configured()) throw new AppError(503, 'TELEGRAM_NOT_CONFIGURED', 'Set TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET (16+ characters) first.');
   if (!/^https:\/\//.test(env.telegram.publicUrl)) throw new AppError(503, 'PUBLIC_URL_MISSING', 'Set PUBLIC_BASE_URL (https://...) first.');

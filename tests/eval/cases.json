@@ -1,0 +1,39 @@
+{
+  "today": "2026-10-29",
+  "machines": [
+    { "key": 1, "type": "Pick-up", "vendor": "Mohammad Alsagheer" },
+    { "key": 2, "type": "Bobcat", "seq": 1, "vendor": "Ahmad Monsi Al-Thani" },
+    { "key": 3, "type": "Telehandler", "vendor": "Abo Fahed Akeel" },
+    { "key": 4, "type_ar": "تركس", "vendor": "Al-Deeb" },
+    { "key": 5, "type": "Bobcat", "seq": 1, "vendor": "Al-Deeb" },
+    { "key": 6, "type_ar": "مدحلة", "vendor": "Al-Deeb" },
+    { "key": 7, "type_ar": "رافعة متحركة", "vendor": "Al-Deeb" },
+    { "key": 8, "type_ar": "تركس", "vendor": "Al-Shahem" },
+    { "key": 9, "type": "GCB", "seq": 1, "vendor": "Al-Shahem" },
+    { "key": 10, "type": "Mini Excavator", "vendor": "Al-Shahem" },
+    { "key": 11, "type": "Bobcat", "seq": 1, "vendor": "Al-Hamshari" },
+    { "key": 12, "type": "Bobcat", "seq": 2, "vendor": "Al-Hamshari" },
+    { "key": 13, "type_ar": "صهريج مياه", "vendor": "Bilal Abed-Alnabi" },
+    { "key": 14, "type_ar": "جريدر", "vendor": "Fayez Moussa-Abo Omran" },
+    { "key": 15, "type": "Bobcat", "seq": 3, "vendor": "Al-Deeb" },
+    { "key": 16, "type_ar": "حفارة", "vendor": "Al-Shahem" },
+    { "key": 17, "type": "GCB", "seq": 2, "vendor": "Al-Shahem" }
+  ],
+  "cases": [
+    { "text": "بدي دخّل حضور الآليات لتاريخ 28 أكتوبر", "expect": { "intent": "set_context", "work_date": "2026-10-28", "count": 0 } },
+    { "text": "بوبكات 1 تبع أحمد منسي الثاني ساعة الدخول 8 وساعة الخروج 5 مع الاستراحة", "expect": { "intent": "record", "items": [{ "key": 2, "check_in": "08:00", "check_out": "17:00" }], "no_downtime": true } },
+    { "text": "بدي دخّل بوبكات 1 تبع أحمد منسي الثاني ساعة الدخول والخروج", "expect": { "intent": "record", "items": [{ "key": 2, "action": "need_times" }] } },
+    { "text": "8 لـ 5", "times": { "in": "08:00", "out": "17:00" } },
+    { "text": "ساعة الدخول 8، ساعة الخروج 5", "times": { "in": "08:00", "out": "17:00" } },
+    { "text": "البوبكات التاني تبع الحمشري ما إجا اليوم", "expect": { "intent": "record", "items": [{ "key": 12, "day_status": "Absent" }] } },
+    { "text": "التركس تبع الشهم دخل 7 وطلع 4 ونص", "expect": { "intent": "record", "items": [{ "key": 8, "check_in": "07:00", "check_out": "16:30" }] } },
+    { "text": "الجي سي بي 2 معطل اليوم كله خربان الهيدروليك", "expect": { "intent": "record", "items": [{ "key": 17, "day_status": "Breakdown" }] } },
+    { "text": "بوبكات 1 دخل 7", "expect": { "intent": "record", "items": [{ "key": "ask", "check_in": "07:00" }] } },
+    { "text": "كل الآليات إجت الساعة 7 إلا الجريدر ما إجا", "expect": { "intent": "record", "all": true, "items": [{ "key": 14, "day_status": "Absent" }] } },
+    { "text": "التيليهاندلر من 7 لـ 5 مع استراحة الغدا", "expect": { "intent": "record", "items": [{ "key": 3, "check_in": "07:00", "check_out": "17:00" }], "no_downtime": true } },
+    { "text": "الحفارة الصغيرة تبع الشهم طلعت 3", "expect": { "intent": "record", "items": [{ "key": 10, "check_out": "15:00" }] } },
+    { "text": "الصهريج تبع بلال من 8 لل 4", "expect": { "intent": "record", "items": [{ "key": 13, "check_in": "08:00", "check_out": "16:00" }] } },
+    { "text": "شو ناقص اليوم؟", "expect": { "intent": "not_recorded" } },
+    { "text": "سجل مبارح البيكاب من 7 لـ 5", "expect": { "intent": "record", "work_date": "yesterday", "items": [{ "key": 1, "check_in": "07:00", "check_out": "17:00" }] } }
+  ]
+}

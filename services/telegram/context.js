@@ -27,11 +27,13 @@ async function load(userId, date) {
       continue;
     }
     const access = (day.data && day.data.access) || {};
-    boards.push({ site_id: s.site_id, site_code: s.site_code, site_name: s.site_name, shift, can_edit: access.can_edit !== false, reason: access.reason || null, summary: day.data.summary });
+    const site = (day.data && day.data.site) || {};
+    const start = site.shift_start ? String(site.shift_start).slice(0, 5) : null;
+    boards.push({ site_id: s.site_id, site_code: s.site_code, site_name: s.site_name, shift, start, can_edit: access.can_edit !== false, reason: access.reason || null, summary: day.data.summary });
     for (const m of (day.data && day.data.machines) || []) {
       const a = m.attendance;
       machines.push({
-        n: machines.length + 1, equipment_id: m.equipment_id, site_id: s.site_id, site_code: s.site_code, shift,
+        n: machines.length + 1, key: `${m.equipment_id}:${s.site_id}:${shift}`, equipment_id: m.equipment_id, site_id: s.site_id, site_code: s.site_code, shift,
         code: m.equipment_code, type_name: m.type_name, type_name_ar: m.type_name_ar, type_seq: m.type_seq, vendor_name: m.vendor_name,
         plate: m.plate_number, operator: m.default_operator_name, state: m.live_state,
         row: a ? { id: a.eq_attendance_id, status: a.status, day_status: a.day_status, in: a.check_in_time, out: a.check_out_time, from_previous_day: Boolean(a.from_previous_day) } : null,

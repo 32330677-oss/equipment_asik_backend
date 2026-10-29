@@ -198,7 +198,7 @@ exports.siteDay = async (req, res) => {
   res.json({
     status: 'success',
     data: {
-      site: { site_id: site.site_id, site_code: site.site_code, site_name: site.site_name, shift_type: shift },
+      site: { site_id: site.site_id, site_code: site.site_code, site_name: site.site_name, shift_type: shift, shift_start: (shift === 'Night' ? site.night_shift_start : site.day_shift_start) || null },
       date, summary, machines: out,
       submit: { draft_rows: Number(drafts.n), open_rows: Number(drafts.open_rows || 0), can_submit: !denial && Number(drafts.n) > 0 && !Number(drafts.open_rows || 0) && !gate.blocked, week_gate: gate, submitted_rows: Number(submitted.n) },
       // historical visibility is not editing permission: the app shows the day read-only when can_edit is false
