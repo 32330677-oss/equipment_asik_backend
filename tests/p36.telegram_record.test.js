@@ -22,6 +22,8 @@ let F;
 let excB; // a second "Excavator 1" (another vendor) on the same board
 let reply = null; // (listText) -> tool input of the fake AI
 let aiCalls = 0;
+let planReply = () => ({ scope: 'out_of_scope' });
+let answerReply = () => ({ answer: '' });
 
 const hook = (update) => h.api().post('/api/telegram/webhook').set('X-Telegram-Bot-Api-Secret-Token', SECRET).send(update);
 const say = (text) => hook({ update_id: Date.now(), message: { message_id: 1, chat: { id: CHAT, type: 'private' }, from: { id: CHAT }, text } });
@@ -71,7 +73,9 @@ after(async () => {
 function fakeAi() {
   ai.setTransport(async (request) => {
     aiCalls += 1;
-    const input = reply(request.messages[0].content);
+    const tool = request.tools[0].name;
+    const content = request.messages[0].content;
+    const input = tool === 'plan_reads' ? planReply(content) : tool === 'write_answer' ? answerReply(content) : reply(content);
     return { content: [{ type: 'tool_use', name: request.tools[0].name, input }], usage: { input_tokens: 10, output_tokens: 5 } };
   });
 }
@@ -246,4 +250,84 @@ test('builder rules (no database): dates, night shift times, contradictions, che
   ] } });
   assert.deepStrictEqual(plan.steps, []);
   assert.deepStrictEqual(plan.skipped.map((s) => s.why).sort(), ['conflict', 'no_check_in']);
+});
+
+test('"which machines do I have": the list per site / shift with vendor and state (nothing proposed)', async () => {
+  reply = () => ({ intent: 'machines', entries: [] });
+  sent = [];
+  const before = (await h.query('SELECT COUNT(*) AS n FROM tg_pending'))[0].n;
+  await say('شو الآليات الموجودة بالـ S08 نهاري؟');
+  assert.match(last().text, /آلياتك/);
+  assert.match(last().text, /Second Vendor/);
+  assert.match(last().text, /Al-Bunyan/);
+  assert.strictEqual((await h.query('SELECT COUNT(*) AS n FROM tg_pending'))[0].n, before, 'no proposal');
+});
+
+test('a reading with nothing to record never gives an empty proposal', async () => {
+  reply = () => ({ intent: 'other', entries: [E({ said: 'الآليات', all: true, action: 'day_status', day_status: '' })] });
+  sent = [];
+  const before = (await h.query('SELECT COUNT(*) AS n FROM tg_pending'))[0].n;
+  await say('شو في؟');
+  assert.match(last().text, /ما لقيت برسالتك شي لسجّله/);
+  assert.doesNotMatch(last().text, /رح سجّل/);
+  assert.strictEqual((await h.query('SELECT COUNT(*) AS n FROM tg_pending'))[0].n, before);
+});
+
+test('a typed "yes" confirms the open proposal like the button; with nothing open it says so', async () => {
+  reply = (list) => ({ intent: 'record', entries: [E({ said: 'اللودر', targets: [nOf(list, F.loader.equipment_code)], action: 'check_out', check_out: '11:40' })] });
+  await say('لا اللودر طلع 11:40');
+  assert.match(last().text, /تعديل الخروج 11:30 ← 11:40/);
+  reply = () => ({ intent: 'confirm', entries: [] });
+  sent = [];
+  await say('اي');
+  assert.match(last().text, /سجّلت 1 آلية/);
+  assert.strictEqual((await row(F.loader.equipment_id)).check_out_time, '2026-10-20 11:40:00');
+  sent = [];
+  await say('تمام');
+  assert.match(last().text, /ما في شي ناطر تأكيد/);
+});
+
+test('short known replies are understood by the code alone (no AI call)', async () => {
+  const before = aiCalls;
+  sent = [];
+  await say('شو الوضع؟');
+  assert.match(last().text, /وضع آلياتك اليوم/);
+  await say('شو ناقص');
+  assert.match(last().text, /شو ناقص/);
+  await say('شو آلياتي');
+  assert.match(last().text, /آلياتك/);
+  await say('لا');
+  assert.match(last().text, /ما في شي ناطر تأكيد/);
+  assert.strictEqual(aiCalls, before, 'none of these called the AI');
+});
+
+test('a question: the AI picks what to read, the code reads it as the supervisor, the answer comes from that data', async () => {
+  reply = () => ({ intent: 'question', entries: [] });
+  planReply = () => ({ scope: 'machines', from: '2026-10-20', to: '2026-10-20', boards: true, rejected: true });
+  let data = '';
+  answerReply = (content) => { data = content; return { answer: 'الحفارة 1 تبع البنيان اشتغلت اليوم من 07:00 لـ 11:00.' }; };
+  const before = aiCalls;
+  sent = [];
+  await say('قديش اشتغلت الحفارة تبع البنيان اليوم؟');
+  assert.strictEqual(last().text, 'الحفارة 1 تبع البنيان اشتغلت اليوم من 07:00 لـ 11:00.');
+  assert.strictEqual(aiCalls - before, 3, 'read the message, plan the reads, write the answer');
+  assert.match(data, /Al-Bunyan/);
+  assert.match(data, /"worked_min"/);
+  assert.match(data, /"rejected":\[/);
+  assert.doesNotMatch(data, /hourly_rate|daily_rate|monthly_rate|price/i, 'no money in what the supervisor can read');
+});
+
+test('a question about prices is out of scope; a period over 14 days is refused (nothing read)', async () => {
+  reply = () => ({ intent: 'question', entries: [] });
+  planReply = () => ({ scope: 'out_of_scope' });
+  let answered = false;
+  answerReply = () => { answered = true; return { answer: 'x' }; };
+  sent = [];
+  await say('قديش سعر ساعة الحفارة؟');
+  assert.match(last().text, /برا اللي بقدر جاوب عليه/);
+  planReply = () => ({ scope: 'machines', from: '2026-09-25', to: '2026-10-20', boards: true });
+  sent = [];
+  await say('كم ساعة اشتغلت الحفارة هالشهر؟');
+  assert.match(last().text, /14 يوم أو أقل/);
+  assert.strictEqual(answered, false);
 });

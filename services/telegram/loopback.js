@@ -14,6 +14,11 @@ const { passwordVersion } = require('../../middleware/requireAuth');
 const ALLOWED = [
   { method: 'GET', path: /^\/api\/equipment\/my-sites$/ },
   { method: 'GET', path: /^\/api\/equipment\/attendance\/site\/\d+$/ },
+  // reading only, for answering his questions (the routes scope everything to the supervisor)
+  { method: 'GET', path: /^\/api\/equipment\/attendance\/rejected$/ },
+  { method: 'GET', path: /^\/api\/equipment\/attendance\/change-requests$/ },
+  { method: 'GET', path: /^\/api\/equipment\/timesheets$/ },
+  { method: 'GET', path: /^\/api\/equipment\/operators$/ },
   { method: 'POST', path: /^\/api\/equipment\/attendance\/check-in$/ },
   { method: 'POST', path: /^\/api\/equipment\/attendance\/\d+\/check-out$/ },
   { method: 'POST', path: /^\/api\/equipment\/attendance\/day-status$/ },
