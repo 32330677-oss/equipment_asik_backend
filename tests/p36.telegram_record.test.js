@@ -273,13 +273,15 @@ test('guided mode: Record a day -> day -> all came at the usual time -> one mach
   assert.match(p.text, /رافعة متحركة 1 · Al-Bunyan[^:\n]*: غايبة/);
   await tap(button(/سجّل \(4\)/, p));
   assert.strictEqual((await row(F.crane.equipment_id, '2026-10-18')).day_status, 'Absent');
-  assert.strictEqual((await row(F.loader.equipment_id, '2026-10-18')).check_in_time, '2026-10-18 07:00:00');
-  // the Al-Bunyan excavator is still checked in on the 20th: the app refuses a second open session (BR-12) and the
-  // bot says why, the other machines are recorded
-  assert.match(last().text, /سجّلت 3 آلية/);
-  assert.match(last().text, /still checked in/);
-  assert.strictEqual(await row(F.exc.equipment_id, '2026-10-18'), undefined);
-  assert.strictEqual(await count('2026-10-18'), 3);
+  // an open check-in on a past day meets the app's own rules (nothing decided by the bot):
+  //   the Al-Bunyan excavator is still checked in on the 20th (BR-12: one open session per machine);
+  //   the loader and the second excavator have sessions after the 18th, and an open session would overlap them (BR-13)
+  const res = last().text;
+  assert.match(res, /سجّلت 1 آلية/);
+  assert.match(res, /still checked in/);
+  assert.match(res, /overlap/);
+  for (const m of [F.exc, F.loader, excB]) assert.strictEqual(await row(m.equipment_id, '2026-10-18'), undefined, 'refused: nothing half written');
+  assert.strictEqual(await count('2026-10-18'), 1);
 });
 
 test('"today" brings the session back to today; short replies are read by the code alone', async () => {
