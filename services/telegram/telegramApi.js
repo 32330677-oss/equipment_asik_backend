@@ -39,11 +39,17 @@ async function callApi(method, payload = {}) {
   }
 }
 
+let onSent = null;
+/** A hook called with (chatId, text) after every message sent or edited (the conversation log). */
+function setOnSent(fn) { onSent = fn; }
+function sent(chatId, text) { if (onSent) Promise.resolve(onSent(chatId, text)).catch(() => {}); }
+
 /** Sends a message (HTML), cut to Telegram's limit. Never throws: returns the message or null. */
 async function sendMessage(chatId, text, extra = {}) {
   let t = String(text || '');
   if (t.length > MAX_TEXT) t = `${t.slice(0, MAX_TEXT - 1)}…`;
   try {
+    sent(chatId, t);
     return await callApi('sendMessage', { chat_id: chatId, text: t, parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
   } catch (e) {
     console.error('Telegram sendMessage failed:', e.message);
@@ -57,6 +63,7 @@ async function editMessage(chatId, messageId, text, extra = {}) {
   if (t.length > MAX_TEXT) t = `${t.slice(0, MAX_TEXT - 1)}…`;
   if (messageId) {
     try {
+      sent(chatId, t);
       return await callApi('editMessageText', { chat_id: chatId, message_id: messageId, text: t, parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
     } catch (e) {
       if (/not modified/i.test(e.message)) return null;
@@ -88,4 +95,4 @@ function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-module.exports = { callApi, sendMessage, editMessage, answerCallback, downloadFile, setDownloader, esc, configured, enabled, setTransport, MAX_TEXT };
+module.exports = { setOnSent, callApi, sendMessage, editMessage, answerCallback, downloadFile, setDownloader, esc, configured, enabled, setTransport, MAX_TEXT };

@@ -16,8 +16,22 @@ function name(ctx, n, lang) {
   return manyBoards(ctx) ? `${base} (${m.site_code} ${t(lang, `shift_${m.shift}`)})` : base;
 }
 
+function nameByKey(ctx, key, lang) {
+  const m = ctx.machines.find((x) => x.key === key);
+  return m ? name(ctx, m.n, lang) : '?';
+}
+
+/** "📅 2026-10-28 · 📍 S-BRIDGES · نهاري": what the draft is about. */
+function header(draft, ctx, lang) {
+  const b = draft && draft.siteId ? ctx.boards.find((x) => x.site_id === draft.siteId && (!draft.shift || x.shift === draft.shift)) : null;
+  const parts = [`📅 <b>${esc(ctx.date)}</b>`];
+  if (b) parts.push(`📍 <b>${esc(b.site_code)}</b>`);
+  if (draft && draft.shift) parts.push(t(lang, `shift_${draft.shift}`));
+  return parts.join(' · ');
+}
+
 function boardLabel(ctx, key, lang) {
-  const [siteId, shift] = String(key).split('|');
+  const [siteId, shift] = String(key).split(':');
   const b = ctx.boards.find((x) => String(x.site_id) === siteId && x.shift === shift) || {};
   return `${b.site_code || siteId} · ${t(lang, `shift_${shift}`)}`;
 }
@@ -53,8 +67,8 @@ function cut(lines) {
 }
 
 /** The proposal: what will be recorded, what not and why, the questions still open, with its buttons. */
-function proposal(plan, ctx, lang, id) {
-  const out = [t(lang, 'proposal_title', { date: ctx.date })];
+function proposal(plan, ctx, lang, id, draft = null) {
+  const out = [`${t(lang, 'proposal_title', { date: '' }).replace(/\s*·\s*$/, '')}\n${header(draft, ctx, lang)}`];
   if (plan.lines.length) out.push(cut(plan.lines.map((l) => lineText(l, ctx, lang))).join('\n'));
   if (plan.skipped.length) out.push(`${t(lang, 'skipped_title')}\n${cut(plan.skipped.map((s) => skippedText(s, ctx, lang))).join('\n')}`);
   if (plan.questions.length) out.push(t(lang, 'questions_count', { n: plan.questions.length }));
@@ -62,7 +76,7 @@ function proposal(plan, ctx, lang, id) {
   const row = [];
   if (n) row.push({ text: t(lang, plan.questions.length ? 'btn_confirm_clear' : 'btn_confirm', { n }), callback_data: `c|${id}` });
   if (plan.questions.length) row.push({ text: t(lang, 'btn_answer', { n: plan.questions.length }), callback_data: `a|${id}` });
-  const keys = [row, [{ text: t(lang, 'btn_cancel'), callback_data: `x|${id}` }]].filter((r) => r.length);
+  const keys = [row, [{ text: t(lang, 'btn_each'), callback_data: `ml|${id}` }, { text: t(lang, 'btn_cancel'), callback_data: `x|${id}` }]].filter((r) => r.length);
   return { text: out.join('\n\n'), keyboard: { inline_keyboard: keys } };
 }
 
@@ -70,13 +84,18 @@ function proposal(plan, ctx, lang, id) {
 function question(q, ctx, lang, id) {
   const skip = { text: t(lang, 'btn_skip'), callback_data: `q|${id}|${q.id}|s` };
   if (q.kind === 'pick') {
-    const keys = q.options.map((n) => [{ text: name(ctx, n, lang).slice(0, 60), callback_data: `q|${id}|${q.id}|${n}` }]);
-    return { text: t(lang, 'q_pick', { said: esc(q.said) }), keyboard: { inline_keyboard: [...keys, [skip]] } };
+    const keys = q.candidates.map((key, k) => [{ text: nameByKey(ctx, key, lang).slice(0, 60), callback_data: `q|${id}|${q.id}|${k}` }]);
+    const text = q.candidates.length && !q.weak ? t(lang, 'q_pick', { said: esc(q.said) }) : t(lang, 'q_pick_none', { said: esc(q.said) });
+    return { text, keyboard: { inline_keyboard: [...keys, [skip]] } };
   }
   if (q.kind === 'scope') {
-    const keys = q.options.map((key, k) => [{ text: boardLabel(ctx, key, lang), callback_data: `q|${id}|scope|b${k}` }]);
-    keys.push([{ text: t(lang, 'btn_all'), callback_data: `q|${id}|scope|all` }]);
+    const keys = q.options.map((key, k) => [{ text: boardLabel(ctx, key, lang), callback_data: `q|${id}|${q.id}|b${k}` }]);
+    keys.push([{ text: t(lang, 'btn_all'), callback_data: `q|${id}|${q.id}|all` }]);
     return { text: t(lang, 'q_scope'), keyboard: { inline_keyboard: keys } };
+  }
+  if (q.kind === 'times') {
+    if (q.key === '*') return { text: t(lang, 'q_times_all', { n: q.count }), keyboard: { inline_keyboard: [[skip]] } };
+    return { text: t(lang, 'q_times', { name: esc(nameByKey(ctx, q.key, lang)) }), keyboard: { inline_keyboard: [[skip]] } };
   }
   const what = t(lang, q.downtime ? `dt_${q.status}` : `ds_${q.status}`);
   return { text: t(lang, 'q_reason', { name: esc(name(ctx, q.n, lang)), what }), keyboard: { inline_keyboard: [[skip]] } };
@@ -132,4 +151,56 @@ function machineList(ctx, lang) {
   return out.join('\n\n');
 }
 
-module.exports = { proposal, question, result, notRecorded, machineList, name };
+/** Guided mode: which day? */
+function dayPicker(lang, today, addDays) {
+  const d = [today, addDays(today, -1), addDays(today, -2)];
+  return { text: t(lang, 'g_day'), keyboard: { inline_keyboard: [[
+    { text: t(lang, 'g_today'), callback_data: `d|${d[0]}` }, { text: t(lang, 'g_yesterday'), callback_data: `d|${d[1]}` }, { text: d[2], callback_data: `d|${d[2]}` },
+  ]] } };
+}
+
+/** Guided mode: which site / shift? */
+function boardPicker(ctx, lang) {
+  const keys = ctx.boards.map((b) => [{ text: `${b.site_code} · ${t(lang, `shift_${b.shift}`)}`, callback_data: `b|${b.site_id}:${b.shift}` }]);
+  return { text: `${header(null, ctx, lang)}\n${t(lang, 'g_board')}`, keyboard: { inline_keyboard: keys } };
+}
+
+/** Guided mode: the board chosen; what next. */
+function boardIntro(draft, ctx, lang, id, past = false) {
+  const ms = ctx.machines.filter((m) => m.site_id === draft.siteId && m.shift === draft.shift);
+  const b = ctx.boards.find((x) => x.site_id === draft.siteId && x.shift === draft.shift) || {};
+  const free = ms.filter((m) => !m.row).length;
+  const keys = [];
+  // today: they came at the shift start (still working); an old day: one question for both times
+  if (past && free) keys.push([{ text: t(lang, 'btn_all_in_past', { n: free }), callback_data: `ai|${id}` }]);
+  else if (b.start && free) keys.push([{ text: t(lang, 'btn_all_in', { t: b.start, n: free }), callback_data: `ai|${id}` }]);
+  keys.push([{ text: t(lang, 'btn_each'), callback_data: `ml|${id}` }]);
+  return { text: `${header(draft, ctx, lang)}\n${t(lang, 'g_intro', { n: ms.length, free })}`, keyboard: { inline_keyboard: keys } };
+}
+
+/** Guided mode: every machine of the board as a button (with what the draft or the board says about it). */
+function machineButtons(draft, ctx, lang, id) {
+  const ms = ctx.machines.filter((m) => (!draft.siteId || m.site_id === draft.siteId) && (!draft.shift || m.shift === draft.shift)).slice(0, 40);
+  const keys = ms.map((m) => {
+    const it = draft.items.find((x) => x.key === m.key);
+    const mark = it ? (it.status === 'Absent' ? '❌' : it.status ? '🔧' : it.needTimes ? '⏰' : '✅') : (m.row ? '☑️' : '▫️');
+    return [{ text: `${mark} ${machineName(m, lang)}`.slice(0, 60), callback_data: `m|${id}|${m.key}` }];
+  });
+  keys.push([{ text: t(lang, 'btn_show_draft'), callback_data: `a|${id}` }]);
+  return { text: `${header(draft, ctx, lang)}\n${t(lang, 'g_pick_machine')}`, keyboard: { inline_keyboard: keys } };
+}
+
+/** Guided mode: what happened to this machine? */
+function machineMenu(m, start, ctx, lang, id) {
+  const k = m.key;
+  const row1 = [];
+  if (start) row1.push({ text: t(lang, 'btn_m_in', { t: start }), callback_data: `t|${id}|${k}|in` });
+  row1.push({ text: t(lang, 'btn_m_time'), callback_data: `t|${id}|${k}|time` });
+  return { text: `<b>${esc(name(ctx, m.n, lang))}</b>`, keyboard: { inline_keyboard: [
+    row1,
+    [{ text: t(lang, 'btn_m_abs'), callback_data: `t|${id}|${k}|abs` }, { text: t(lang, 'btn_m_brk'), callback_data: `t|${id}|${k}|brk` }],
+    [{ text: t(lang, 'btn_m_del'), callback_data: `t|${id}|${k}|del` }, { text: t(lang, 'btn_back'), callback_data: `ml|${id}` }],
+  ] } };
+}
+
+module.exports = { proposal, question, result, notRecorded, machineList, name, header, dayPicker, boardPicker, boardIntro, machineButtons, machineMenu };
