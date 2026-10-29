@@ -126,7 +126,7 @@ test('a check-out with the meter; a time still to come is refused before anythin
   assert.strictEqual((await row(F.crane.equipment_id)).check_out_time, null);
 });
 
-test('"excavator 1" at two vendors: the bot asks which one, learns the answer, then records', async () => {
+test('"excavator 1" at two vendors: the bot asks which one; a special name is learned, "excavator 1" never is', async () => {
   reply = (list) => ({ intent: 'record', entries: [E({ said: 'حفارة 1', targets: [nOf(list, F.exc.equipment_code), nOf(list, excB.equipment_code)], ambiguous: true, action: 'check_out', check_out: '11:00' })] });
   sent = [];
   await say('حفارة 1 طلعت 11');
@@ -140,13 +140,22 @@ test('"excavator 1" at two vendors: the bot asks which one, learns the answer, t
   await tap(button(/سجّل \(1\)/));
   assert.strictEqual((await row(excB.equipment_id)).check_out_time, '2026-10-20 11:00:00');
   assert.strictEqual((await row(F.exc.equipment_id)).check_out_time, null, 'the other excavator is untouched');
+  assert.strictEqual((await h.query('SELECT * FROM eq_machine_aliases WHERE user_id = 3')).length, 0,
+    '"excavator 1" fits both vendors: it is not learned, the bot will ask again next time');
+  // a name of his own for one machine IS learned (picked, then cancelled: nothing recorded)
+  reply = (list) => ({ intent: 'record', entries: [E({ said: 'البوكلين الكبير', targets: [nOf(list, F.exc.equipment_code), nOf(list, excB.equipment_code)], ambiguous: true, action: 'check_out', check_out: '11:15' })] });
+  await say('البوكلين الكبير طلع 11 وربع');
+  await tap(button(/أجب/));
+  await tap(button(/Al-Bunyan/));
+  await tap(button(/إلغاء/));
   const [alias] = await h.query('SELECT alias_text, equipment_id FROM eq_machine_aliases WHERE user_id = 3');
-  assert.strictEqual(alias.equipment_id, excB.equipment_id);
+  assert.strictEqual(alias.equipment_id, F.exc.equipment_id);
+  assert.strictEqual((await row(F.exc.equipment_id)).check_out_time, null, 'cancelled: nothing recorded');
   // the next message gives the AI his name for it
   let seen = '';
   reply = (list) => { seen = list; return { intent: 'help', entries: [] }; };
   await say('كيف بستعمل البوت');
-  assert.match(seen, /His names: «حفاره 1»/);
+  assert.match(seen, /His names: «البوكلين الكبير»/);
 });
 
 test('a breakdown with no reason: the bot asks, the next message is the reason; the session of that day is replaced', async () => {

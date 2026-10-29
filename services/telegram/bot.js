@@ -245,7 +245,9 @@ async function onCallback(cb) {
       else if (q.kind === 'pick' && q.options.includes(Number(val))) {
         answers[qid] = Number(val);
         const m = ctx.machines.find((x) => x.n === Number(val));
-        if (m && q.said) await aliases.save(link.user_id, q.said, m.equipment_id);
+        // learn his name for it, unless the words only say a type and a number (that fits several vendors' machines)
+        const candidates = q.options.map((n) => ctx.machines.find((x) => x.n === n)).filter(Boolean);
+        if (m && q.said && !aliases.isGeneric(q.said, candidates)) await aliases.save(link.user_id, q.said, m.equipment_id);
       } else if (q.kind === 'scope') {
         answers.scope = val === 'all' ? 'all' : q.options[Number(String(val).slice(1))] || 'all';
       }
