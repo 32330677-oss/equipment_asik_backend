@@ -200,7 +200,9 @@ exports.siteDay = async (req, res) => {
     data: {
       site: { site_id: site.site_id, site_code: site.site_code, site_name: site.site_name, shift_type: shift, shift_start: (shift === 'Night' ? site.night_shift_start : site.day_shift_start) || null },
       date, summary, machines: out,
-      submit: { draft_rows: Number(drafts.n), open_rows: Number(drafts.open_rows || 0), can_submit: !denial && Number(drafts.n) > 0 && !Number(drafts.open_rows || 0) && !gate.blocked, week_gate: gate, submitted_rows: Number(submitted.n) },
+      submit: { draft_rows: Number(drafts.n), open_rows: Number(drafts.open_rows || 0), can_submit: !denial && Number(drafts.n) > 0 && !Number(drafts.open_rows || 0) && !gate.blocked, week_gate: gate, submitted_rows: Number(submitted.n),
+        // 1 Nov 2026: the rows that can go while the open ones (or rows chosen by the supervisor) stay Draft
+        can_submit_partial: !denial && Number(drafts.n) > Number(drafts.open_rows || 0) && !gate.blocked },
       // historical visibility is not editing permission: the app shows the day read-only when can_edit is false
       access: { can_edit: !denial, reason: denial, late_after_days: await settings.getInt('eq_late_entry_days'), days_old: daysLate(date) },
     },
@@ -588,8 +590,14 @@ exports.cancel = async (req, res) => {
 };
 
 // ------------------------------------------------------------------ submit / rejected / resubmit
+/**
+ * Submit a day (site + shift + date): every Draft row goes to the office. 1 Nov 2026: leave_draft_ids keeps some rows of
+ * the day as Draft (still editable by the supervisor, submitted later the same way); a session still open must be kept
+ * that way on purpose, otherwise the day is refused as before (OPEN_SESSIONS). Without leave_draft_ids nothing changed.
+ */
 exports.submit = async (req, res) => {
-  const d = validate(req.body, { site_id: v.id({ required: true }), shift_type: SHIFT, record_date: v.date({ required: true }) });
+  const d = validate(req.body, { site_id: v.id({ required: true }), shift_type: SHIFT, record_date: v.date({ required: true }), leave_draft_ids: v.ids() });
+  const keep = new Set((d.leave_draft_ids || []).map(Number));
   const result = await withTransaction(async (conn) => {
     await assertCanActOnSite(req.user, d.site_id, d.shift_type, d.record_date, conn);
     const [rows] = await conn.execute(
@@ -597,28 +605,43 @@ exports.submit = async (req, res) => {
        WHERE ea.site_id = ? AND ea.shift_type = ? AND ea.record_date = ? AND ea.status = 'Draft' FOR UPDATE`,
       [d.site_id, d.shift_type, d.record_date]);
     if (!rows.length) throw AppError.conflict('NOTHING_TO_SUBMIT', 'There are no Draft rows for this day.');
-    const open = rows.filter((r) => r.day_status === 'Working' && !r.check_out_time).map((r) => r.equipment_code);
-    if (open.length) throw AppError.conflict('OPEN_SESSIONS', `Check out these machines first: ${open.join(', ')}.`, { machines: open });
+    const unknown = [...keep].filter((id) => !rows.some((r) => r.eq_attendance_id === id));
+    if (unknown.length) throw AppError.validation({ leave_draft_ids: `must be Draft rows of this day (${unknown.join(', ')})` });
+    const openRows = rows.filter((r) => r.day_status === 'Working' && !r.check_out_time && !keep.has(r.eq_attendance_id));
+    if (openRows.length) {
+      throw AppError.conflict('OPEN_SESSIONS', `Check out these machines first: ${openRows.map((r) => r.equipment_code).join(', ')}.`, {
+        machines: openRows.map((r) => r.equipment_code),
+        rows: openRows.map((r) => ({ eq_attendance_id: r.eq_attendance_id, equipment_code: r.equipment_code, check_in_time: r.check_in_time })),
+      });
+    }
+    const send = rows.filter((r) => !keep.has(r.eq_attendance_id));
+    const kept = rows.filter((r) => keep.has(r.eq_attendance_id));
+    if (!send.length) throw AppError.conflict('NOTHING_TO_SUBMIT', 'Every Draft row of this day is kept as a draft: nothing to send.');
     const gate = await weekGate.previousWeekDrafts(conn, d.site_id, d.shift_type, d.record_date, req.user);
     if (gate.blocked) {
       throw AppError.conflict('PREVIOUS_WEEK_DRAFTS', `Submit the previous week (${gate.prev_start} to ${gate.prev_end}) first.`, gate);
     }
-    for (const r of rows) await lock.assertEqEditable(conn, r);
+    for (const r of send) await lock.assertEqEditable(conn, r);
     const now = businessNow();
-    await conn.execute(
+    await conn.query(
       `UPDATE eq_attendance SET status = 'Submitted', submitted_by_user_id = ?, submitted_at = ?
-       WHERE site_id = ? AND shift_type = ? AND record_date = ? AND status = 'Draft'`,
-      [req.user.user_id, now, d.site_id, d.shift_type, d.record_date]);
-    for (const r of rows) await audit.log(conn, { table: 'eq_attendance', id: r.eq_attendance_id, action: 'submit', ...audit.ctx(req) });
+       WHERE site_id = ? AND shift_type = ? AND record_date = ? AND status = 'Draft' AND eq_attendance_id IN (?)`,
+      [req.user.user_id, now, d.site_id, d.shift_type, d.record_date, send.map((r) => r.eq_attendance_id)]);
+    for (const r of send) await audit.log(conn, { table: 'eq_attendance', id: r.eq_attendance_id, action: 'submit', ...audit.ctx(req) });
+    // who decided that these rows stay Draft, and with which rows of the day they were left behind
+    for (const r of kept) {
+      await audit.log(conn, { table: 'eq_attendance', id: r.eq_attendance_id, action: 'kept_as_draft',
+        newValues: { open_session: r.day_status === 'Working' && !r.check_out_time, submitted_with: send.map((x) => x.eq_attendance_id) }, ...audit.ctx(req) });
+    }
     const [missing] = await conn.execute(
       `SELECT e.equipment_code FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id
        WHERE a.site_id = ? AND a.shift_type = ? AND a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?)
          AND NOT EXISTS (SELECT 1 FROM eq_attendance x WHERE x.equipment_id = a.equipment_id AND x.site_id = a.site_id AND x.shift_type = a.shift_type AND x.record_date = ?
                            AND x.status <> 'Cancelled')`,
       [d.site_id, d.shift_type, d.record_date, d.record_date, d.record_date]);
-    return { submitted: rows.length, machines_without_row: missing.map((m) => m.equipment_code) };
+    return { submitted: send.length, kept_draft: kept.map((r) => r.equipment_code), machines_without_row: missing.map((m) => m.equipment_code) };
   });
-  res.json({ status: 'success', data: result, message: `${result.submitted} row(s) submitted.` });
+  res.json({ status: 'success', data: result, message: `${result.submitted} row(s) submitted.${result.kept_draft.length ? ` Kept as draft: ${result.kept_draft.join(', ')}.` : ''}` });
 };
 
 // ------------------------------------------------------------------ recall (supervisor takes back a Submitted row before approval)
