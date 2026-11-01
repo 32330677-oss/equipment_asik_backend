@@ -90,6 +90,14 @@ async function handoverPdf(h, user) {
       { key: 'c', en: 'Cur.', ar: 'العملة', width: 32 }, { key: 'a', en: 'Amount', ar: 'المبلغ', width: W - 448, align: 'right', bold: true },
     ],
   }) + 8;
+  // 31 Oct 2026: an invoice finance had partly paid before it was withdrawn says so (never paid twice)
+  for (const l of h.lines.filter((x) => x.paid_before)) {
+    const left = cents(l.amount) - cents(l.paid_before.amount);
+    P.text(doc, `${l.doc_no}: finance already paid ${money(l.paid_before.amount, l.currency)} before it was withdrawn (${l.paid_before.withdrawal_no}). Left to pay: ${fmt.money(left, l.currency)}.`,
+      L, y, { size: 8, bold: true, color: COLORS.red, width: W });
+    P.text(doc, `${l.doc_no}: دفع القسم المالي ${money(l.paid_before.amount, l.currency)} قبل السحب، المتبقي ${fmt.money(left, l.currency)}`, L, doc.y + 1, { size: 7.5, color: COLORS.red, width: W, align: 'right' });
+    y = doc.y + 6;
+  }
   if (h.note) { P.text(doc, `Note: ${h.note}`, L, y, { size: 8, width: W }); y = doc.y + 6; }
   P.text(doc, 'The documents above were handed over to the finance department for payment. From now on they are not changed: a correction needs a signed withdrawal acknowledgement, or a debit / credit note.',
     L, y, { size: 7.2, color: COLORS.muted, width: W });

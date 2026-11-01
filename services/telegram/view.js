@@ -36,8 +36,17 @@ function boardLabel(ctx, key, lang) {
   return `${b.site_code || siteId} · ${t(lang, `shift_${shift}`)}`;
 }
 
+/** Minutes from a check-in to a check-out "HH:MM" (a check-out at or before the check-in is the next day). */
+function spanMinutes(a, b) {
+  const m = (x) => Number(String(x).slice(0, 2)) * 60 + Number(String(x).slice(3, 5));
+  const d = m(b) - m(a);
+  return d > 0 ? d : d + 24 * 60;
+}
+const LONG_SESSION_MIN = 12 * 60; // the bot points out a session of 12 h or more before it is confirmed
+
 function lineText(l, ctx, lang) {
   const parts = [];
+  if (l.prevDay) parts.push(t(lang, 'l_prev_day', { date: l.prevDay }));
   if (l.status) {
     parts.push(t(lang, `ds_${l.status}`));
     if (l.reason) parts.push(t(lang, 'l_reason', { r: esc(l.reason) }));
@@ -47,6 +56,7 @@ function lineText(l, ctx, lang) {
   if (l.editIn) parts.push(t(lang, 'l_edit_in', l.editIn));
   if (l.out) parts.push(t(lang, 'l_out', { t: l.out }));
   if (l.editOut) parts.push(t(lang, 'l_edit_out', l.editOut));
+  if (l.in && l.out && spanMinutes(l.in, l.out) >= LONG_SESSION_MIN) parts.push(t(lang, 'l_long', { h: Math.round(spanMinutes(l.in, l.out) / 6) / 10 }));
   if (l.meterStart !== null && l.meterStart !== undefined) parts.push(t(lang, 'l_meter_start', { v: l.meterStart }));
   if (l.meterEnd !== null && l.meterEnd !== undefined) parts.push(t(lang, 'l_meter_end', { v: l.meterEnd }));
   if (l.replaces && l.replaces !== 'Working') parts.push(t(lang, 'l_replaces', { s: t(lang, `ds_${l.replaces}`) }));
@@ -106,7 +116,7 @@ function result(run, plan, ctx, lang) {
   const out = [];
   out.push(run.done.length ? t(lang, 'res_done', { n: run.done.length }) : t(lang, 'res_none'));
   const bad = [
-    ...run.failed.map((f) => `• ${esc(name(ctx, f.n, lang))}: ${esc(f.message || f.code)}`),
+    ...run.failed.map((f) => `• ${esc(name(ctx, f.n, lang))}: ${esc(f.message || f.code)}${f.saved && f.saved.length ? `\n   ${t(lang, 'res_partial', { what: f.saved.map((k) => t(lang, `step_${k}`)).join('، ') })}` : ''}`),
     ...plan.skipped.map((s) => skippedText(s, ctx, lang)),
     ...plan.questions.map((q) => (q.n ? `• ${esc(name(ctx, q.n, lang))}: ${t(lang, 'why_unanswered')}` : `• «${esc(q.said || '')}»: ${t(lang, 'why_unanswered')}`)),
   ];

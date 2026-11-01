@@ -571,12 +571,12 @@ async function calculate(conn, scope) {
   const monthTo = `${monthOf(scope.end_date)}-${String(daysInMonth(monthOf(scope.end_date))).padStart(2, '0')}`;
   const termsOf = await loadMonthlyTerms(conn, monthlyIds, monthOf(scope.start_date), monthOf(scope.end_date));
   const [heldDays] = monthlyIds.length ? await conn.query(
-    `SELECT md.equipment_id, md.day, md.eq_batch_id, md.eq_item_id, i.rate_card_id FROM eq_payroll_monthly_days md
+    `SELECT md.equipment_id, md.day, md.eq_batch_id, md.eq_item_id, i.rate_card_id, b.start_date AS held_start FROM eq_payroll_monthly_days md
      JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id JOIN eq_payroll_items i ON i.eq_item_id = md.eq_item_id
      WHERE md.equipment_id IN (?) AND md.day BETWEEN ? AND ? AND ${ACTIVE_BATCH} AND b.eq_batch_id <> ?`,
     [monthlyIds, monthFrom, monthTo, scope.exclude_batch_id || 0]) : [[]];
   const [prevRowsAll] = monthlyIds.length ? await conn.query(
-    `SELECT ea.*, i.rate_card_id AS held_rate_card_id, ps.eq_item_id AS held_item_id FROM eq_payroll_attendance_snapshot ps JOIN eq_payroll_batches b ON b.eq_batch_id = ps.eq_batch_id
+    `SELECT ea.*, i.rate_card_id AS held_rate_card_id, ps.eq_item_id AS held_item_id, b.eq_batch_id AS held_batch_id, b.start_date AS held_start FROM eq_payroll_attendance_snapshot ps JOIN eq_payroll_batches b ON b.eq_batch_id = ps.eq_batch_id
      JOIN eq_payroll_items i ON i.eq_item_id = ps.eq_item_id JOIN eq_attendance ea ON ea.eq_attendance_id = ps.eq_attendance_id
      WHERE i.equipment_id IN (?) AND i.billing_mode = 'Monthly' AND ps.record_date BETWEEN ? AND ? AND ${ACTIVE_BATCH} AND b.eq_batch_id <> ?
        AND ea.status <> 'Cancelled'`,
@@ -586,6 +586,7 @@ async function calculate(conn, scope) {
   const [prevItems] = prevItemIds.length ? await conn.query('SELECT eq_item_id, rate_snapshot FROM eq_payroll_items WHERE eq_item_id IN (?)', [prevItemIds]) : [[]];
   const prevCalc = new Map(prevItems.map((x) => [x.eq_item_id, (parseJson(x.rate_snapshot) || {}).monthly_calc || []]));
   const offsets = new Set(normalizeOffsets(scope.offsets));
+  const earlierCardDays = await earlierMonthlyCardDays(conn, monthlyIds, monthFrom, monthTo, offDay);
   const groups = new Map();
   // A MONTHLY card is one contract per machine: one group whatever the site (hours due settled once per month);
   // it is billed on the site where the machine spent most deployed days, with the cost split by site.
@@ -673,7 +674,15 @@ async function calculate(conn, scope) {
     let ctx = {};
     let monthly = null;
     if (rate.billing_mode === 'Monthly') {
-      monthly = monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf: (m) => termsOf(g.equipment_id, m), ownerSite, prevCalc });
+      monthly = monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf: (m) => termsOf(g.equipment_id, m), ownerSite, prevCalc, earlierCardDays });
+      // 31 Oct 2026: rows of a month without any deployed day are not held at 0: they wait for a later invoice
+      const billedMonths = new Set((monthly.ctx.months || []).map((m) => m.month));
+      const waiting = g.rows.filter((r) => !billedMonths.has(monthOf(String(r.record_date).slice(0, 10))));
+      if (waiting.length) {
+        g.rows = g.rows.filter((r) => billedMonths.has(monthOf(String(r.record_date).slice(0, 10))));
+        warnings.push({ code: 'MONTHLY_ROWS_WAITING', equipment_id: g.equipment_id, rows: waiting.length, days: waiting.map((r) => String(r.record_date).slice(0, 10)),
+          message: 'Rows of a month without any deployed day are not invoiced: they wait until the deployment is fixed.' });
+      }
       ctx = { ...monthly.ctx, offset: (monthly.ctx.months || []).filter((m) => offsets.has(`${g.equipment_id}|${m.month}`)).map((m) => m.month) };
     }
     if (rate.billing_mode !== 'Monthly' && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;
@@ -721,31 +730,84 @@ async function calculate(conn, scope) {
 }
 
 /**
+ * 31 Oct 2026: base days of a month are counted once across the monthly cards of a machine. Returns
+ * (equipmentId, card, month, D) -> base days already given in that month by the machine's EARLIER monthly cards
+ * (their deployed working days before this card starts, at most D). 0 when the machine has one monthly card.
+ */
+async function earlierMonthlyCardDays(conn, monthlyIds, monthFrom, monthTo, offDay) {
+  if (!monthlyIds.length) return () => 0;
+  const [mc] = await conn.query(
+    `SELECT rate_card_id, equipment_id, effective_from, effective_to FROM eq_rate_cards
+     WHERE equipment_id IN (?) AND billing_mode = 'Monthly' AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)`,
+    [monthlyIds, monthTo, monthFrom]);
+  const multi = [...new Set(mc.map((c) => c.equipment_id))].filter((id) => mc.filter((c) => c.equipment_id === id).length > 1);
+  if (!multi.length) return () => 0;
+  const [dp] = await conn.query(
+    `SELECT equipment_id, assigned_date, unassigned_date FROM eq_site_assignments
+     WHERE equipment_id IN (?) AND assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)`,
+    [multi, monthTo, monthFrom]);
+  return (equipmentId, card, month, D) => {
+    if (!multi.includes(equipmentId)) return 0;
+    const others = mc.filter((c) => c.equipment_id === equipmentId && c.rate_card_id !== card.rate_card_id && String(c.effective_from).slice(0, 10) < String(card.effective_from).slice(0, 10));
+    if (!others.length) return 0;
+    const deps = dp.filter((d) => d.equipment_id === equipmentId);
+    let n = 0;
+    for (let i = 1; i <= daysInMonth(month); i += 1) {
+      const d = `${month}-${String(i).padStart(2, '0')}`;
+      if (d >= String(card.effective_from).slice(0, 10) || weekday(d) === offDay) continue;
+      if (!others.some((c) => covers(String(c.effective_from).slice(0, 10), c.effective_to ? String(c.effective_to).slice(0, 10) : null, d))) continue;
+      if (!deps.some((x) => covers(String(x.assigned_date).slice(0, 10), x.unassigned_date ? String(x.unassigned_date).slice(0, 10) : null, d))) continue;
+      n += 1;
+    }
+    return Math.min(n, D);
+  };
+}
+
+/**
  * Monthly context of one group (one machine x one monthly card). Days of the scope inside the card and the deployments
  * that no other active batch holds are THIS part. Months this part touches (by its days or its rows) are billed as
  * F(days and rows of all parts) - F(days and rows already billed): the parts always add up to the whole month.
  * Returns { ctx, days: [{ day, site_id }], prevRowIds }.
  */
-function monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf, ownerSite, prevCalc = new Map() }) {
+function monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf, ownerSite, prevCalc = new Map(), earlierCardDays = null }) {
   const ranges = g.deployRanges || [];
   const cardId = g.card.rate_card_id;
-  const held = heldDays.filter((h) => h.equipment_id === g.equipment_id && h.rate_card_id === cardId).map((h) => String(h.day).slice(0, 10));
-  const heldSet = new Set(held);
+  const heldMine = heldDays.filter((h) => h.equipment_id === g.equipment_id && h.rate_card_id === cardId);
+  const held = heldMine.map((h) => String(h.day).slice(0, 10));
+  const heldSet = new Set(held); // every day held by another batch is never billed again
   const mine = ranges.length ? deployedDays(scope.start_date, scope.end_date, ranges, g.card, (d) => !heldSet.has(d)) : [];
   const touched = new Set([...mine.map(monthOf), ...g.rows.map((r) => monthOf(String(r.record_date).slice(0, 10)))]);
-  const heldIn = held.filter((d) => touched.has(monthOf(d)));
-  const prevRows = prevRowsAll.filter((r) => r.equipment_id === g.equipment_id && r.held_rate_card_id === cardId && touched.has(monthOf(String(r.record_date).slice(0, 10))));
+  // 31 Oct 2026: only the EARLIER parts of the month count as billed before (by period start, then batch number), so a
+  // later part never changes an earlier one and the parts add up to the whole month (every other part did before).
+  const before = (x) => String(x.held_start).slice(0, 10) < scope.start_date
+    || (String(x.held_start).slice(0, 10) === scope.start_date && scope.exclude_batch_id && x.eq_batch_id < scope.exclude_batch_id)
+    || (String(x.held_start).slice(0, 10) === scope.start_date && !scope.exclude_batch_id);
+  const heldPrev = heldMine.filter((h) => before(h));
+  const heldIn = heldPrev.map((h) => String(h.day).slice(0, 10)).filter((d) => touched.has(monthOf(d)));
+  const prevRows = prevRowsAll.filter((r) => r.equipment_id === g.equipment_id && r.held_rate_card_id === cardId && touched.has(monthOf(String(r.record_date).slice(0, 10)))
+    && before({ held_start: r.held_start, eq_batch_id: r.held_batch_id }));
   // a month is billed only when it has deployed days (this part's or another's); rows on other days wait for a deployment
   const withDays = new Set([...mine, ...heldIn].map(monthOf));
   const holidayOf = (list) => new Set(list.filter((r) => r.day_status === 'Holiday').map((r) => String(r.record_date).slice(0, 10)));
   const allDays = [...mine, ...heldIn];
-  const months = monthsFromDays(allDays, g.card, offDay, holidayOf([...g.rows, ...prevRows]), termsOf);
+  // base days of the month counted once across the machine's monthly cards (31 Oct 2026)
+  const decorate = (list) => {
+    for (const mo of list) {
+      if (earlierCardDays) {
+        const D = Math.max(1, Number(mo.divisor ?? mo.workingDays ?? 1));
+        const e = earlierCardDays(g.equipment_id, g.card, mo.month, D);
+        if (e > 0) mo.baseCap = Math.max(0, D - e);
+      }
+    }
+    return list;
+  };
+  const months = decorate(monthsFromDays(allDays, g.card, offDay, holidayOf([...g.rows, ...prevRows]), termsOf));
   const days = mine.map((d) => ({ day: d, site_id: ownerSite(g.equipment_id, d) || g.site_id }));
   if (!heldIn.length && !prevRows.length) return { ctx: { months }, days, prevRowIds: [] };
   const prevMonthsList = [...new Set(prevRows.map((r) => monthOf(String(r.record_date).slice(0, 10))))].filter((m) => withDays.has(m));
-  const prevMonths = monthsFromDays(heldIn, g.card, offDay, holidayOf(prevRows), termsOf, prevMonthsList);
+  const prevMonths = decorate(monthsFromDays(heldIn, g.card, offDay, holidayOf(prevRows), termsOf, prevMonthsList));
   // ledger of the extra hours: what the earlier invoices of each month gave as offset / overtime (their snapshots)
-  const itemIds = new Set([...heldDays.filter((h) => h.equipment_id === g.equipment_id && h.rate_card_id === cardId && touched.has(monthOf(String(h.day).slice(0, 10)))).map((h) => h.eq_item_id),
+  const itemIds = new Set([...heldPrev.filter((h) => touched.has(monthOf(String(h.day).slice(0, 10)))).map((h) => h.eq_item_id),
     ...prevRows.map((r) => r.held_item_id)].filter(Boolean));
   const used = {};
   let ledger = true;

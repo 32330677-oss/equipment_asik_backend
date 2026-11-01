@@ -34,16 +34,24 @@ function one(raw) {
 
 const pad = (n) => String(n).padStart(2, '0');
 
-/** 24h for the shift: Day: a check-out at 1..11 is in the afternoon; Night: a check-in at 1..11 is in the evening. */
-function to24(t, kind, shift, inH = null) {
+/**
+ * 24h for the shift. Night: a check-in at 1..11 is in the evening (unchanged).
+ * Day (31 Oct 2026): a check-in at 1..4 is in the afternoon (13:00-16:00; a day shift never starts at 1-4 am);
+ * a check-out at 1..11 is the first time AFTER the check-in ("7 to 11" = 07:00-11:00, "8 to 5" = 08:00-17:00,
+ * "1 to 5" = 13:00-17:00); without a check-in it is in the afternoon. inMin = minutes of the check-in (24h).
+ */
+function to24(t, kind, shift, inMin = null) {
   let h = t.h;
   if (shift === 'Night') {
     if (kind === 'in' && h >= 1 && h <= 11) h += 12;
-  } else if (kind === 'out' && h >= 1 && h <= 11 && (inH === null || h <= inH || h < 12)) {
-    if (inH === null || h + 12 > inH) h += 12;
+  } else if (kind === 'in') {
+    if (h >= 1 && h <= 4) h += 12;
+  } else if (kind === 'out' && h >= 1 && h <= 11) {
+    if (inMin === null || h * 60 + t.m <= inMin) h += 12;
   }
   return `${pad(h % 24)}:${pad(t.m)}`;
 }
+const minutesOf = (hhmm) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
 
 const FILLER = /(الدخول|دخول|دخلت|دخل|الخروج|خروج|طلعت|طلع|خلصت|ساعه|ساعة|الساعة|الساعه|من|لـ|الى|إلى|حتى|لعند|الصبح|المسا|المساء|الضهر|بعد|ونص|وربع|ونصف|الا|إلا|ربع|ثلث|تلت|in|out|to|am|pm)/gi;
 
@@ -66,16 +74,16 @@ function parseTimes(text, shift = 'Day') {
     const b = outM ? one(outM[1]) : null;
     if (!a && !b) return null;
     const i = a ? to24(a, 'in', shift) : '';
-    return { in: i, out: b ? to24(b, 'out', shift, a ? Number(i.slice(0, 2)) : null) : '' };
+    return { in: i, out: b ? to24(b, 'out', shift, a ? minutesOf(i) : null) : '' };
   }
   // "8 لـ 5", "من 8 ل 5", "8 الى 5", "8 - 5", "8 حتى 5"
-  const range = /^(?:من\s*)?(.+?)\s*(?:لـ|ل|الى|إلى|لل|حتى|لعند|-|–|to)\s*(.+)$/i.exec(s);
+  const range = /^(?:من\s*)?(.+?)\s*(?:لـ|لل|ل|الى|إلى|حتى|لعند|-|–|to)\s*(.+)$/i.exec(s);
   if (range) {
     const a = one(range[1]);
     const b = one(range[2]);
     if (!a || !b) return null;
     const i = to24(a, 'in', shift);
-    return { in: i, out: to24(b, 'out', shift, Number(i.slice(0, 2))) };
+    return { in: i, out: to24(b, 'out', shift, minutesOf(i)) };
   }
   return null;
 }

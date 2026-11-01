@@ -154,6 +154,15 @@ exports.updateMachine = async (req, res) => {
       const [[{ n }]] = await conn.execute('SELECT COUNT(*) AS n FROM eq_rate_cards WHERE equipment_id = ?', [id]);
       const [[{ m }]] = await conn.execute('SELECT COUNT(*) AS m FROM eq_attendance WHERE equipment_id = ?', [id]);
       if (Number(n) || Number(m)) throw AppError.conflict('MACHINE_VENDOR_LOCKED', 'The vendor cannot change once the machine has rate cards or attendance.');
+      // 31 Oct 2026: fuel, adjustments, delivery notes and DNR prices belong to the vendor they were recorded for
+      const [[{ f }]] = await conn.execute('SELECT COUNT(*) AS f FROM eq_fuel_issues WHERE equipment_id = ? AND is_cancelled = 0', [id]);
+      const [[{ a }]] = await conn.execute("SELECT COUNT(*) AS a FROM eq_adjustments WHERE equipment_id = ? AND status = 'Active'", [id]);
+      const [[{ dn }]] = await conn.execute("SELECT COUNT(*) AS dn FROM eq_delivery_notes WHERE equipment_id = ? AND status = 'Active'", [id]);
+      const [[{ dr }]] = await conn.execute('SELECT COUNT(*) AS dr FROM eq_dnr_rates WHERE equipment_id = ?', [id]);
+      if (Number(f) || Number(a) || Number(dn) || Number(dr)) {
+        throw AppError.conflict('MACHINE_VENDOR_LOCKED', 'The vendor cannot change once the machine has fuel issues, adjustments, delivery notes or DNR prices: they belong to the vendor they were recorded for.',
+          { fuel_issues: Number(f), adjustments: Number(a), delivery_notes: Number(dn), dnr_prices: Number(dr) });
+      }
       await C.loadVendor(conn, d.vendor_id);
     }
     const keys = Object.keys(d);
@@ -177,9 +186,14 @@ exports.setMachineStatus = async (req, res) => {
     effective_date: v.date({ default: businessToday() }),
     reason: v.string({ max: 500 }),
   });
+  // 31 Oct 2026: the status changes at once, so a date in the future is refused (it would hide the machine early)
+  if (d.effective_date > businessToday()) throw AppError.validation({ effective_date: 'cannot be in the future: change the status on that day' });
   const machine = await withTransaction(async (conn) => {
     const before = await C.loadMachine(conn, id, true);
     if (d.status !== 'Active') {
+      // never with a session still open (it would leave the board and could not be checked out)
+      const [open] = await conn.execute("SELECT eq_attendance_id, record_date FROM eq_attendance WHERE equipment_id = ? AND day_status = 'Working' AND check_in_time IS NOT NULL AND check_out_time IS NULL AND status <> 'Cancelled' LIMIT 1", [id]);
+      if (open[0]) throw AppError.conflict('OPEN_SESSION', `The machine is still checked in (${String(open[0].record_date).slice(0, 10)}): check it out first.`, { eq_attendance_id: open[0].eq_attendance_id });
       const [dep] = await conn.execute(
         `SELECT a.eq_assignment_id, s.site_code, a.assigned_date, a.unassigned_date FROM eq_site_assignments a JOIN sites s ON s.site_id = a.site_id
          WHERE a.equipment_id = ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)`, [id, d.effective_date]);

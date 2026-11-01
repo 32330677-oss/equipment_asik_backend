@@ -45,6 +45,12 @@ exports.createFuel = async (req, res) => {
   const row = await withTransaction(async (conn) => {
     await C.loadMachine(conn, d.equipment_id);
     await C.loadSite(conn, d.site_id);
+    // 31 Oct 2026: fuel is given to a machine deployed at that site on that day (any shift): it is deducted from its vendor
+    const [dep] = await conn.execute(
+      `SELECT eq_assignment_id FROM eq_site_assignments WHERE equipment_id = ? AND site_id = ? AND assigned_date <= ?
+         AND (unassigned_date IS NULL OR unassigned_date >= ?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date) LIMIT 1`,
+      [d.equipment_id, d.site_id, d.issue_date, d.issue_date]);
+    if (!dep[0]) throw AppError.badRequest('MACHINE_NOT_ASSIGNED', `The machine is not deployed to this site on ${d.issue_date}: check the machine and the site.`);
     // 14 Oct 2026: refused inside an invoice handed over to finance (an issued invoice is brought up to date by itself)
     await lock.assertOpen(conn, { equipmentId: d.equipment_id, siteId: d.site_id, from: d.issue_date, what: 'A fuel issue on this date' });
     const [r] = await conn.execute(

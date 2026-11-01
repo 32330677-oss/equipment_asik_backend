@@ -234,7 +234,8 @@ function standbyCredit(row, maxCredit) {
   return Math.min(Math.round(c), maxCredit, Math.round(Number(row.standby_minutes || 0)));
 }
 
-// A monthly machine, month by month (rules of 12 Oct 2026 — every day on its own, the Admin decides the offset):
+// A monthly machine, month by month (rules of 12 Oct 2026 — every day on its own, the Admin decides the offset;
+// 31 Oct 2026: the base days capped by mo.baseCap across the monthly cards of the machine):
 //   amount A     = the monthly price of the card, or the amount typed for this machine and month (exception)
 //   divisor D    = the working days of the calendar month (calendar days minus the weekly day off, Friday by
 //                  default), or the number typed for this machine and month (exception)
@@ -277,7 +278,10 @@ function monthTermsOf(mo, rate) {
   const amountC = amountTyped ? Number(mo.amountCents) : toCents(rate.monthly_rate);
   const manualH = mo.hourlyCents !== null && mo.hourlyCents !== undefined && Number(mo.hourlyCents) > 0;
   const hourlyC = manualH ? Number(mo.hourlyCents) : amountC / D / hpd;
-  const baseDays = Math.min(Number(mo.assignedWorkingDays || 0), D);
+  // 31 Oct 2026: base days of the month counted once across the monthly cards of the machine (mo.baseCap =
+  // D minus the base days of the earlier cards of the same month); absent = one monthly card
+  const cap = mo.baseCap === null || mo.baseCap === undefined ? D : Math.max(0, Math.min(D, Number(mo.baseCap)));
+  const baseDays = Math.min(Number(mo.assignedWorkingDays || 0), cap);
   return { hpd, D, amountC, amountTyped, hourlyC, manualH, baseDays };
 }
 

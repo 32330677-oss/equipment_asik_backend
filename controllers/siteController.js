@@ -23,12 +23,14 @@ async function loadSite(conn, id, lock = false) {
   return rows[0];
 }
 
+/** Deployments still running or to come (31 Oct 2026: a cancelled one, ending before it starts, holds nothing). */
 async function openDeployments(conn, siteId, shiftType = null) {
   const today = businessToday();
   const [rows] = await conn.execute(
     `SELECT a.eq_assignment_id, e.equipment_code, a.shift_type FROM eq_site_assignments a
      JOIN eq_equipment e ON e.equipment_id = a.equipment_id
-     WHERE a.site_id = ? ${shiftType ? 'AND a.shift_type = ?' : ''} AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?)`,
+     WHERE a.site_id = ? ${shiftType ? 'AND a.shift_type = ?' : ''} AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?)
+       AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)`,
     shiftType ? [siteId, shiftType, today] : [siteId, today]);
   return rows;
 }

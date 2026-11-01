@@ -16,6 +16,7 @@ async function run(userId, steps) {
   const failedN = new Set();
   const done = new Set();
   const failed = [];
+  const saved = new Map(); // n -> kinds of the steps already saved for that machine
   let late = false;
   for (const s of steps) {
     if (failedN.has(s.n)) continue; // one refused step stops the rest for that machine (never half a day)
@@ -30,11 +31,13 @@ async function run(userId, steps) {
     if (!r.ok) {
       failedN.add(s.n);
       done.delete(s.n);
-      failed.push({ n: s.n, code: r.code || String(r.status), message: r.message || '', details: r.details || null });
+      // 31 Oct 2026: what was already saved for this machine is said (it is a draft row in the app, not "nothing")
+      failed.push({ n: s.n, code: r.code || String(r.status), message: r.message || '', details: r.details || null, saved: saved.get(s.n) || [] });
       continue;
     }
     if (s.kind === 'check_in' && r.data && r.data.eq_attendance_id) newRow.set(s.n, r.data.eq_attendance_id);
     if ((r.warnings || []).some((w) => w && w.code === 'LATE_ENTRY')) late = true;
+    saved.set(s.n, [...(saved.get(s.n) || []), s.kind]);
     done.add(s.n);
   }
   return { done: [...done].filter((n) => !failedN.has(n)), failed, late };

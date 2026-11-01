@@ -17,7 +17,8 @@
     "harden-db": "node scripts/hardenDb.js",
     "create-admin": "node scripts/createAdmin.js",
     "seed-demo": "node scripts/seedDemo.js",
-    "backfill:monthly-days": "node scripts/backfillMonthlyDays.js"
+    "backfill:monthly-days": "node scripts/backfillMonthlyDays.js",
+    "check:invoices": "node scripts/checkInvoiceChanges.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1146.0",
