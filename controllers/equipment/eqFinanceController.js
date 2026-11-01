@@ -24,6 +24,19 @@ const day = (d) => (d ? String(d).slice(0, 10) : null);
 const isAdmin = (req) => req.user.role === 'Admin';
 const adminOnly = (req, what) => { if (!isAdmin(req)) throw AppError.forbidden('ADMIN_ONLY', `Only the Admin ${what}.`); };
 const idList = (x) => (Array.isArray(x) ? [...new Set(x.map(Number))].filter((n) => Number.isInteger(n) && n > 0) : []);
+const toCents = (x) => Math.round(Number(x || 0) * 100);
+
+/**
+ * What finance had already paid of an invoice when it last came back (31 Oct 2026): the last withdrawal "was paid"
+ * in its version chain (the same invoice re-issued keeps the link). null when nothing was paid.
+ */
+async function paidBefore(conn, batchId) {
+  const chain = await pay.versionChainBack(conn, batchId);
+  const [[w]] = await conn.query(
+    `SELECT withdrawal_no, paid_amount FROM eq_withdrawals WHERE eq_batch_id IN (?) AND was_paid = 1 AND paid_amount IS NOT NULL AND paid_amount > 0
+     ORDER BY withdrawal_id DESC LIMIT 1`, [chain]);
+  return w ? { withdrawal_no: w.withdrawal_no, amount: Number(w.paid_amount).toFixed(2) } : null;
+}
 
 function sendPdf(res, { buffer, fileName }) {
   res.set('Content-Type', 'application/pdf');
@@ -199,6 +212,8 @@ exports.handOver = async (req, res) => {
   adminOnly(req, 'hands invoices over to finance');
   const d = validate(req.body || {}, {
     batch_ids: v.any(), note_ids: v.any(), handed_on: v.date(), receiver_name: v.string({ required: true, min: 2, max: 255 }), note: v.string({ max: 500 }),
+    // 31 Oct 2026: the totals the Admin saw (per currency); refused when the sheet would print other amounts
+    expected_totals: v.any(),
   });
   const batchIds = idList(d.batch_ids); const noteIds = idList(d.note_ids);
   if (!batchIds.length && !noteIds.length) throw AppError.validation({ batch_ids: 'choose at least one invoice or note' });
@@ -250,6 +265,16 @@ exports.handOver = async (req, res) => {
         amount: (n.kind === 'Credit' ? -Number(n.amount) : Number(n.amount)).toFixed(2), period: n.period_from ? `${day(n.period_from)} - ${day(n.period_to || n.period_from)}` : '' });
       notesDone.push(n);
     }
+    if (d.expected_totals && typeof d.expected_totals === 'object' && !Array.isArray(d.expected_totals)) {
+      const totals = {};
+      for (const l of lines) totals[l.currency] = (totals[l.currency] || 0) + toCents(l.amount);
+      const seen = Object.fromEntries(Object.entries(d.expected_totals).map(([c, a]) => [c, toCents(a)]));
+      const differs = [...new Set([...Object.keys(totals), ...Object.keys(seen)])].some((c) => (totals[c] || 0) !== (seen[c] || 0));
+      if (differs) {
+        throw AppError.conflict('TOTALS_CHANGED', 'Some invoices were brought up to date: the hand-over sheet would print other totals than the ones shown. Check the new totals and confirm again.',
+          { totals: Object.fromEntries(Object.entries(totals).map(([c, x]) => [c, (x / 100).toFixed(2)])), shown: d.expected_totals });
+      }
+    }
     const now = businessNow();
     const no = await pay.nextNo(conn, 'Handover', Number(now.slice(0, 4)));
     const [h] = await conn.execute('INSERT INTO eq_handovers (handover_no, handed_on, receiver_name, note, created_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -282,13 +307,15 @@ async function handoverView(conn, id) {
     `SELECT hi.*, vd.vendor_name, b.start_date, b.end_date, n.kind AS note_kind, n.period_from, n.period_to
      FROM eq_handover_items hi JOIN eq_vendors vd ON vd.vendor_id = hi.vendor_id LEFT JOIN eq_payroll_batches b ON b.eq_batch_id = hi.eq_batch_id
      LEFT JOIN eq_notes n ON n.note_id = hi.note_id WHERE hi.handover_id = ? ORDER BY hi.line_no`, [id]);
-  return {
-    ...h,
-    lines: lines.map((l) => ({
+  const out = [];
+  for (const l of lines) {
+    out.push({
       ...l, kind: l.note_id ? l.note_kind : 'invoice',
       period: l.eq_batch_id ? `${day(l.start_date)} - ${day(l.end_date)}` : (l.period_from ? `${day(l.period_from)} - ${day(l.period_to || l.period_from)}` : ''),
-    })),
-  };
+      paid_before: l.eq_batch_id ? await paidBefore(conn, l.eq_batch_id) : null,
+    });
+  }
+  return { ...h, lines: out };
 }
 
 exports.listHandovers = async (req, res) => {
@@ -320,6 +347,9 @@ exports.withdrawBatch = async (req, res) => {
   const wid = await withTransaction(async (conn) => {
     const b = await pay.loadBatch(conn, id, true);
     if (b.status !== 'HandedOver') throw AppError.conflict('BATCH_STATE', 'Only an invoice handed over to finance can be withdrawn.');
+    if (d.was_paid && d.paid_amount && toCents(d.paid_amount) > toCents(b.total_net)) {
+      throw AppError.validation({ paid_amount: `cannot be more than the invoice (${Number(b.total_net).toFixed(2)} ${b.currency})` });
+    }
     const now = businessNow();
     const no = await pay.nextNo(conn, 'Withdrawal', Number(now.slice(0, 4)));
     const [w] = await conn.execute(
@@ -343,6 +373,9 @@ exports.withdrawNote = async (req, res) => {
   const wid = await withTransaction(async (conn) => {
     const n = await loadNote(conn, id, true);
     if (n.status !== 'HandedOver') throw AppError.conflict('BATCH_STATE', 'Only a note handed over to finance can be withdrawn.');
+    if (d.was_paid && d.paid_amount && toCents(d.paid_amount) > toCents(n.amount)) {
+      throw AppError.validation({ paid_amount: `cannot be more than the note (${Number(n.amount).toFixed(2)} ${n.currency})` });
+    }
     const now = businessNow();
     const no = await pay.nextNo(conn, 'Withdrawal', Number(now.slice(0, 4)));
     const [w] = await conn.execute(

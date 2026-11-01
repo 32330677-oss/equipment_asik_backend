@@ -142,7 +142,7 @@ function freeRanges(start, end, taken) {
  * per machine with the free parts of the period: [{ equipment_id, equipment_code, label, conflicts: [...], free: [...] }].
  * lockRows: the machines are locked (FOR UPDATE) so two people cannot invoice the same days at the same moment.
  */
-async function overlapsFor(conn, { equipmentIds, start, end, siteId = null, excludeBatchIds = [], lockRows = false }) {
+async function overlapsFor(conn, { equipmentIds, start, end, siteId = null, excludeBatchIds = [], lockRows = false, currency = null }) {
   const ids = [...new Set((equipmentIds || []).map(Number))].filter(Boolean);
   if (!ids.length) return [];
   if (lockRows) await conn.query('SELECT equipment_id FROM eq_equipment WHERE equipment_id IN (?) ORDER BY equipment_id FOR UPDATE', [ids]);
@@ -153,8 +153,9 @@ async function overlapsFor(conn, { equipmentIds, start, end, siteId = null, excl
      JOIN eq_equipment e ON e.equipment_id = c.equipment_id JOIN eq_types t ON t.type_id = e.type_id LEFT JOIN sites s ON s.site_id = c.site_id
      WHERE c.equipment_id IN (?) AND ${lock.ACTIVE} AND b.eq_batch_id NOT IN (?) AND c.start_date <= ? AND c.end_date >= ?
        AND (? IS NULL OR c.site_id IS NULL OR c.site_id = ?)
+       AND (? IS NULL OR c.currency IS NULL OR c.currency = ?)
      ORDER BY e.equipment_code, c.start_date`,
-    [ids, excludeBatchIds.length ? excludeBatchIds : [0], end, start, siteId ?? null, siteId ?? null]);
+    [ids, excludeBatchIds.length ? excludeBatchIds : [0], end, start, siteId ?? null, siteId ?? null, currency ?? null, currency ?? null]);
   const byMachine = new Map();
   for (const r of rows) {
     const m = byMachine.get(r.equipment_id) || { equipment_id: r.equipment_id, equipment_code: r.equipment_code, label: r.machine_label || `${r.equipment_code} ${r.type_name}`, conflicts: [] };
@@ -186,7 +187,9 @@ exports.preview = async (req, res) => {
   const blockers = await P.blockers(conn, scope);
   const { items, warnings } = await P.calculate(conn, scope);
   const names = await namesFor(conn, items);
-  const overlaps = await overlapsFor(conn, { equipmentIds: coveredMachines(scope, items), start: scope.start_date, end: scope.end_date, siteId: scope.site_id || null });
+  const currencies = [...new Set(items.map((i) => i.currency))];
+  const overlaps = await overlapsFor(conn, { equipmentIds: coveredMachines(scope, items), start: scope.start_date, end: scope.end_date, siteId: scope.site_id || null,
+    currency: scope.currency || (currencies.length === 1 ? currencies[0] : null) });
   res.json({ status: 'success', data: { scope, totals: summarize(items), blockers, warnings, overlaps, items: items.map((i) => itemView(i, names)) } });
 };
 
@@ -294,8 +297,8 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
   for (const eid of machineList(scope) || []) await conn.execute('INSERT INTO eq_payroll_batch_machines (eq_batch_id, equipment_id) VALUES (?, ?)', [batchId, eid]);
   // the period of each machine this batch covers (14 Oct 2026): no other active invoice may cover it
   for (const eid of coveredMachines(scope, items)) {
-    await conn.execute('INSERT INTO eq_invoice_coverage (eq_batch_id, equipment_id, site_id, start_date, end_date) VALUES (?, ?, ?, ?, ?)',
-      [batchId, eid, scope.site_id || null, scope.start_date, scope.end_date]);
+    await conn.execute('INSERT INTO eq_invoice_coverage (eq_batch_id, equipment_id, site_id, start_date, end_date, currency) VALUES (?, ?, ?, ?, ?, ?)',
+      [batchId, eid, scope.site_id || null, scope.start_date, scope.end_date, currency]);
   }
   const labels = await labelsFor(conn, items);
   for (const it of items) {
@@ -399,7 +402,7 @@ async function generateInTx(conn, req, scope, extraIn = {}) {
   // 14 Oct 2026: a machine is never in two active invoices over the same days
   const overlaps = await overlapsFor(conn, {
     equipmentIds: coveredMachines(scope, items), start: scope.start_date, end: scope.end_date, siteId: scope.site_id || null,
-    excludeBatchIds: extra.supersedes_batch_id ? [extra.supersedes_batch_id] : [], lockRows: true,
+    excludeBatchIds: extra.supersedes_batch_id ? [extra.supersedes_batch_id] : [], lockRows: true, currency: items[0].currency,
   });
   if (overlaps.length) throw overlapError(overlaps);
   const id = await persistBatch(conn, req, scope, items, extra);
@@ -462,6 +465,8 @@ async function versionChainBack(conn, batchId) {
   }
   return ids;
 }
+
+exports.versionChainBack = versionChainBack;
 
 /** Numbers reserved (Withdrawn) in this batch's version chain and not cancelled: they are given back when it is issued. */
 async function withdrawnInChain(conn, batchId) {
@@ -1044,7 +1049,7 @@ exports.reissue = async (req, res) => {
  * Cancels a batch (inside the caller's transaction). Draft: deleted (no number). Issued or returned: Admin, reason
  * required; its numbers are kept as cancelled. Handed over: refused (withdraw it from finance first).
  */
-async function doVoid(conn, req, id, reason) {
+async function doVoid(conn, req, id, reason, { keepNotes = false } = {}) {
   const b = await loadBatch(conn, id, true);
   const st = lock.stateOf(b);
   if (st === 'handed_over') throw AppError.conflict('INVOICE_HANDED_OVER', 'This invoice is handed over to finance: withdraw it first (signed acknowledgement).');
@@ -1053,6 +1058,13 @@ async function doVoid(conn, req, id, reason) {
     if (!isAdmin(req)) throw AppError.forbidden('ADMIN_ONLY', 'Only the Admin cancels an issued invoice.');
     if (!reason || String(reason).trim().length < 3) throw AppError.validation({ reason: 'is required to cancel an issued invoice (at least 3 characters)' });
     await assertMonthLinkFree(conn, b);
+    // 31 Oct 2026: debit / credit notes issued against this invoice stay in the vendor statement after it is cancelled:
+    // the Admin decides (cancel them first, or keep them on purpose with keep_notes = true)
+    const [notes] = await conn.execute("SELECT note_id, note_no, kind, amount, currency, status FROM eq_notes WHERE ref_batch_id = ? AND status IN ('Issued','HandedOver','Returned')", [id]);
+    if (notes.length && !keepNotes) {
+      throw AppError.conflict('NOTES_ATTACHED', `Debit / credit notes were issued against this invoice (${notes.map((x) => x.note_no).join(', ')}). They stay counted in the vendor statement after the invoice is cancelled: cancel them first, or confirm that they are kept.`,
+        { notes: notes.map((x) => ({ note_id: x.note_id, note_no: x.note_no, kind: x.kind, amount: x.amount, currency: x.currency, status: x.status })) });
+    }
   }
   await conn.execute("UPDATE eq_payroll_batches SET status = 'Voided', voided_by_user_id = ?, voided_at = ?, void_reason = ? WHERE eq_batch_id = ?", [req.user.user_id, businessNow(), reason || null, id]);
   await cancelInvoices(conn, id, `Invoice batch #${id} cancelled${reason ? `: ${reason}` : ''}`, req.user.user_id);
@@ -1062,8 +1074,8 @@ async function doVoid(conn, req, id, reason) {
 
 exports.void = async (req, res) => {
   const id = parseId(req.params.id);
-  const d = validate(req.body || {}, { reason: v.string({ max: 500 }) });
-  await withTransaction((conn) => doVoid(conn, req, id, (d.reason || '').trim() || null));
+  const d = validate(req.body || {}, { reason: v.string({ max: 500 }), keep_notes: v.bool({ default: false }) });
+  await withTransaction((conn) => doVoid(conn, req, id, (d.reason || '').trim() || null, { keepNotes: d.keep_notes }));
   res.json({ status: 'success', data: await batchDetail(pool, id, { withDrift: false }) });
 };
 

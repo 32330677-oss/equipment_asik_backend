@@ -85,12 +85,22 @@ async function applyChanges(conn, rowId, changes, userId, opts = {}) {
   if (sets.length) {
     await conn.execute(`UPDATE eq_attendance SET ${sets.map((k) => `${k} = ?`).join(', ')} WHERE eq_attendance_id = ?`, [...sets.map((k) => changes[k]), rowId]);
   }
+  // 31 Oct 2026: a downtime still open is never lost by an office edit — closed at the check-out when the session
+  // gets one (BR-16), and kept when the list of periods is replaced (the list sent holds the closed periods only)
+  let keptOpen = [];
+  if (status === 'Working') {
+    const [open] = await conn.execute('SELECT downtime_id FROM eq_downtime_periods WHERE eq_attendance_id = ? AND end_time IS NULL', [rowId]);
+    keptOpen = open.map((p) => p.downtime_id);
+    if (next.check_out_time) await S.closeOpenDowntimeAt(conn, rowId, next.check_out_time);
+  }
   if (changes.downtime !== undefined) {
     if (status !== 'Working') {
       if (changes.downtime.length) throw AppError.validation({ downtime: 'only a Working day has downtime periods' });
     } else {
-      S.assertPeriodsValid(changes.downtime, next.check_in_time, next.check_out_time);
-      await conn.execute('DELETE FROM eq_downtime_periods WHERE eq_attendance_id = ?', [rowId]);
+      const kept = keptOpen.length ? (await S.loadDowntime(conn, rowId)).filter((p) => keptOpen.includes(p.downtime_id)) : [];
+      S.assertPeriodsValid([...changes.downtime, ...kept], next.check_in_time, next.check_out_time);
+      if (keptOpen.length) await conn.query('DELETE FROM eq_downtime_periods WHERE eq_attendance_id = ? AND downtime_id NOT IN (?)', [rowId, keptOpen]);
+      else await conn.execute('DELETE FROM eq_downtime_periods WHERE eq_attendance_id = ?', [rowId]);
       for (const p of changes.downtime) {
         await conn.execute('INSERT INTO eq_downtime_periods (eq_attendance_id, downtime_type, start_time, end_time, reason, recorded_by_user_id) VALUES (?, ?, ?, ?, ?, ?)',
           [rowId, p.downtime_type, p.start_time, p.end_time, p.reason || null, userId]);

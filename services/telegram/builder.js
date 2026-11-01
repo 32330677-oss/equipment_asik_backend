@@ -159,6 +159,10 @@ function build({ reading, ctx, answers = {}, nowStamp }) {
     } else {
       const date = String(session.in).slice(0, 10);
       const rd = row.from_previous_day ? addDays(ctx.date, -1) : ctx.date;
+      // 31 Oct 2026: still checked in since the day before and a check-in is said for today: never put today's times
+      // on yesterday's session (today's work would be lost) — the supervisor closes yesterday first
+      if (row.from_previous_day && want.in) { skip('prev_day_open', { in: hm(session.in), date: rd }); continue; }
+      if (row.from_previous_day) line.prevDay = rd;
       const edit = {};
       if (want.in && want.in !== hm(session.in)) edit.check_in_time = stamp(rd, want.in, m.shift);
       if (want.out && session.out && want.out !== hm(session.out)) edit.check_out_time = stamp(rd, want.out, m.shift);

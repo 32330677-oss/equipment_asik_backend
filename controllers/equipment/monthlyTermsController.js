@@ -89,7 +89,8 @@ async function termsRows(conn, { start, end, vendorId = null, equipmentIds = nul
         calendar_days: mt.workingDays,
         amount, amount_source: mt.amountSource,
         divisor: mt.divisor, divisor_source: mt.divisorSource,
-        hourly: mt.hourlyCents !== null ? Math.round(mt.hourlyCents) / 100 : Math.round((amount / mt.divisor / hpd) * 10000) / 10000,
+        // 31 Oct 2026: the typed hourly price with its 4 decimals (it was cut to 2 and saved back cut)
+        hourly: mt.hourlyCents !== null ? Math.round(mt.hourlyCents * 100) / 10000 : Math.round((amount / mt.divisor / hpd) * 10000) / 10000,
         hourly_source: mt.hourlySource,
         is_exception: mt.amountSource === 'manual' || mt.divisorSource === 'manual' || mt.hourlySource === 'manual',
         overtime_enabled: Number(card.overtime_enabled) === 1, overtime_rate: card.overtime_rate === null ? null : Number(card.overtime_rate),

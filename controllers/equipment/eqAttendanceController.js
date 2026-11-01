@@ -265,6 +265,7 @@ exports.checkIn = async (req, res) => {
         [d.check_in_time, d.check_out_time || null, operatorId, d.meter_start ?? null, d.meter_end ?? null, d.remarks || null, ex.eq_attendance_id]);
       await conn.execute('DELETE FROM eq_downtime_periods WHERE eq_attendance_id = ?', [ex.eq_attendance_id]);
       rowId = ex.eq_attendance_id;
+      await resetPaper(conn, ex, req.user.user_id);
     } else {
       late = await lateEntryFields(recordDate, lateReason);
       rowId = await insertRow(conn, req, {
@@ -302,6 +303,7 @@ exports.downtimeStart = async (req, res) => {
       'INSERT INTO eq_downtime_periods (eq_attendance_id, downtime_type, start_time, end_time, reason, recorded_by_user_id) VALUES (?, ?, ?, ?, ?, ?)',
       [id, d.downtime_type, d.start_time, d.end_time || null, d.reason || null, req.user.user_id]);
     await S.recompute(conn, id);
+    await resetPaper(conn, row, req.user.user_id); // BR-28: compared with the signed sheet again
     await audit.log(conn, { table: 'eq_downtime_periods', id: r.insertId, action: 'start', newValues: { eq_attendance_id: id, ...d }, ...audit.ctx(req) });
   });
   res.status(201).json({ status: 'success', data: await rowView(pool, id) });
@@ -322,6 +324,7 @@ exports.downtimeEnd = async (req, res) => {
     S.assertPeriodsValid(periods.map((x) => (x.downtime_id === downtimeId ? { ...x, end_time: d.end_time } : x)), row.check_in_time, row.check_out_time);
     await conn.execute('UPDATE eq_downtime_periods SET end_time = ? WHERE downtime_id = ?', [d.end_time, downtimeId]);
     await S.recompute(conn, id);
+    await resetPaper(conn, row, req.user.user_id);
     await audit.log(conn, { table: 'eq_downtime_periods', id: downtimeId, action: 'end', newValues: d, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: await rowView(pool, id) });
@@ -348,6 +351,7 @@ exports.downtimeUpdate = async (req, res) => {
     const keys = Object.keys(d);
     await conn.execute(`UPDATE eq_downtime_periods SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE downtime_id = ?`, [...keys.map((k) => d[k]), downtimeId]);
     await S.recompute(conn, id);
+    await resetPaper(conn, row, req.user.user_id);
     await audit.log(conn, { table: 'eq_downtime_periods', id: downtimeId, action: 'update', oldValues: p, newValues: next,
       relatedType: 'eq_attendance', relatedId: id, ...audit.ctx(req) });
   });
@@ -358,11 +362,12 @@ exports.downtimeDelete = async (req, res) => {
   const id = parseId(req.params.id);
   const downtimeId = parseId(req.params.downtimeId, 'downtime');
   await withTransaction(async (conn) => {
-    await rowForAction(conn, req, id);
+    const row = await rowForAction(conn, req, id);
     const [[p]] = await conn.execute('SELECT * FROM eq_downtime_periods WHERE downtime_id = ? AND eq_attendance_id = ?', [downtimeId, id]);
     if (!p) throw AppError.notFound('Downtime period');
     await conn.execute('DELETE FROM eq_downtime_periods WHERE downtime_id = ?', [downtimeId]);
     await S.recompute(conn, id);
+    await resetPaper(conn, row, req.user.user_id);
     await audit.log(conn, { table: 'eq_downtime_periods', id: downtimeId, action: 'delete', oldValues: p, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: await rowView(pool, id) });
@@ -394,18 +399,14 @@ exports.checkOut = async (req, res) => {
       throw AppError.validation({ meter_end: 'must be greater than or equal to the meter start' });
     }
     // auto-close an open downtime at the check-out time (BR-16)
-    const periods = await S.loadDowntime(conn, id);
-    const open = periods.find((p) => !p.end_time);
-    if (open) {
-      if (wallMs(open.start_time) >= wallMs(d.check_out_time)) throw AppError.conflict('DOWNTIME_AFTER_CHECKOUT', 'An open downtime period starts after this check-out time.');
-      await conn.execute("UPDATE eq_downtime_periods SET end_time = ?, reason = CONCAT(COALESCE(reason, ''), ' [auto-closed at check-out]') WHERE downtime_id = ?", [d.check_out_time, open.downtime_id]);
-    }
+    await S.closeOpenDowntimeAt(conn, id, d.check_out_time);
     S.assertPeriodsValid((await S.loadDowntime(conn, id)), row.check_in_time, d.check_out_time);
     await conn.execute(
       `UPDATE eq_attendance SET check_out_time = ?, meter_end = ?, operator_id = ?, work_description = COALESCE(?, work_description),
          remarks = COALESCE(?, remarks) WHERE eq_attendance_id = ?`,
       [d.check_out_time, d.meter_end ?? null, operatorId, d.work_description || null, d.remarks || null, id]);
     await S.recompute(conn, id);
+    await resetPaper(conn, row, req.user.user_id);
     await audit.log(conn, { table: 'eq_attendance', id, action: 'check_out', oldValues: { check_out_time: null, meter_end: row.meter_end },
       newValues: d, ...audit.ctx(req) });
   });
@@ -437,7 +438,6 @@ exports.dayStatus = async (req, res) => {
     const machine = await C.loadMachine(conn, d.equipment_id, true);
     await C.assertMachineDeployed(conn, d.equipment_id, d.site_id, d.shift_type, d.record_date);
     await lock.assertEqEditable(conn, { equipment_id: d.equipment_id, vendor_id: machine.vendor_id, site_id: d.site_id, record_date: d.record_date });
-    if (hasTimes) await S.assertNoTimeOverlap(conn, d.equipment_id, d.check_in_time, d.check_out_time);
     const [existing] = await conn.execute(
       "SELECT * FROM eq_attendance WHERE equipment_id = ? AND site_id = ? AND shift_type = ? AND record_date = ? AND status <> 'Cancelled' FOR UPDATE",
       [d.equipment_id, d.site_id, d.shift_type, d.record_date]);
@@ -456,7 +456,10 @@ exports.dayStatus = async (req, res) => {
            work_description = NULL, remarks = ? WHERE eq_attendance_id = ?`,
         [d.day_status, d.check_in_time || null, d.check_out_time || null, d.remarks || null, ex.eq_attendance_id]);
       rowId = ex.eq_attendance_id;
+      await resetPaper(conn, ex, req.user.user_id);
     } else {
+      // the overlap is checked against the OTHER rows (an existing row of that slot is replaced, checked above)
+      if (hasTimes) await S.assertNoTimeOverlap(conn, d.equipment_id, d.check_in_time, d.check_out_time);
       late = await lateEntryFields(d.record_date, lateReason);
       rowId = await insertRow(conn, req, { ...d, operator_id: null }, late);
     }
@@ -498,6 +501,8 @@ async function applyEdit(conn, row, d) {
     && Number(next.meter_end) < Number(next.meter_start)) throw AppError.validation({ meter_end: 'must be >= meter_start' });
   if (d.operator_id) await assertOperatorUsable(conn, d.operator_id, row);
   if (row.day_status === 'Working' && next.check_in_time) {
+    // BR-16: closing the session by an edit closes its open downtime at the check-out, like the Check-out button
+    if (next.check_out_time) await S.closeOpenDowntimeAt(conn, row.eq_attendance_id, next.check_out_time);
     S.assertPeriodsValid(await S.loadDowntime(conn, row.eq_attendance_id), next.check_in_time, next.check_out_time);
   }
   const keys = Object.keys(d);
@@ -519,6 +524,8 @@ exports.edit = async (req, res) => {
   await withTransaction(async (conn) => {
     const row = await rowForAction(conn, req, id);
     const after = await applyEdit(conn, row, d);
+    // BR-28 (31 Oct 2026: also when the supervisor changes a returned row): what is compared with the paper resets it
+    if (['check_in_time', 'check_out_time', 'operator_id', 'meter_start', 'meter_end'].some((k) => d[k] !== undefined)) await resetPaper(conn, row, req.user.user_id);
     await audit.log(conn, { table: 'eq_attendance', id, action: 'edit', oldValues: row, newValues: after, ...audit.ctx(req) });
   });
   res.json({ status: 'success', data: await rowView(pool, id) });

@@ -62,10 +62,17 @@ async function vendorMovements(conn, vendorId) {
       `SELECT x.invoice_no FROM eq_invoices x LEFT JOIN eq_invoice_cancellations c ON c.invoice_id = x.invoice_id
        WHERE x.eq_batch_id = ? AND x.vendor_id = ? AND x.kind = 'Vendor' AND x.status = 'Issued' AND c.invoice_id IS NULL ORDER BY x.invoice_id DESC LIMIT 1`, [b.eq_batch_id, vendorId]);
     const state = STATE_TEXT[b.status] || b.status;
+    // 31 Oct 2026: an issued invoice (still in the office) whose data changed since it was calculated is shown as it
+    // was saved, and flagged: it is brought up to date when it is opened, printed or handed over
+    let stale = false;
+    if (b.status === 'Generated') {
+      const [[full]] = await conn.query('SELECT * FROM eq_payroll_batches WHERE eq_batch_id = ?', [b.eq_batch_id]);
+      stale = (await PS.batchDrift(conn, full)).length > 0;
+    }
     out.push({
       kind: 'invoice', date: day(b.finalized_at) || day(b.end_date), currency: b.currency, doc_no: no ? no.invoice_no : `Batch #${b.eq_batch_id}`,
       description: `${fmt.date(day(b.start_date))} - ${fmt.date(day(b.end_date))}, ${b.items} machine(s), ${state}`,
-      debit: cents(b.net), credit: 0, eq_batch_id: b.eq_batch_id,
+      debit: cents(b.net), credit: 0, eq_batch_id: b.eq_batch_id, not_up_to_date: stale,
     });
   }
   // debit / credit notes (14 Oct 2026): stand-alone documents, counted once issued
@@ -103,7 +110,7 @@ async function vendorStatement(conn, vendorId, { from = BEGIN, to = businessToda
     const rows = ms.filter((m) => m.date >= from).map((m) => { bal += m.debit - m.credit; return { ...m, balance: bal }; });
     sections.push({
       currency: cur, brought_forward: brought, rows, total_debit: rows.reduce((a, r) => a + r.debit, 0), total_credit: rows.reduce((a, r) => a + r.credit, 0),
-      closing: bal, estimate: null,
+      closing: bal, estimate: null, not_up_to_date: ms.filter((m) => m.not_up_to_date).map((m) => m.doc_no),
     });
   }
   // what is earned but not invoiced yet (approved days, fuel, adjustments... not in any batch): an estimate
@@ -294,6 +301,12 @@ async function vendorStatementPdf(conn, st, user) {
     y = boxRow(doc, y, `TOTAL INVOICED (${cur})`, 'إجمالي المفوتر', money(s.closing, cur),
       { fill: COLORS.navy, color: COLORS.white, arColor: '#E9DDBE', bold: true, size: 9.5 });
     y += 8;
+    if (s.not_up_to_date && s.not_up_to_date.length) {
+      P.text(doc, `NOT UP TO DATE: ${s.not_up_to_date.join(', ')} changed after it was issued. Open the invoice (it is brought up to date with the same number), then print this statement again.`,
+        L, y, { size: 7.5, color: COLORS.red, bold: true, width: W });
+      P.text(doc, 'فواتير تغيّرت بياناتها بعد الإصدار: افتح الفاتورة لتتحدّث، ثم اطبع الكشف من جديد', L, doc.y + 1, { size: 7, color: COLORS.red, width: W, align: 'right' });
+      y = doc.y + 6;
+    }
     if (s.estimate) {
       const e = s.estimate;
       const label = e.error

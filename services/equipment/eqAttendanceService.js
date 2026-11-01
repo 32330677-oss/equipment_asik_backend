@@ -133,6 +133,20 @@ function assertSessionLength(checkIn, checkOut) {
 }
 
 /** Periods must stay inside the session and not overlap each other. */
+/**
+ * BR-16: a downtime period still open when the session gets its check-out is closed at the check-out time — by the
+ * Check-out button and by every edit that sets the check-out (31 Oct 2026: an edit used to leave it open, paid as work).
+ * Returns the ids of the periods it closed.
+ */
+async function closeOpenDowntimeAt(conn, rowId, checkOut) {
+  const [open] = await conn.execute('SELECT downtime_id, start_time FROM eq_downtime_periods WHERE eq_attendance_id = ? AND end_time IS NULL', [rowId]);
+  for (const p of open) {
+    if (wallMs(p.start_time) >= wallMs(checkOut)) throw AppError.conflict('DOWNTIME_AFTER_CHECKOUT', 'An open downtime period starts after this check-out time.');
+    await conn.execute("UPDATE eq_downtime_periods SET end_time = ?, reason = CONCAT(COALESCE(reason, ''), ' [auto-closed at check-out]') WHERE downtime_id = ?", [checkOut, p.downtime_id]);
+  }
+  return open.map((p) => p.downtime_id);
+}
+
 function assertPeriodsValid(periods, checkIn, checkOut) {
   const sorted = [...periods].sort((a, b) => wallMs(a.start_time) - wallMs(b.start_time));
   let open = 0;
@@ -191,5 +205,5 @@ function liveState(row, openDowntime) {
 
 module.exports = {
   loadRow, loadDowntime, recompute, evaluateAnomalies, assertNoOpenSession, assertNoTimeOverlap,
-  assertSessionLength, assertPeriodsValid, liveState, MAX_SESSION_MINUTES, shiftDateOf, assertOnShiftDate,
+  assertSessionLength, assertPeriodsValid, closeOpenDowntimeAt, liveState, MAX_SESSION_MINUTES, shiftDateOf, assertOnShiftDate,
 };

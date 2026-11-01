@@ -106,6 +106,8 @@ exports.createTerms = async (req, res) => {
     await C.loadMachine(conn, equipmentId, true);
     const last = await lastFinalizedFuelDay(conn, equipmentId);
     if (last && d.effective_from <= last) throw AppError.conflict('INVOICE_LOCKED', `The fuel difference is handed over to finance up to ${last}. New terms must start after it.`);
+    // 31 Oct 2026: also an invoice handed over with no fuel difference line (difference 0), like changeTermsStart
+    await lock.assertRangeOpen(conn, { equipmentId, from: d.effective_from, what: 'New fuel terms from this date change days that' });
     const [later] = await conn.execute('SELECT fuel_terms_id FROM eq_fuel_terms WHERE equipment_id = ? AND effective_from >= ?', [equipmentId, d.effective_from]);
     if (later.length) throw AppError.conflict('FUEL_TERMS_OVERLAP', 'Terms already start on or after this date. Choose a later date.');
     const [open] = await conn.execute(
@@ -135,6 +137,8 @@ exports.endTerms = async (req, res) => {
     if (t.effective_to && effective_to > t.effective_to) throw AppError.validation({ effective_to: 'can only shorten the terms' });
     const last = await lastFinalizedFuelDay(conn, t.equipment_id);
     if (last && effective_to < last) throw AppError.conflict('INVOICE_LOCKED', `The fuel difference is handed over to finance up to ${last}.`);
+    // 31 Oct 2026: the days taken out of the terms must not be inside an invoice handed over to finance
+    await lock.assertRangeOpen(conn, { equipmentId: t.equipment_id, from: addDays(effective_to, 1), to: t.effective_to ? String(t.effective_to).slice(0, 10) : null, what: 'Stopping these fuel terms on this date changes days that' });
     await conn.execute('UPDATE eq_fuel_terms SET effective_to = ? WHERE fuel_terms_id = ?', [effective_to, id]);
     await audit.log(conn, { table: 'eq_fuel_terms', id, action: 'end', oldValues: { effective_to: t.effective_to }, newValues: { effective_to }, ...audit.ctx(req) });
     const [[out]] = await conn.execute('SELECT * FROM eq_fuel_terms WHERE fuel_terms_id = ?', [id]);
