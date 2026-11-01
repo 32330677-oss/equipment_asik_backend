@@ -262,7 +262,9 @@ async function vendorStatementPdf(conn, st, user) {
     { label: 'Printed', labelAr: 'تاريخ الطباعة', value: printedAt },
   ], y, 4);
   if (!st.sections.length) {
-    P.text(doc, 'No movement for this vendor yet. / لا توجد حركات لهذا المورد بعد.', L, y + 10, { size: 9, color: COLORS.muted, width: W });
+    P.text(doc, 'No movement for this vendor yet.', L, y + 10, { size: 9, color: COLORS.muted, width: W });
+    P.text(doc, 'لا توجد حركات لهذا المورد بعد.', L, doc.y + 2, { size: 9, color: COLORS.muted, width: W, align: 'right' });
+    y = doc.y + 6; // the notes below start under these lines
   }
   st.sections.forEach((s, k) => {
     const cur = s.currency;

@@ -41,7 +41,9 @@ function signatures(doc, y, labels) {
   const w = W / labels.length;
   labels.forEach(([en, ar], i) => {
     const x = L + i * w;
-    P.text(doc, 'Name / الاسم:', x + 10, y, { size: 7, color: COLORS.muted, width: w - 20, lineBreak: false });
+    // English and Arabic are printed apart: a line mixing both is drawn with the Arabic font (Latin letters as boxes)
+    P.text(doc, 'Name:', x + 10, y, { size: 7, color: COLORS.muted, width: w - 20, lineBreak: false });
+    P.text(doc, 'الاسم:', x + 10, y, { size: 7, color: COLORS.muted, width: w - 20, align: 'right', lineBreak: false });
     doc.moveTo(x + 10, y + 34).lineTo(x + w - 10, y + 34).lineWidth(0.6).strokeColor('#888').stroke();
     P.text(doc, en, x, y + 37, { size: 7.5, width: w, align: 'center', lineBreak: false });
     P.text(doc, ar, x, y + 47, { size: 7, color: COLORS.muted, width: w, align: 'center', lineBreak: false });
