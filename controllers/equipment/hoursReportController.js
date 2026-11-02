@@ -1,22 +1,27 @@
 // GET /api/equipment/reports/hours  — hours since the start of the project per machine, grouped by vendor (read only).
 // Query: vendor_id, site_id, equipment_id (optional), format = json | pdf | xlsx,
-//        view = since_start (hours + amounts, invoiced and not yet) | invoiced (everything invoiced, one line per machine).
+//        view = since_start (hours + amounts, invoiced and not yet) | invoiced (everything invoiced, one line per machine),
+//        from / to (optional, 2 Nov 2026): only invoices whose period lies inside these dates (and, for since_start,
+//        approved days of these dates not invoiced yet). Without them the report is the same as before (since the start).
 'use strict';
 
 const { pool } = require('../../config/db');
 const { v, validate } = require('../../utils/validate');
+const AppError = require('../../utils/AppError');
 const H = require('../../services/equipment/eqHoursReport');
 
 exports.hours = async (req, res) => {
   const q = validate(req.query, {
     vendor_id: v.id(), site_id: v.id(), equipment_id: v.id(), format: v.enumOf(['json', 'xlsx', 'pdf'], { default: 'json' }),
-    view: v.enumOf(['since_start', 'invoiced'], { default: 'since_start' }),
+    view: v.enumOf(['since_start', 'invoiced'], { default: 'since_start' }), from: v.date(), to: v.date(),
   });
+  if (q.from && q.to && q.from > q.to) throw AppError.validation({ to: 'must be on or after "from"' });
   const invoiced = q.view === 'invoiced';
-  const filters = { vendor_id: q.vendor_id || null, site_id: q.site_id || null, equipment_id: q.equipment_id || null };
+  const filters = { vendor_id: q.vendor_id || null, site_id: q.site_id || null, equipment_id: q.equipment_id || null, from: q.from || null, to: q.to || null };
   const data = invoiced ? await H.invoicedReport(pool, filters) : await H.hoursReport(pool, filters);
   if (q.format === 'json') return res.json({ status: 'success', data });
-  const name = `equipment-${invoiced ? 'invoiced' : 'hours'}-since-start-${data.generated_on}`;
+  const span = q.from || q.to ? `${q.from || 'start'}_${q.to || data.generated_on}` : `since-start-${data.generated_on}`;
+  const name = `equipment-${invoiced ? 'invoiced' : 'hours'}-${span}`;
   if (q.format === 'xlsx') {
     res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.set('Content-Disposition', `attachment; filename="${name}.xlsx"`);
