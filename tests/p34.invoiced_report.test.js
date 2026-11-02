@@ -46,7 +46,7 @@ test('invoiced report: only invoices, one line per machine, totals add up', asyn
     assert.strictEqual(m.net, Number(it.n));
     assert.strictEqual(m.total_hours, Number(it.w));
     assert.strictEqual(m.invoices, Number(it.c));
-    assert.strictEqual(Math.round((m.regular + m.overtime + m.additions + m.deductions) * 100), Math.round(m.net * 100));
+    assert.strictEqual(Math.round((m.regular + m.overtime + m.fuel + m.fuel_diff + m.additions + m.deductions) * 100), Math.round(m.net * 100));
   }
   const exc = all.find((m) => m.equipment_id === F.exc.equipment_id);
   assert.strictEqual(exc.invoices, 2);

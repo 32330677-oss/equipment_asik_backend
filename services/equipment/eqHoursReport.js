@@ -356,8 +356,10 @@ async function hoursReportXlsx(data) {
 // Everything INVOICED since the start (active invoices: issued, handed over, withdrawn, and drafts), ONE line per
 // machine and currency: invoices, invoiced period, worked days, hours (regular / OT / total), amounts (regular, OT,
 // additions, deductions, net). Vendors one under the other with their total; a grand total per currency.
-// Additions = every other positive line (standby, top-up, positive adjustments, fuel difference...);
-// deductions = every other negative line (absence / missing hours / breakdown, fuel, negative adjustments...).
+// 2 Nov 2026 (display only, the amounts and the net are the stored ones): Regular amount = everything the calculation
+// gives for the work (base, minus missing hours / absence / breakdown, plus standby, top-up, DNR...), OT apart, Fuel and
+// Fuel difference apart; Additions / Deductions = only the adjustments typed in the system (Fuel & adjustments >
+// Adjustments: "Add to vendor" / "Deduct from vendor"). Regular + OT + Fuel + Fuel diff. + Additions + Deductions = Net.
 
 async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteId = null, equipment_id: equipmentId = null, from: pFrom = null, to: pTo = null } = {}) {
   const today = businessToday();
@@ -388,7 +390,7 @@ async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteI
     const k = key(it);
     if (!rows.has(k)) {
       rows.set(k, { equipment_id: it.equipment_id, vendor_id: it.vendor_id, currency: it.currency || '-', modes: new Set(), batches: new Set(),
-        first: null, last: null, worked_days: 0, reg_h: 0, ot_h: 0, reg: 0, ot: 0, add: 0, ded: 0, net: 0 });
+        first: null, last: null, worked_days: 0, reg_h: 0, ot_h: 0, reg: 0, ot: 0, fuel: 0, fd: 0, add: 0, ded: 0, net: 0 });
     }
     const r = rows.get(k);
     r.batches.add(it.eq_batch_id);
@@ -399,17 +401,18 @@ async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteI
     r.worked_days += n(it.worked_days);
     r.reg_h += Math.max(0, n(it.work_hours) - ot);
     r.ot_h += ot;
-    let reg = 0; let otc = 0; let add = 0; let ded = 0;
+    let otc = 0; let fuel = 0; let fd = 0; let add = 0; let ded = 0;
     for (const l of linesOf.get(it.eq_item_id) || []) {
       const a = c(l.amount);
-      if (F.REGULAR_LINES.includes(l.line_type)) reg += a;
-      else if (l.line_type === 'Overtime') otc += a;
-      else if (a > 0) add += a;
-      else ded += a;
+      if (l.line_type === 'Overtime') otc += a;
+      else if (l.line_type === 'Fuel') fuel += a;
+      else if (l.line_type === 'FuelPriceDifference') fd += a;
+      else if (l.line_type === 'Adjustment') { if (a > 0) add += a; else ded += a; }
     }
     const net = c(it.net_amount);
-    ded += net - reg - otc - add - ded; // the stored net always wins: any rounding left goes with the deductions
-    r.reg += reg; r.ot += otc; r.add += add; r.ded += ded; r.net += net;
+    // the stored net always wins: the work amount is what is left of it (every other line of the calculation)
+    const reg = net - otc - fuel - fd - add - ded;
+    r.reg += reg; r.ot += otc; r.fuel += fuel; r.fd += fd; r.add += add; r.ded += ded; r.net += net;
     const days = [day(it.r_from), day(it.r_to), day(it.m_from), day(it.m_to)].filter(Boolean);
     const span = days.length ? days : [day(it.start_date), day(it.end_date)];
     for (const d of span) {
@@ -435,7 +438,7 @@ async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteI
       equipment_id: r.equipment_id, equipment_code: mi.equipment_code || `#${r.equipment_id}`, machine_label: mi.machine_label || null, type_name: mi.type_name || null,
       plate_number: mi.plate_number || null, currency: r.currency, billing_modes: [...r.modes].sort().join(', '), invoices: r.batches.size,
       first_day: r.first, last_day: r.last, worked_days: r.worked_days, regular_hours: r2(r.reg_h), overtime_hours: r2(r.ot_h), total_hours: r2(r.reg_h + r.ot_h),
-      regular: r.reg / 100, overtime: r.ot / 100, additions: r.add / 100, deductions: r.ded / 100, net: r.net / 100,
+      regular: r.reg / 100, overtime: r.ot / 100, fuel: r.fuel / 100, fuel_diff: r.fd / 100, additions: r.add / 100, deductions: r.ded / 100, net: r.net / 100,
     };
   };
   const totalsOf = (list) => {
@@ -447,14 +450,15 @@ async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteI
   const moneyOf = (list) => {
     const by = new Map();
     for (const m of list) {
-      if (!by.has(m.currency)) by.set(m.currency, { currency: m.currency, machines: new Set(), worked_days: 0, regular_hours: 0, overtime_hours: 0, regular: 0, overtime: 0, additions: 0, deductions: 0, net: 0 });
+      if (!by.has(m.currency)) by.set(m.currency, { currency: m.currency, machines: new Set(), worked_days: 0, regular_hours: 0, overtime_hours: 0, regular: 0, overtime: 0, fuel: 0, fuel_diff: 0, additions: 0, deductions: 0, net: 0 });
       const t = by.get(m.currency);
       t.machines.add(m.equipment_id); t.worked_days += m.worked_days; t.regular_hours += m.regular_hours; t.overtime_hours += m.overtime_hours;
-      for (const k of ['regular', 'overtime', 'additions', 'deductions', 'net']) t[k] += c(m[k]);
+      for (const k of ['regular', 'overtime', 'fuel', 'fuel_diff', 'additions', 'deductions', 'net']) t[k] += c(m[k]);
     }
     return [...by.values()].sort((a, b) => a.currency.localeCompare(b.currency)).map((t) => ({
       currency: t.currency, machines: t.machines.size, worked_days: t.worked_days, regular_hours: r2(t.regular_hours), overtime_hours: r2(t.overtime_hours),
-      total_hours: r2(t.regular_hours + t.overtime_hours), regular: t.regular / 100, overtime: t.overtime / 100, additions: t.additions / 100, deductions: t.deductions / 100, net: t.net / 100,
+      total_hours: r2(t.regular_hours + t.overtime_hours), regular: t.regular / 100, overtime: t.overtime / 100, fuel: t.fuel / 100, fuel_diff: t.fuel_diff / 100,
+      additions: t.additions / 100, deductions: t.deductions / 100, net: t.net / 100,
     }));
   };
   const groups = new Map();
@@ -497,7 +501,8 @@ async function invoicedReportPdf(data, { siteLabel } = {}) {
   const mm = (v, cur) => (v ? fmt.money(c(v), cur) : '-');
   const line = (base, x, extra = {}) => ({
     ...base, cur: x.currency, days: String(x.worked_days), reg_h: h(x.regular_hours), ot_h: x.overtime_hours ? h(x.overtime_hours) : '-', tot_h: h(x.total_hours),
-    reg: mm(x.regular, x.currency), ot: mm(x.overtime, x.currency), add: x.additions ? `+${fmt.money(c(x.additions), x.currency)}` : '-',
+    reg: mm(x.regular, x.currency), ot: mm(x.overtime, x.currency), fuel: mm(x.fuel, x.currency), fd: mm(x.fuel_diff, x.currency),
+    add: x.additions ? `+${fmt.money(c(x.additions), x.currency)}` : '-',
     ded: mm(x.deductions, x.currency), net: fmt.money(c(x.net), x.currency), ...extra,
   });
   const rows = [];
@@ -517,26 +522,28 @@ async function invoicedReportPdf(data, { siteLabel } = {}) {
   if (!rows.length) rows.push({ m: 'No invoice for this selection.' });
   const columns = [
     { key: 'no', en: '#', ar: '', width: 16 },
-    { key: 'm', en: 'Machine', ar: 'الآلية', width: 132, align: 'left' },
-    { key: 'mode', en: 'Billing', ar: 'الأساس', width: 44, size: 6.6 },
-    { key: 'period', en: 'Invoiced period', ar: 'الفترة المفوترة', width: 88, size: 6.8 },
-    { key: 'inv', en: 'Invoices', ar: 'فواتير', width: 30 },
-    { key: 'days', en: 'Worked days', ar: 'أيام العمل', width: 32 },
-    { key: 'reg_h', en: 'Regular h', ar: 'ساعات عادية', width: 46, align: 'right' },
-    { key: 'ot_h', en: 'OT h', ar: 'إضافي', width: 38, align: 'right' },
-    { key: 'tot_h', en: 'Total h', ar: 'إجمالي الساعات', width: 48, align: 'right', bold: true },
-    { key: 'cur', en: 'Cur.', ar: 'العملة', width: 30 },
-    { key: 'reg', en: 'Regular amount', ar: 'مبلغ العادي', width: 64, align: 'right' },
-    { key: 'ot', en: 'OT amount', ar: 'مبلغ الإضافي', width: 54, align: 'right' },
-    { key: 'add', en: 'Additions', ar: 'إضافات', width: 52, align: 'right' },
-    { key: 'ded', en: 'Deductions', ar: 'حسومات', width: 58, align: 'right', color: COLORS.red },
-    { key: 'net', en: 'Net invoiced', ar: 'الصافي المفوتر', width: W - 732, align: 'right', bold: true },
+    { key: 'm', en: 'Machine', ar: 'الآلية', width: 100, align: 'left' },
+    { key: 'mode', en: 'Billing', ar: 'الأساس', width: 38, size: 6.6 },
+    { key: 'period', en: 'Invoiced period', ar: 'الفترة المفوترة', width: 74, size: 6.4 },
+    { key: 'inv', en: 'Invoices', ar: 'فواتير', width: 28 },
+    { key: 'days', en: 'Worked days', ar: 'أيام العمل', width: 30 },
+    { key: 'reg_h', en: 'Regular h', ar: 'ساعات عادية', width: 40, align: 'right' },
+    { key: 'ot_h', en: 'OT h', ar: 'إضافي', width: 34, align: 'right' },
+    { key: 'tot_h', en: 'Total h', ar: 'إجمالي الساعات', width: 42, align: 'right', bold: true },
+    { key: 'cur', en: 'Cur.', ar: 'العملة', width: 26 },
+    { key: 'reg', en: 'Regular amount', ar: 'مبلغ العادي', width: 62, align: 'right' },
+    { key: 'ot', en: 'OT amount', ar: 'مبلغ الإضافي', width: 52, align: 'right' },
+    { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 48, align: 'right', color: COLORS.red },
+    { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 42, align: 'right' },
+    { key: 'add', en: 'Additions', ar: 'إضافات', width: 46, align: 'right' },
+    { key: 'ded', en: 'Deductions', ar: 'حسومات', width: 48, align: 'right', color: COLORS.red },
+    { key: 'net', en: 'Net invoiced', ar: 'الصافي المفوتر', width: W - 726, align: 'right', bold: true },
   ];
   const topOfPage = () => doc.page.margins.top + 4;
   y = P.table(doc, { y: y + 2, rows, rowHeight: 15, headHeight: 32, fontSize: 7, onNewPage: topOfPage, columns });
   const notes = [
     'Invoiced = active invoices (issued, handed over, withdrawn) and drafts; cancelled / replaced invoices and days not invoiced yet are not counted. One line per machine and currency; currencies are never added together.',
-    'Additions: standby, minimum top-up, positive adjustments, fuel price difference. Deductions: absence / missing hours / breakdown of monthly machines, fuel issued, negative adjustments. Debit / credit notes are not included (see the vendor statement).',
+    'Regular amount: the work as calculated (days / hours / month on site, after missing hours, absence and breakdown; with standby, minimum top-up and delivery notes). Fuel: fuel issued by us. Additions / Deductions: adjustments typed in the system (Add to / Deduct from vendor). Regular + OT + Fuel + Fuel diff. + Additions + Deductions = Net. Debit / credit notes are not included (see the vendor statement).',
   ];
   if (data.period) notes.push(`Period ${periodText(data)}: an invoice is counted when its whole period lies inside these dates.`);
   if (crossingNote(data)) notes.push(crossingNote(data));
@@ -554,13 +561,14 @@ async function invoicedReportXlsx(data) {
     { header: 'Plate', key: 'plate', width: 11 }, { header: 'Billing', key: 'mode', width: 14 }, { header: 'First day', key: 'first', width: 11 }, { header: 'Last day', key: 'last', width: 11 },
     { header: 'Invoices', key: 'inv', width: 9 }, { header: 'Worked days', key: 'days', width: 10 }, { header: 'Regular hours', key: 'reg_h', width: 12 },
     { header: 'OT hours', key: 'ot_h', width: 10 }, { header: 'Total hours', key: 'tot_h', width: 11 }, { header: 'Currency', key: 'cur', width: 9 },
-    { header: 'Regular amount', key: 'reg', width: 15 }, { header: 'OT amount', key: 'ot', width: 13 }, { header: 'Additions', key: 'add', width: 13 },
+    { header: 'Regular amount', key: 'reg', width: 15 }, { header: 'OT amount', key: 'ot', width: 13 }, { header: 'Fuel', key: 'fuel', width: 13 },
+    { header: 'Fuel diff.', key: 'fd', width: 13 }, { header: 'Additions', key: 'add', width: 13 },
     { header: 'Deductions', key: 'ded', width: 13 }, { header: 'Net invoiced', key: 'net', width: 16 },
   ];
   ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
   ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF3B3B3B' } };
   const vals = (x) => ({ days: x.worked_days, reg_h: x.regular_hours, ot_h: x.overtime_hours, tot_h: x.total_hours, cur: x.currency,
-    reg: x.regular, ot: x.overtime, add: x.additions, ded: x.deductions, net: x.net });
+    reg: x.regular, ot: x.overtime, fuel: x.fuel, fd: x.fuel_diff, add: x.additions, ded: x.deductions, net: x.net });
   const tot = (label, x, fill) => { const row = ws.addRow({ vendor: label, ...vals(x) }); row.font = { bold: true }; row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } }; };
   for (const g of data.vendors) {
     for (const r of g.machines) {
@@ -570,7 +578,7 @@ async function invoicedReportXlsx(data) {
     for (const x of g.money) tot(`Total ${g.vendor_name}`, x, 'FFF3EEE2');
   }
   for (const x of data.money) tot(`GRAND TOTAL ${x.currency}`, x, 'FFE6DCC3');
-  for (const k of ['reg_h', 'ot_h', 'tot_h', 'reg', 'ot', 'add', 'ded', 'net']) ws.getColumn(k).numFmt = '#,##0.00;[Red]-#,##0.00;-';
+  for (const k of ['reg_h', 'ot_h', 'tot_h', 'reg', 'ot', 'fuel', 'fd', 'add', 'ded', 'net']) ws.getColumn(k).numFmt = '#,##0.00;[Red]-#,##0.00;-';
   periodRows(ws, data);
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
