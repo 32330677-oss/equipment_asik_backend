@@ -9,6 +9,10 @@
 // else: standby, top-up, deductions, fuel, adjustments, fuel difference...), net invoiced, net not invoiced yet, total.
 // Debit / credit notes are not in these amounts (see the vendor statement).
 // view=invoiced (26 Oct 2026): only what is invoiced, one line per machine with hours AND amounts (invoicedReport).
+// from / to (2 Nov 2026, optional): an invoice counts when its whole period lies inside these dates (its amounts cannot
+// be split by day); invoices that cross a limit are not counted and are listed apart (crossing). The not-invoiced part
+// is calculated for these dates only, and the rows waiting for approval are those of these dates. Without from / to
+// nothing changes: since the start of the project, up to today.
 'use strict';
 
 const ExcelJS = require('exceljs');
@@ -35,7 +39,38 @@ function addMoney(m, currency, lines, netCents, invoiced) {
   if (invoiced) x.invoiced_net += netCents; else x.not_invoiced_net += netCents;
 }
 
-async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId = null, equipment_id: equipmentId = null } = {}) {
+/** Invoices whose period lies inside from / to (no limit given: no condition). Adds to w / p (alias b). */
+function periodSql(w, p, from, to) {
+  if (from) { w.push('b.start_date >= ?'); p.push(from); }
+  if (to) { w.push('b.end_date <= ?'); p.push(to); }
+}
+
+/** Active invoices of the scope that overlap from / to without lying inside: not counted, listed apart. */
+async function crossingInvoices(conn, { vendorId, siteId, equipmentId, from, to }) {
+  if (!from && !to) return [];
+  const w = []; const p = [];
+  if (vendorId) { w.push('i.vendor_id = ?'); p.push(vendorId); }
+  if (siteId) { w.push('i.site_id = ?'); p.push(siteId); }
+  if (equipmentId) { w.push('i.equipment_id = ?'); p.push(equipmentId); }
+  if (from) { w.push('b.end_date >= ?'); p.push(from); }
+  if (to) { w.push('b.start_date <= ?'); p.push(to); }
+  const out = [];
+  if (from && to) { out.push('(b.start_date < ? OR b.end_date > ?)'); p.push(from, to); } else if (from) { out.push('b.start_date < ?'); p.push(from); } else { out.push('b.end_date > ?'); p.push(to); }
+  const [rows] = await conn.query(
+    `SELECT b.eq_batch_id, b.start_date, b.end_date, b.currency, b.is_finalized, COUNT(DISTINCT i.equipment_id) AS machines FROM eq_payroll_items i
+     JOIN eq_payroll_batches b ON b.eq_batch_id = i.eq_batch_id
+     WHERE ${PS.ACTIVE_BATCH} AND ${[...w, ...out].join(' AND ')} GROUP BY b.eq_batch_id, b.start_date, b.end_date, b.currency, b.is_finalized ORDER BY b.start_date, b.eq_batch_id`, p);
+  return rows.map((r) => ({ eq_batch_id: r.eq_batch_id, start_date: day(r.start_date), end_date: day(r.end_date), currency: r.currency, draft: !Number(r.is_finalized), machines: Number(r.machines) }));
+}
+
+const periodOf = (from, to) => (from || to ? { from: from || null, to: to || null } : null);
+/** "01/10/2026 - 31/10/2026" (an open side: "start" / today). */
+const periodText = (data) => `${data.period.from ? fmt.date(data.period.from) : 'start'} - ${fmt.date(data.period.to || data.generated_on)}`;
+const crossingNote = (data) => (data.crossing && data.crossing.length
+  ? `Not counted (period crosses the chosen dates): ${data.crossing.map((x) => `#${x.eq_batch_id} ${fmt.date(x.start_date)} - ${fmt.date(x.end_date)} ${x.currency}${x.draft ? ' draft' : ''}`).join('; ')}.`
+  : null);
+
+async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId = null, equipment_id: equipmentId = null, from: pFrom = null, to: pTo = null } = {}) {
   const today = businessToday();
   const byMachine = new Map();
   const get = (id) => {
@@ -49,6 +84,7 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   if (vendorId) { w.push('i.vendor_id = ?'); p.push(vendorId); }
   if (siteId) { w.push('i.site_id = ?'); p.push(siteId); }
   if (equipmentId) { w.push('i.equipment_id = ?'); p.push(equipmentId); }
+  periodSql(w, p, pFrom, pTo);
   const [items] = await conn.query(
     `SELECT i.eq_item_id, i.net_amount, b.currency, i.equipment_id, i.vendor_id, i.billing_mode, i.worked_days, i.work_hours, i.overtime_hours, b.start_date, b.end_date,
        (SELECT MIN(ps.record_date) FROM eq_payroll_attendance_snapshot ps WHERE ps.eq_item_id = i.eq_item_id) AS r_from,
@@ -83,12 +119,14 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   const ds = PS.scopeSql(scope, 'a');
   const [[r1]] = await conn.query(`SELECT MIN(ea.record_date) AS d FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id WHERE ea.status = 'Approved'${s.sql}`, s.params);
   const [[r2_]] = await conn.query(`SELECT MIN(a.assigned_date) AS d FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id WHERE 1 = 1${ds.sql}`, ds.params);
-  const start = [day(r1.d), day(r2_.d)].filter(Boolean).sort()[0] || null;
+  const first = [day(r1.d), day(r2_.d)].filter(Boolean).sort()[0] || null;
+  const start = first && pFrom && pFrom > first ? pFrom : first;
+  const end = pTo && pTo < today ? pTo : today;
   const errors = [];
-  if (start && start <= today) {
-    for (let y = Number(start.slice(0, 4)); y <= Number(today.slice(0, 4)); y += 1) {
+  if (start && start <= end) {
+    for (let y = Number(start.slice(0, 4)); y <= Number(end.slice(0, 4)); y += 1) {
       const from = y === Number(start.slice(0, 4)) ? start : `${y}-01-01`;
-      const to = y === Number(today.slice(0, 4)) ? today : `${y}-12-31`;
+      const to = y === Number(end.slice(0, 4)) ? end : `${y}-12-31`;
       try {
         const { items: its } = await PS.calculate(conn, { start_date: from, end_date: to, ...scope });
         for (const it of its) {
@@ -112,13 +150,18 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   }
 
   // rows waiting for approval (not counted in the hours)
+  const ws_ = []; const wp = [];
+  if (pFrom) { ws_.push(' AND ea.record_date >= ?'); wp.push(pFrom); }
+  if (pTo) { ws_.push(' AND ea.record_date <= ?'); wp.push(pTo); }
   const [subs] = await conn.query(
     `SELECT ea.equipment_id, e.vendor_id, COUNT(*) AS c FROM eq_attendance ea JOIN eq_equipment e ON e.equipment_id = ea.equipment_id
-     WHERE ea.status = 'Submitted'${s.sql} GROUP BY ea.equipment_id, e.vendor_id`, s.params);
+     WHERE ea.status = 'Submitted'${s.sql}${ws_.join('')} GROUP BY ea.equipment_id, e.vendor_id`, [...s.params, ...wp]);
+  const period = periodOf(pFrom, pTo);
+  const crossing = await crossingInvoices(conn, { vendorId, siteId, equipmentId, from: pFrom, to: pTo });
   for (const r of subs) { const m = get(r.equipment_id); m.vendor_id = m.vendor_id || r.vendor_id; m.pending_rows += n(r.c); }
 
   const ids = [...byMachine.keys()];
-  if (!ids.length) return { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, vendors: [], totals: emptyTotals(), money: [], errors };
+  if (!ids.length) return { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, period, crossing, vendors: [], totals: emptyTotals(), money: [], errors };
   const [machines] = await conn.query(
     `SELECT e.equipment_id, e.equipment_code, e.machine_label, e.plate_number, e.vendor_id, t.type_name FROM eq_equipment e
      JOIN eq_types t ON t.type_id = e.type_id WHERE e.equipment_id IN (?)`, [ids]);
@@ -145,7 +188,7 @@ async function hoursReport(conn, { vendor_id: vendorId = null, site_id: siteId =
   const out = [...groups.values()].sort((a, b) => a.vendor_name.localeCompare(b.vendor_name));
   for (const g of out) { g.machines.sort((a, b) => a.equipment_code.localeCompare(b.equipment_code)); g.totals = sum(g.machines); g.money = sumMoney(g.machines); }
   const all = out.flatMap((g) => g.machines);
-  return { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, vendors: out, totals: sum(all), money: sumMoney(all), errors };
+  return { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, period, crossing, vendors: out, totals: sum(all), money: sumMoney(all), errors };
 }
 
 /** Money of one currency in units (2 decimals): regular, overtime, other, invoiced_net, not_invoiced_net, total. */
@@ -180,12 +223,12 @@ const h = (v) => fmt.num(v, 2);
 
 async function hoursReportPdf(data, { siteLabel } = {}) {
   const company = await settings.getString('company_name');
-  const doc = P.createDoc({ layout: 'landscape', info: { Title: 'Equipment hours since the start' } });
+  const doc = P.createDoc({ layout: 'landscape', info: { Title: data.period ? 'Equipment hours of a period' : 'Equipment hours since the start' } });
   const one = data.equipment_id && data.vendors.length === 1 && data.vendors[0].machines.length === 1 ? data.vendors[0].machines[0] : null;
   const scope = [one ? `${machineName(one)} - ${data.vendors[0].vendor_name}` : data.vendors.length === 1 && data.vendor_id ? data.vendors[0].vendor_name : 'All vendors', siteLabel || 'All sites'].join(' | ');
   let y = P.header(doc, {
-    title: 'EQUIPMENT HOURS SINCE THE START', titleAr: 'ساعات الآليات منذ بداية المشروع', subtitle: company,
-    right: (xr, top) => [`Up to ${fmt.date(data.generated_on)}`, scope].forEach((t, k) => P.text(doc, t, xr - 220, top + k * 11, { size: k ? 7 : 8, bold: !k, color: k ? COLORS.ink : COLORS.navy, width: 220, align: 'right', lineBreak: false })),
+    title: data.period ? 'EQUIPMENT HOURS OF THE PERIOD' : 'EQUIPMENT HOURS SINCE THE START', titleAr: data.period ? 'ساعات الآليات خلال الفترة' : 'ساعات الآليات منذ بداية المشروع', subtitle: company,
+    right: (xr, top) => [data.period ? periodText(data) : `Up to ${fmt.date(data.generated_on)}`, scope].forEach((t, k) => P.text(doc, t, xr - 220, top + k * 11, { size: k ? 7 : 8, bold: !k, color: k ? COLORS.ink : COLORS.navy, width: 220, align: 'right', lineBreak: false })),
   });
   const rows = [];
   for (const g of data.vendors) {
@@ -233,8 +276,8 @@ async function hoursReportPdf(data, { siteLabel } = {}) {
     const L0 = doc.page.margins.left;
     if (y + 80 > doc.page.height - doc.page.margins.bottom - 18) { doc.addPage(); y = doc.page.margins.top + 4; }
     doc.rect(L0, y + 10, 3, 12).fill(COLORS.gold);
-    P.text(doc, 'Amounts since the start (each currency on its own)', L0 + 8, y + 11, { size: 10, bold: true, color: COLORS.navy, width: 400, lineBreak: false });
-    P.text(doc, 'المبالغ منذ البداية', L0, y + 11, { size: 10, color: COLORS.gold, width: doc.page.width - L0 - doc.page.margins.right, align: 'right', lineBreak: false });
+    P.text(doc, data.period ? 'Amounts of the period (each currency on its own)' : 'Amounts since the start (each currency on its own)', L0 + 8, y + 11, { size: 10, bold: true, color: COLORS.navy, width: 400, lineBreak: false });
+    P.text(doc, data.period ? 'المبالغ خلال الفترة' : 'المبالغ منذ البداية', L0, y + 11, { size: 10, color: COLORS.gold, width: doc.page.width - L0 - doc.page.margins.right, align: 'right', lineBreak: false });
     y = P.table(doc, {
       y: y + 28, rows: mrows, rowHeight: 16, headHeight: 34, fontSize: 7.2, onNewPage: () => doc.page.margins.top + 4,
       columns: [
@@ -249,17 +292,19 @@ async function hoursReportPdf(data, { siteLabel } = {}) {
   const notes = ['Hours as billed: invoiced = hours in invoices (drafts and issued, not cancelled); not invoiced yet = approved attendance not in any invoice (same calculation as the invoices).',
     'Rows awaiting approval are counted only, their hours are not in the totals.',
     'Amounts: net = regular + overtime + other additions and deductions (standby, top-up, deductions, fuel, adjustments, fuel difference). Debit / credit notes are not included (see the vendor statement).'];
+  if (data.period) notes.push(`Period ${periodText(data)}: an invoice is counted when its whole period lies inside these dates; not invoiced yet = approved days of these dates only.`);
+  if (crossingNote(data)) notes.push(crossingNote(data));
   if (data.errors.length) notes.push(`Could not calculate the not-invoiced part for: ${data.errors.map((e) => `${e.from} - ${e.to} (${e.message})`).join('; ')}`);
   const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
   if (y + 40 > doc.page.height - doc.page.margins.bottom - 18) { doc.addPage(); y = doc.page.margins.top; }
-  P.text(doc, notes.join('\n'), L, y + 6, { size: 6.8, color: data.errors.length ? COLORS.red : COLORS.muted, width: W });
-  P.footers(doc, `${company} | Equipment Flow | hours since the start | printed ${businessNow().slice(0, 16)}`);
+  P.text(doc, notes.join('\n'), L, y + 6, { size: 6.8, color: data.errors.length || (data.crossing && data.crossing.length) ? COLORS.red : COLORS.muted, width: W });
+  P.footers(doc, `${company} | Equipment Flow | ${data.period ? `hours ${periodText(data)}` : 'hours since the start'} | printed ${businessNow().slice(0, 16)}`);
   return P.toBuffer(doc);
 }
 
 async function hoursReportXlsx(data) {
   const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('Hours since start');
+  const ws = wb.addWorksheet(data.period ? 'Hours of the period' : 'Hours since start');
   ws.columns = [
     { header: 'Vendor', key: 'vendor', width: 28 }, { header: 'Machine', key: 'code', width: 12 }, { header: 'Type / machine no.', key: 'name', width: 22 },
     { header: 'Plate', key: 'plate', width: 12 }, { header: 'Billing', key: 'mode', width: 12 }, { header: 'First day', key: 'first', width: 12 }, { header: 'Last day', key: 'last', width: 12 },
@@ -303,6 +348,7 @@ async function hoursReportXlsx(data) {
   }
   if (data.vendors.length > 1) mtot('GRAND TOTAL', data.money || [], 'FFE6DCC3');
   for (const k of ['reg', 'ot', 'oth', 'inv', 'pend', 'tot']) am.getColumn(k).numFmt = '#,##0.00';
+  periodRows(ws, data);
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
@@ -313,12 +359,13 @@ async function hoursReportXlsx(data) {
 // Additions = every other positive line (standby, top-up, positive adjustments, fuel difference...);
 // deductions = every other negative line (absence / missing hours / breakdown, fuel, negative adjustments...).
 
-async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteId = null, equipment_id: equipmentId = null } = {}) {
+async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteId = null, equipment_id: equipmentId = null, from: pFrom = null, to: pTo = null } = {}) {
   const today = businessToday();
   const w = []; const p = [];
   if (vendorId) { w.push('i.vendor_id = ?'); p.push(vendorId); }
   if (siteId) { w.push('i.site_id = ?'); p.push(siteId); }
   if (equipmentId) { w.push('i.equipment_id = ?'); p.push(equipmentId); }
+  periodSql(w, p, pFrom, pTo);
   const [items] = await conn.query(
     `SELECT i.eq_item_id, i.eq_batch_id, i.net_amount, b.currency, b.is_finalized, i.equipment_id, i.vendor_id, i.billing_mode, i.worked_days,
        i.work_hours, i.overtime_hours, b.start_date, b.end_date,
@@ -371,7 +418,8 @@ async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteI
     }
   }
   const ids = [...new Set([...rows.values()].map((r) => r.equipment_id))];
-  const empty = { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, first_day: null, last_day: null,
+  const empty = { generated_on: today, vendor_id: vendorId, site_id: siteId, equipment_id: equipmentId, period: periodOf(pFrom, pTo),
+    crossing: await crossingInvoices(conn, { vendorId, siteId, equipmentId, from: pFrom, to: pTo }), first_day: null, last_day: null,
     invoices: 0, draft_invoices: 0, vendors: [], totals: { machines: 0, worked_days: 0, regular_hours: 0, overtime_hours: 0, total_hours: 0 }, money: [] };
   if (!ids.length) return empty;
   const [machines] = await conn.query(
@@ -426,14 +474,14 @@ async function invoicedReport(conn, { vendor_id: vendorId = null, site_id: siteI
 
 async function invoicedReportPdf(data, { siteLabel } = {}) {
   const company = await settings.getString('company_name');
-  const doc = P.createDoc({ layout: 'landscape', info: { Title: 'Equipment invoiced since the start' } });
+  const doc = P.createDoc({ layout: 'landscape', info: { Title: data.period ? 'Equipment invoiced in a period' : 'Equipment invoiced since the start' } });
   const L = doc.page.margins.left; const W = doc.page.width - L - doc.page.margins.right;
   const one = data.equipment_id && data.vendors.length === 1 && data.vendors[0].machines.length === 1 ? data.vendors[0].machines[0] : null;
   const scope = [one ? `${machineName(one)} - ${data.vendors[0].vendor_name}` : data.vendors.length === 1 && data.vendor_id ? data.vendors[0].vendor_name : 'All vendors', siteLabel || 'All sites'].join(' | ');
   const period = data.first_day ? `${fmt.date(data.first_day)} - ${fmt.date(data.last_day)}` : '-';
   let y = P.header(doc, {
-    title: 'EQUIPMENT INVOICED SINCE THE START', titleAr: 'كشف فوترة الآليات منذ بداية المشروع', subtitle: company,
-    right: (xr, top) => [`Printed ${fmt.date(data.generated_on)}`, scope].forEach((t, k) => P.text(doc, t, xr - 230, top + k * 11, { size: k ? 7 : 8, bold: !k, color: k ? COLORS.ink : COLORS.navy, width: 230, align: 'right', lineBreak: false })),
+    title: data.period ? 'EQUIPMENT INVOICED IN THE PERIOD' : 'EQUIPMENT INVOICED SINCE THE START', titleAr: data.period ? 'كشف فوترة الآليات خلال الفترة' : 'كشف فوترة الآليات منذ بداية المشروع', subtitle: company,
+    right: (xr, top) => [data.period ? `Period ${periodText(data)}` : `Printed ${fmt.date(data.generated_on)}`, scope].forEach((t, k) => P.text(doc, t, xr - 230, top + k * 11, { size: k ? 7 : 8, bold: !k, color: k ? COLORS.ink : COLORS.navy, width: 230, align: 'right', lineBreak: false })),
   });
   const T = data.totals;
   const invoices = `${data.invoices}${data.draft_invoices ? ` (${data.draft_invoices} draft)` : ''}`;
@@ -490,15 +538,17 @@ async function invoicedReportPdf(data, { siteLabel } = {}) {
     'Invoiced = active invoices (issued, handed over, withdrawn) and drafts; cancelled / replaced invoices and days not invoiced yet are not counted. One line per machine and currency; currencies are never added together.',
     'Additions: standby, minimum top-up, positive adjustments, fuel price difference. Deductions: absence / missing hours / breakdown of monthly machines, fuel issued, negative adjustments. Debit / credit notes are not included (see the vendor statement).',
   ];
+  if (data.period) notes.push(`Period ${periodText(data)}: an invoice is counted when its whole period lies inside these dates.`);
+  if (crossingNote(data)) notes.push(crossingNote(data));
   if (y + 26 > doc.page.height - doc.page.margins.bottom - 14) { doc.addPage(); y = doc.page.margins.top; }
-  P.text(doc, notes.join('\n'), L, y + 6, { size: 6.6, color: COLORS.muted, width: W });
-  P.footers(doc, `${company} | Equipment Flow | invoiced since the start | printed ${businessNow().slice(0, 16)}`);
+  P.text(doc, notes.join('\n'), L, y + 6, { size: 6.6, color: data.crossing && data.crossing.length ? COLORS.red : COLORS.muted, width: W });
+  P.footers(doc, `${company} | Equipment Flow | ${data.period ? `invoiced ${periodText(data)}` : 'invoiced since the start'} | printed ${businessNow().slice(0, 16)}`);
   return P.toBuffer(doc);
 }
 
 async function invoicedReportXlsx(data) {
   const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('Invoiced since start', { views: [{ state: 'frozen', ySplit: 1 }], pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
+  const ws = wb.addWorksheet(data.period ? 'Invoiced in the period' : 'Invoiced since start', { views: [{ state: 'frozen', ySplit: 1 }], pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 } });
   ws.columns = [
     { header: 'Vendor', key: 'vendor', width: 28 }, { header: 'Machine', key: 'code', width: 11 }, { header: 'Type / machine no.', key: 'name', width: 20 },
     { header: 'Plate', key: 'plate', width: 11 }, { header: 'Billing', key: 'mode', width: 14 }, { header: 'First day', key: 'first', width: 11 }, { header: 'Last day', key: 'last', width: 11 },
@@ -521,7 +571,17 @@ async function invoicedReportXlsx(data) {
   }
   for (const x of data.money) tot(`GRAND TOTAL ${x.currency}`, x, 'FFE6DCC3');
   for (const k of ['reg_h', 'ot_h', 'tot_h', 'reg', 'ot', 'add', 'ded', 'net']) ws.getColumn(k).numFmt = '#,##0.00;[Red]-#,##0.00;-';
+  periodRows(ws, data);
   return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+/** Excel: with a period, two lines under the table (the rule, and the invoices not counted). Nothing without a period. */
+function periodRows(ws, data) {
+  if (!data.period) return;
+  ws.addRow([]);
+  ws.addRow([`Period ${data.period.from || 'start'} - ${data.period.to || data.generated_on}: an invoice is counted when its whole period lies inside these dates.`]).font = { italic: true };
+  const note = crossingNote(data);
+  if (note) ws.addRow([note]).font = { italic: true, color: { argb: 'FFC00000' } };
 }
 
 module.exports = { hoursReport, hoursReportPdf, hoursReportXlsx, invoicedReport, invoicedReportPdf, invoicedReportXlsx };
