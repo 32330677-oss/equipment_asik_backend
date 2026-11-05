@@ -529,23 +529,34 @@ function drawVendor(doc, ctx, b, items) {
     }
     return { reg, ot };
   });
+  // 4 Nov 2026 (display only, amounts and net are the stored ones, as in the "All invoiced" report): Regular amount =
+  // everything the calculation gives for the work (regular lines, minus missing hours / absence / breakdown, plus
+  // standby, top-up...), OT, Fuel and Fuel diff. apart, Additions / Deductions = only the adjustments typed in the system.
+  const cols = (it) => {
+    const a = F.amountSplit(it.lines);
+    const adj = it.lines.filter((l) => l.line_type === 'Adjustment').map((l) => Math.round(n(l.amount) * 100));
+    const add = adj.filter((x) => x > 0).reduce((s1, x) => s1 + x, 0) / 100;
+    const ded = adj.filter((x) => x < 0).reduce((s1, x) => s1 + x, 0) / 100;
+    const regular = Math.round((n(it.net_amount) - a.overtime - a.fuel - a.fuelDiff - add - ded) * 100) / 100;
+    return { regular, overtime: a.overtime, fuel: a.fuel, fuelDiff: a.fuelDiff, add, ded };
+  };
   const rows = items.map((it, i) => {
-    const a = F.amountSplit(it.lines); const { reg, ot } = g[i];
+    const a = cols(it); const { reg, ot } = g[i];
     const dnr = it.billing_mode === 'DNR';
     return {
       no: i + 1, m: `${it.equipment_code}\n${mlabel(it)}`, site: it.site_code, bill: dnr ? `DNR (${it.lines.filter((l) => l.line_type === 'DeliveryNote').length})` : it.billing_mode, days: it.worked_days,
-      rq: reg.qty, rr: reg.rate, ra: reg.amt, oq: ot.qty, or: ot.rate, oa: ot.amt,
-      oth: a.otherAdd ? money(a.otherAdd, cur) : '-', fd: a.fuelDiff ? money(a.fuelDiff, cur) : '-', fuel: a.fuel ? money(a.fuel, cur) : '-',
-      adj: a.adjustments ? money(a.adjustments, cur) : '-', ded: a.otherDed ? money(a.otherDed, cur) : '-', net: money(it.net_amount, cur),
+      rq: reg.qty, rr: reg.rate, ra: money(a.regular, cur), oq: ot.qty, or: ot.rate, oa: ot.amt,
+      fuel: a.fuel ? money(a.fuel, cur) : '-', fd: a.fuelDiff ? money(a.fuelDiff, cur) : '-',
+      add: a.add ? money(a.add, cur) : '-', ded: a.ded ? money(a.ded, cur) : '-', net: money(it.net_amount, cur),
       _color: n(it.net_amount) < 0 ? COLORS.red : undefined,
     };
   });
   const tot = (f) => items.reduce((a, it) => a + f(it), 0);
-  const ta = (k) => tot((it) => F.amountSplit(it.lines)[k]);
+  const ta = (k) => tot((it) => cols(it)[k]);
   // a quantity total only when every machine counts in the same unit (hours with hours)
   const qTotal = (k) => { const gs = g.map((x) => x[k]).filter((x) => x.units.length); const u = [...new Set(gs.flatMap((x) => x.units))]; return gs.length && u.length === 1 && !gs.some((x) => x.mixed) ? qtyText(gs.reduce((a, x) => a + x.q, 0), u[0]) : ''; };
   rows.push({ m: 'Totals', rq: qTotal('reg'), ra: money(ta('regular'), cur), oq: qTotal('ot'), oa: money(ta('overtime'), cur),
-    oth: money(ta('otherAdd'), cur), fd: money(ta('fuelDiff'), cur), fuel: money(ta('fuel'), cur), adj: money(ta('adjustments'), cur), ded: money(ta('otherDed'), cur),
+    fuel: money(ta('fuel'), cur), fd: money(ta('fuelDiff'), cur), add: money(ta('add'), cur), ded: money(ta('ded'), cur),
     net: money(tot((i) => n(i.net_amount)), cur), _bold: true, _fill: COLORS.soft, _height: 18 });
   const REG = '#EFE7D3'; const OT = '#F7F2E6'; // light bands so the regular / overtime groups read together
   y = P.table(doc, {
@@ -554,17 +565,17 @@ function drawVendor(doc, ctx, b, items) {
       { key: 'no', en: '#', ar: '', width: 16 }, { key: 'm', en: 'Machine', ar: 'الآلية', width: 96, align: 'left', wrap: true },
       { key: 'site', en: 'Site', ar: 'الموقع', width: 34 }, { key: 'bill', en: 'Billing', ar: 'الأساس', width: 40 }, { key: 'days', en: 'Shifts', ar: 'الشفتات', width: 32 },
       { key: 'rq', en: 'Regular hours', ar: 'الساعات العادية', width: 48 }, { key: 'rr', en: 'Regular hour rate', ar: 'السعر العادي', width: 46, align: 'right' },
-      { key: 'ra', en: 'Regular hour amount', ar: 'مبلغ العادي', width: 60, align: 'right', bold: true },
+      { key: 'ra', en: 'Regular amount', ar: 'المبلغ العادي', width: 60, align: 'right', bold: true },
       { key: 'oq', en: 'OT hours', ar: 'ساعات الإضافي', width: 44 }, { key: 'or', en: 'OT hour rate', ar: 'سعر الإضافي', width: 44, align: 'right' },
       { key: 'oa', en: 'OT hour amount', ar: 'مبلغ الإضافي', width: 56, align: 'right', bold: true },
-      { key: 'oth', en: 'Other add.', ar: 'إضافات أخرى', width: 50, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 48, align: 'right' },
-      { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 46, align: 'right' }, { key: 'adj', en: 'Adjust.', ar: 'تسويات', width: 46, align: 'right' },
-      { key: 'ded', en: 'Other ded.', ar: 'حسومات', width: 48, align: 'right' }, { key: 'net', en: `Net (${cur})`, ar: 'الصافي', width: 64, align: 'right', bold: true },
+      { key: 'fuel', en: 'Fuel', ar: 'محروقات', width: 46, align: 'right' }, { key: 'fd', en: 'Fuel diff.', ar: 'فرق محروقات', width: 48, align: 'right' },
+      { key: 'add', en: 'Additions', ar: 'إضافات', width: 48, align: 'right' }, { key: 'ded', en: 'Deductions', ar: 'حسومات', width: 50, align: 'right' },
+      { key: 'net', en: `Net (${cur})`, ar: 'الصافي', width: 64, align: 'right', bold: true },
     ]),
   });
   let sec = 2;
   if (detail.length) {
-    y = sectionTitle(doc, y + 6, `${sec++}. Other additions and deductions (detail of the columns above)`, 'تفاصيل الإضافات والحسومات الأخرى');
+    y = sectionTitle(doc, y + 6, `${sec++}. Detail of the regular amount (lines of the calculation)`, 'تفاصيل المبلغ العادي');
     y = P.table(doc, {
       y, rowHeight: 15, headHeight: 24, fontSize: 7.2, onNewPage: newPage,
       columns: fit([{ key: 'm', en: 'Machine', ar: 'الآلية', width: 70 }, { key: 'desc', en: 'Description', ar: 'البيان', width: 330, align: 'left' }, { key: 'qty', en: 'Qty', ar: 'الكمية', width: 60 },
@@ -607,7 +618,11 @@ function drawVendor(doc, ctx, b, items) {
   let ty = y + 6;
   if (ty + 74 > doc.page.height - doc.page.margins.bottom - 14) { doc.addPage(); ty = doc.page.margins.top + 4; }
   drawReceipt(doc, L, ty, W - 290 - 20);
-  y = totalsBox(doc, ty, { gross: sum('gross_amount'), deductions: sum('deductions_amount'), net: sum('net_amount'), currency: cur });
+  // deductions in the box = what is deducted from the vendor in the system: fuel issued and adjustments "Deduct from
+  // vendor" (and a negative fuel difference); earnings = the rest. Earnings - deductions = the stored net.
+  const dedBox = -tot((it) => { const a = cols(it); return Math.min(0, a.fuel) + a.ded + Math.min(0, a.fuelDiff); });
+  const netBox = sum('net_amount');
+  y = totalsBox(doc, ty, { gross: Math.round((netBox + dedBox) * 100) / 100, deductions: Math.round(dedBox * 100) / 100, net: netBox, currency: cur });
   const approvalNote = b.provisional && b.unapproved_rows
     ? `Includes ${b.unapproved_rows} attendance row(s) NOT approved yet: amounts may change after approval`
     : `Only approved attendance rows are included${ctx.requirePaper ? ', matched with the signed monthly timesheets' : ''}`;
