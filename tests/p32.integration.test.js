@@ -83,6 +83,19 @@ test('plant-days: machines on site per day, type and vendor (Working / Standby /
   }
 });
 
+test('checked-in plant-days: excludes status-only rows without a real check-in', async () => {
+  const d = await ok(h.api().get('/api/integration/checked-in-plant-days?from=2026-10-20&to=2026-10-20&site_ids=8,9').set(KEY));
+  assert.strictEqual(d.rows.length, 1);
+  assert.strictEqual(d.rows[0].type_name, 'Excavator');
+  assert.strictEqual(d.rows[0].working, 1);
+  assert.ok(!d.rows.some((x) => x.type_name === 'Wheel Loader' || x.type_name === 'Roller'), 'these rows had no check-in time');
+  assert.ok(!('equipment_id' in d.rows[0]), 'no individual equipment id leaves the system');
+  for (const q of ['from=2026-10-21&to=2026-10-20&site_ids=8', 'from=2026-10-20&to=2026-10-20']) {
+    const r = await h.api().get(`/api/integration/checked-in-plant-days?${q}`).set(KEY);
+    assert.strictEqual(r.status, 400, q);
+  }
+});
+
 test('a cancelled row does not count, the deployment makes it Pending again', async () => {
   const [[row]] = await require('../config/db').pool.query(
     "SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-20'", [F.exc.equipment_id]);
