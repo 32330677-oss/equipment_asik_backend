@@ -149,9 +149,9 @@ async function plantDays({ from, to, siteIds }) {
 }
 
 /**
- * Checked-in machines only: unlike plantDays, this deliberately omits Working
- * rows without a recorded check-in and all standby/breakdown-only rows without
- * check-in timestamps. One machine contributes once per day across shifts/sites.
+ * Machines for the DPR: a Working row counts only with a recorded check-in; a
+ * Standby or Breakdown row counts as recorded (its times are optional in this
+ * system). One machine contributes once per day across shifts/sites.
  * Returned data is count-only except type/vendor labels needed by DPR mapping.
  */
 async function checkedInPlantDays({ from, to, siteIds }) {
@@ -163,7 +163,8 @@ async function checkedInPlantDays({ from, to, siteIds }) {
        JOIN eq_types t ON t.type_id = e.type_id
        JOIN eq_vendors v ON v.vendor_id = e.vendor_id
       WHERE ea.record_date BETWEEN ? AND ? AND ea.site_id IN (?)
-        AND ea.status <> 'Cancelled' AND ea.check_in_time IS NOT NULL`, [from, to, siteIds]);
+        AND ea.status <> 'Cancelled'
+        AND (ea.day_status IN ('Standby', 'Breakdown') OR ea.check_in_time IS NOT NULL)`, [from, to, siteIds]);
   const best = new Map();
   for (const r of rows) {
     const state = ['Working', 'Standby', 'Breakdown'].includes(r.day_status) ? r.day_status : null;

@@ -83,13 +83,25 @@ test('plant-days: machines on site per day, type and vendor (Working / Standby /
   }
 });
 
-test('checked-in plant-days: excludes status-only rows without a real check-in', async () => {
-  const d = await ok(h.api().get('/api/integration/checked-in-plant-days?from=2026-10-20&to=2026-10-20&site_ids=8,9').set(KEY));
-  assert.strictEqual(d.rows.length, 1);
-  assert.strictEqual(d.rows[0].type_name, 'Excavator');
-  assert.strictEqual(d.rows[0].working, 1);
-  assert.ok(!d.rows.some((x) => x.type_name === 'Wheel Loader' || x.type_name === 'Roller'), 'these rows had no check-in time');
-  assert.ok(!('equipment_id' in d.rows[0]), 'no individual equipment id leaves the system');
+test('checked-in plant-days: Working needs a check-in, Standby / Breakdown count as recorded', async () => {
+  let d = await ok(h.api().get('/api/integration/checked-in-plant-days?from=2026-10-20&to=2026-10-20&site_ids=8,9').set(KEY));
+  const byType = Object.fromEntries(d.rows.map((x) => [x.type_name, x]));
+  assert.strictEqual(byType.Excavator.working, 1);
+  assert.strictEqual(byType['Wheel Loader'].breakdown, 1, 'Breakdown without times counts');
+  assert.strictEqual(byType.Roller.standby, 1, 'Standby without times counts');
+  assert.ok(!byType['Mobile Crane'], 'nothing recorded: not counted');
+  assert.ok(d.rows.every((x) => !('equipment_id' in x)), 'no individual equipment id leaves the system');
+  // a Working row without a check-in time does not count
+  const db = require('../config/db').pool;
+  const [[row]] = await db.query(
+    "SELECT eq_attendance_id, check_in_time FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-20'", [F.exc.equipment_id]);
+  await db.query('UPDATE eq_attendance SET check_in_time = NULL WHERE eq_attendance_id = ?', [row.eq_attendance_id]);
+  try {
+    d = await ok(h.api().get('/api/integration/checked-in-plant-days?from=2026-10-20&to=2026-10-20&site_ids=8,9').set(KEY));
+    assert.ok(!d.rows.some((x) => x.type_name === 'Excavator'), 'Working without check-in is not counted');
+  } finally {
+    await db.query('UPDATE eq_attendance SET check_in_time = ? WHERE eq_attendance_id = ?', [row.check_in_time, row.eq_attendance_id]);
+  }
   for (const q of ['from=2026-10-21&to=2026-10-20&site_ids=8', 'from=2026-10-20&to=2026-10-20']) {
     const r = await h.api().get(`/api/integration/checked-in-plant-days?${q}`).set(KEY);
     assert.strictEqual(r.status, 400, q);

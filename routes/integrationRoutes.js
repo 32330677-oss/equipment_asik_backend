@@ -7,7 +7,7 @@
 //   GET /api/integration/plant-days?from=YYYY-MM-DD&to=YYYY-MM-DD&site_ids=8,9
 //        machines on site per day, type and vendor (Working / Standby / Breakdown), for cumulative equipment-days
 //   GET /api/integration/checked-in-plant-days?from=YYYY-MM-DD&to=YYYY-MM-DD&site_ids=8,9
-//        machines with a recorded check-in, grouped by day / type / vendor (counts only)
+//        Working with a check-in + Standby / Breakdown as recorded, by day / type / vendor (counts only)
 // Auth: Authorization: Bearer <INTEGRATION_TOKEN> (middleware/integrationAuth). Rate limited.
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
