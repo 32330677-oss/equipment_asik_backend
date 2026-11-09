@@ -148,10 +148,48 @@ async function plantDays({ from, to, siteIds }) {
     || a.vendor_name.localeCompare(b.vendor_name));
 }
 
+/**
+ * Machines for the DPR: a Working row counts only with a recorded check-in; a
+ * Standby or Breakdown row counts as recorded (its times are optional in this
+ * system). One machine contributes once per day across shifts/sites.
+ * Returned data is count-only except type/vendor labels needed by DPR mapping.
+ */
+async function checkedInPlantDays({ from, to, siteIds }) {
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(ea.record_date, '%Y-%m-%d') AS d, ea.equipment_id, ea.day_status,
+            t.type_id, t.type_name, v.vendor_id, v.vendor_name
+       FROM eq_attendance ea
+       JOIN eq_equipment e ON e.equipment_id = ea.equipment_id
+       JOIN eq_types t ON t.type_id = e.type_id
+       JOIN eq_vendors v ON v.vendor_id = e.vendor_id
+      WHERE ea.record_date BETWEEN ? AND ? AND ea.site_id IN (?)
+        AND ea.status <> 'Cancelled'
+        AND (ea.day_status IN ('Standby', 'Breakdown') OR ea.check_in_time IS NOT NULL)`, [from, to, siteIds]);
+  const best = new Map();
+  for (const r of rows) {
+    const state = ['Working', 'Standby', 'Breakdown'].includes(r.day_status) ? r.day_status : null;
+    if (!state) continue;
+    const k = `${r.d}|${r.equipment_id}`;
+    const cur = best.get(k);
+    if (!cur || RANK[state] > RANK[cur.state]) best.set(k, { ...r, state });
+  }
+  const out = new Map();
+  for (const m of best.values()) {
+    const k = `${m.d}|${m.type_id}|${m.vendor_id}`;
+    const o = out.get(k) || { date: m.d, type_id: Number(m.type_id), type_name: m.type_name,
+      vendor_id: Number(m.vendor_id), vendor_name: m.vendor_name, working: 0, standby: 0, breakdown: 0, machines: 0 };
+    o[m.state.toLowerCase()] += 1;
+    o.machines += 1;
+    out.set(k, o);
+  }
+  return [...out.values()].sort((a, b) => a.date.localeCompare(b.date) || a.type_name.localeCompare(b.type_name)
+    || a.vendor_name.localeCompare(b.vendor_name));
+}
+
 function emptyCounts() {
   const c = { machines: 0 };
   for (const s of STATES) c[s.toLowerCase()] = 0;
   return c;
 }
 
-module.exports = { listSites, listTypes, listVendors, dailyPlantSummary, plantDays, STATES };
+module.exports = { listSites, listTypes, listVendors, dailyPlantSummary, plantDays, checkedInPlantDays, STATES };
