@@ -731,6 +731,27 @@ See every site right now: who is working, on break, broken, not arrived, and the
 2. Switch between **By site** and **By vendor**.
 3. Tick **Problems only** to see late machines, breakdowns and anomalies.
 
+## Daily timesheet in Excel (all machines, ready to print)
+id: daily-timesheet-excel
+roles: Supervisor, Admin, Accountant
+screens: my-sites, live-board, paper-sheets
+open: my-sites
+popular: Supervisor
+keywords: timesheet time sheet excel xlsx print paper attendance all machines daily sheet sign signature blank sheet download
+related: open-site-day, check-in
+
+One Excel sheet with every machine of the day, grouped by site, then shift, then vendor, with the **Supervisor** and **Approved by** signatures at the end. Print it to keep a paper record.
+
+1. Supervisor: on **My sites**, tap **Daily timesheet (Excel)** (also in the menu). Office: the same button is on the **Live board** and on **Paper sheets**.
+2. Choose the day (**Yesterday**, **Today**, **Tomorrow** or **Other day**) and the shift: **Both shifts**, **Day** or **Night**. Both shifts come out in the same sheet.
+3. Office only: leave **All sites** for every site, or choose one site.
+4. Tap **Download Excel**, then print it (A4 landscape, already set).
+
+- A machine already recorded on that day comes out filled: status, start, end, downtime, work hours and remarks.
+- A machine with nothing recorded stays empty, so the sheet can be filled by hand. A day that has not started yet gives a blank sheet.
+- A supervisor only gets the sites and shifts he supervises.
+Tip: You can download a blank sheet up to 31 days ahead, to print it before the day.
+
 ## Daily equipment report for the client
 id: client-daily-report
 roles: Admin, Accountant
