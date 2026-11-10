@@ -1,6 +1,6 @@
 // P43 — Daily Equipment Timesheet (Excel): one worksheet with every machine of the day, Site > Shift > Vendor;
 // recorded machines filled, the others left empty for the pen; signatures at the end; supervisor limits.
-const { test, before } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const ExcelJS = require('exceljs');
 const h = require('./helpers');
@@ -53,6 +53,7 @@ before(async () => {
   night = await ok(h.api().post('/api/equipment/machines').set(A()).send({ vendor_id: v2.vendor_id, type_id: 2, plate_number: 'N-5' }));
   await ok(h.api().post('/api/equipment/deployments').set(A()).send({ equipment_id: night.equipment_id, site_id: 9, shift_type: 'Night', assigned_date: '2026-10-01' }));
 });
+after(h.closePool); // close the DB pool, or the test process never ends (CI waits until its timeout)
 
 test('admin: one sheet with every site and shift, recorded machines filled, the others empty, signatures at the end', async () => {
   const { all, rowOf } = await sheetOf(await bin(h.api().get(URL).query({ date: '2026-10-20' }).set(A())));
