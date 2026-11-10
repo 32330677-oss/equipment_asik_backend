@@ -22,11 +22,14 @@ async function sheetOf(res) {
   assert.strictEqual(wb.worksheets.length, 1, 'one worksheet only');
   const ws = wb.worksheets[0];
   const text = [];
-  ws.eachRow((row) => row.eachCell((c) => { if (c.text) text.push(String(c.text)); }));
+  // the text of a cell; the other cells of a merged range give '' (exceljs throws on .text of a merged cell whose
+  // first cell is empty, e.g. the logo area A1:B3)
+  const textOf = (c) => (c.isMerged && c.master.address !== c.address ? '' : String(c.text || ''));
+  ws.eachRow((row) => row.eachCell((c) => { const t = textOf(c); if (t) text.push(t); }));
   const all = text.join('\n');
   const rowOf = (code) => {
     let found = null;
-    ws.eachRow((row, n) => { if (!found && String(ws.getCell(`B${n}`).text || '').startsWith(code)) found = n; });
+    ws.eachRow((row, n) => { if (!found && textOf(ws.getCell(`B${n}`)).startsWith(code)) found = n; });
     assert.ok(found, `machine ${code} is listed`);
     const v = (c) => ws.getCell(`${c}${found}`).value;
     return { status: v('C'), start: v('D'), end: v('E'), downtime: v('F'), work: v('G'), remarks: v('H') };
