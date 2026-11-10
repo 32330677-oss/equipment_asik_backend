@@ -21,6 +21,7 @@ const pay = require('../controllers/equipment/eqPayrollController');
 const monthlyTerms = require('../controllers/equipment/monthlyTermsController');
 const liveC = require('../controllers/equipment/eqLiveController');
 const clientRep = require('../controllers/equipment/clientReportController');
+const dailyTs = require('../controllers/equipment/dailyTimesheetController');
 const AS = requireRole('Admin', 'Supervisor');
 const fd = require('../controllers/equipment/eqFuelDiffController');
 const dnr = require('../controllers/equipment/dnrController');
@@ -208,6 +209,7 @@ router.get('/live', ACS, liveC.live);
 router.get('/live/sites/:siteId', ACS, liveC.liveSite);
 router.get('/reports/daily.pdf', ACS, liveC.dailyPdf);
 router.get('/reports/client-daily.pdf', ACS, clientRep.clientDailyPdf);
+router.get('/reports/daily-timesheet.xlsx', ACS, dailyTs.dailyTimesheetXlsx); // one Excel sheet: every machine of the day, Site > Shift > Vendor
 router.get('/reports/utilization', AC, liveC.utilization);
 router.get('/reports/hours', AC, require('../controllers/equipment/hoursReportController').hours);
 
