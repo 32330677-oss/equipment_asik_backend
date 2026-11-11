@@ -108,6 +108,53 @@ test('checked-in plant-days: Working needs a check-in, Standby / Breakdown count
   }
 });
 
+test('invoiced plant-days: machines on site and how many an ISSUED invoice covers (DPR internal record)', async () => {
+  const db = require('../config/db').pool;
+  const q = '/api/integration/invoiced-plant-days?from=2026-10-20&to=2026-10-20&site_ids=8,9';
+  let d = await ok(h.api().get(q).set(KEY));
+  assert.deepStrictEqual(d.rows.map((r) => [r.date, r.machines, r.invoiced]), [['2026-10-20', 3, 0]], 'excavator + loader + roller, nothing invoiced');
+  const [[admin]] = await db.query("SELECT user_id FROM users WHERE role = 'Admin' ORDER BY user_id LIMIT 1");
+  const batch = async (status, finalized) => {
+    const [r] = await db.query(
+      `INSERT INTO eq_payroll_batches (start_date, end_date, currency, status, is_finalized, generated_by_user_id)
+       VALUES ('2026-10-01', '2026-10-31', 'SYP', ?, ?, ?)`, [status, finalized, admin.user_id]);
+    return r.insertId;
+  };
+  const draft = await batch('Generated', 0);
+  const issued = await batch('Generated', 1);
+  try {
+    // a draft (no number) does not count
+    await db.query("INSERT INTO eq_invoice_coverage (eq_batch_id, equipment_id, site_id, start_date, end_date) VALUES (?, ?, 8, '2026-10-01', '2026-10-31')",
+      [draft, F.exc.equipment_id]);
+    d = await ok(h.api().get(q).set(KEY));
+    assert.strictEqual(d.rows[0].invoiced, 0, 'a draft invoice does not make the day final');
+    // an issued invoice of the excavator (S08) and of the loader for every site
+    await db.query(`INSERT INTO eq_invoice_coverage (eq_batch_id, equipment_id, site_id, start_date, end_date) VALUES
+      (?, ?, 8, '2026-10-01', '2026-10-31'), (?, ?, NULL, '2026-10-01', '2026-10-31')`,
+    [issued, F.exc.equipment_id, issued, F.loader.equipment_id]);
+    d = await ok(h.api().get(q).set(KEY));
+    assert.strictEqual(d.rows[0].machines, 3);
+    assert.strictEqual(d.rows[0].invoiced, 2, 'the roller is not invoiced yet');
+    assert.ok(d.rows.every((r) => !('equipment_id' in r)), 'counts only');
+    // S08 only: both machines there are invoiced
+    d = await ok(h.api().get('/api/integration/invoiced-plant-days?from=2026-10-20&to=2026-10-20&site_ids=8').set(KEY));
+    assert.deepStrictEqual([d.rows[0].machines, d.rows[0].invoiced], [2, 2]);
+    // a voided invoice does not count any more
+    await db.query("UPDATE eq_payroll_batches SET status = 'Voided' WHERE eq_batch_id = ?", [issued]);
+    d = await ok(h.api().get(q).set(KEY));
+    assert.strictEqual(d.rows[0].invoiced, 0);
+  } finally {
+    await db.query('DELETE FROM eq_invoice_coverage WHERE eq_batch_id IN (?, ?)', [draft, issued]);
+    await db.query('DELETE FROM eq_payroll_batches WHERE eq_batch_id IN (?, ?)', [draft, issued]);
+  }
+  for (const bad of ['from=2026-10-21&to=2026-10-20&site_ids=8', 'from=2026-10-20&to=2026-10-20']) {
+    const r = await h.api().get(`/api/integration/invoiced-plant-days?${bad}`).set(KEY);
+    assert.strictEqual(r.status, 400, bad);
+  }
+  const r = await h.api().get(q);
+  assert.strictEqual(r.status, 401, 'token needed');
+});
+
 test('a cancelled row does not count, the deployment makes it Pending again', async () => {
   const [[row]] = await require('../config/db').pool.query(
     "SELECT eq_attendance_id FROM eq_attendance WHERE equipment_id = ? AND record_date = '2026-10-20'", [F.exc.equipment_id]);

@@ -186,10 +186,70 @@ async function checkedInPlantDays({ from, to, siteIds }) {
     || a.vendor_name.localeCompare(b.vendor_name));
 }
 
+/**
+ * Which machine-days on these sites are covered by an ISSUED invoice (numbered: issued, handed over to finance or
+ * withdrawn from finance), for the DPR's internal record: a day whose machines are all invoiced is final there.
+ * The machines of a day are counted like checkedInPlantDays (Working with a check-in, Standby / Breakdown as recorded).
+ * Counts and invoice numbers only: no machine, vendor, hour or amount leaves the system.
+ */
+async function invoicedPlantDays({ from, to, siteIds }) {
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(ea.record_date, '%Y-%m-%d') AS d, ea.equipment_id, ea.site_id
+       FROM eq_attendance ea
+      WHERE ea.record_date BETWEEN ? AND ? AND ea.site_id IN (?)
+        AND ea.status <> 'Cancelled'
+        AND (ea.day_status IN ('Standby', 'Breakdown') OR (ea.day_status = 'Working' AND ea.check_in_time IS NOT NULL))`,
+    [from, to, siteIds]);
+  // machine-days (a machine once a day; on two sites the same day it must be invoiced for each)
+  const days = new Map();
+  for (const r of rows) {
+    const list = days.get(r.d) || new Map();
+    const sites = list.get(Number(r.equipment_id)) || new Set();
+    sites.add(Number(r.site_id));
+    list.set(Number(r.equipment_id), sites);
+    days.set(r.d, list);
+  }
+  const ids = [...new Set(rows.map((r) => Number(r.equipment_id)))];
+  const cover = new Map();
+  if (ids.length) {
+    const [cov] = await pool.query(
+      `SELECT c.equipment_id, c.site_id, DATE_FORMAT(c.start_date, '%Y-%m-%d') AS c_from, DATE_FORMAT(c.end_date, '%Y-%m-%d') AS c_to,
+              b.eq_batch_id, b.status,
+              (SELECT x.invoice_no FROM eq_invoices x LEFT JOIN eq_invoice_cancellations xc ON xc.invoice_id = x.invoice_id
+                WHERE x.eq_batch_id = b.eq_batch_id AND x.kind = 'Vendor' AND x.status = 'Issued' AND xc.invoice_id IS NULL
+                ORDER BY x.invoice_id LIMIT 1) AS invoice_no
+         FROM eq_invoice_coverage c JOIN eq_payroll_batches b ON b.eq_batch_id = c.eq_batch_id
+        WHERE b.status IN ('Generated','HandedOver','Returned') AND b.is_finalized = 1
+          AND c.start_date <= ? AND c.end_date >= ? AND c.equipment_id IN (?)`, [to, from, ids]);
+    for (const c of cov) {
+      const list = cover.get(Number(c.equipment_id)) || [];
+      list.push(c);
+      cover.set(Number(c.equipment_id), list);
+    }
+  }
+  const out = [];
+  for (const [d, machines] of [...days.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    let invoiced = 0;
+    let handedOver = 0;
+    const nos = new Set();
+    for (const [eid, sites] of machines) {
+      const list = (cover.get(eid) || []).filter((c) => c.c_from <= d && c.c_to >= d);
+      const covering = [...sites].map((s) => list.find((c) => c.site_id === null || Number(c.site_id) === s));
+      if (covering.every(Boolean)) {
+        invoiced += 1;
+        if (covering.every((c) => c.status === 'HandedOver')) handedOver += 1;
+        for (const c of covering) nos.add(c.invoice_no || `batch #${c.eq_batch_id}`);
+      }
+    }
+    out.push({ date: d, machines: machines.size, invoiced, handed_over: handedOver, invoices: [...nos].sort() });
+  }
+  return out;
+}
+
 function emptyCounts() {
   const c = { machines: 0 };
   for (const s of STATES) c[s.toLowerCase()] = 0;
   return c;
 }
 
-module.exports = { listSites, listTypes, listVendors, dailyPlantSummary, plantDays, checkedInPlantDays, STATES };
+module.exports = { listSites, listTypes, listVendors, dailyPlantSummary, plantDays, checkedInPlantDays, invoicedPlantDays, STATES };
