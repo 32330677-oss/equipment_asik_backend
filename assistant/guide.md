@@ -731,26 +731,28 @@ See every site right now: who is working, on break, broken, not arrived, and the
 2. Switch between **By site** and **By vendor**.
 3. Tick **Problems only** to see late machines, breakdowns and anomalies.
 
-## Daily timesheet in Excel (all machines, ready to print)
-id: daily-timesheet-excel
+## Weekly timesheet in Excel (per vendor, ready to print)
+id: weekly-timesheet-excel
 roles: Supervisor, Admin, Accountant
 screens: my-sites, live-board, paper-sheets
 open: my-sites
 popular: Supervisor
-keywords: timesheet time sheet excel xlsx print paper attendance all machines daily sheet sign signature blank sheet download
+keywords: timesheet time sheet weekly week excel xlsx print paper attendance vendor machines sign signature driver lunch blank sheet download
 related: open-site-day, check-in
 
-One Excel sheet with every machine of the day, grouped by site, then shift, then vendor, with the **Supervisor** and **Approved by** signatures at the end. Print it to keep a paper record.
+One Excel file for a week (Saturday to Thursday): one sheet per vendor, one box per machine with a line per day. Print it to keep a paper record signed every day.
 
-1. Supervisor: on **My sites**, tap **Daily timesheet (Excel)** (also in the menu). Office: the same button is on the **Live board** and on **Paper sheets**.
-2. Choose the day (**Yesterday**, **Today**, **Tomorrow** or **Other day**) and the shift: **Both shifts**, **Day** or **Night**. Both shifts come out in the same sheet.
+1. Supervisor: on **My sites**, tap **Weekly timesheet (Excel)** (also in the menu). Office: the same button is on the **Live board** and on **Paper sheets**.
+2. Choose the week (**This week**, **Next week**, **Last week** or **Other week**) and the shift: **Both shifts**, **Day** or **Night**.
 3. Office only: leave **All sites** for every site, or choose one site.
-4. Tap **Download Excel**, then print it (A4 landscape, already set).
+4. Tap **Download Excel**, then print each vendor's sheet (A4 landscape, two machines per page).
 
-- A machine already recorded on that day comes out filled: status, start, end, downtime, work hours and remarks.
-- A machine with nothing recorded stays empty, so the sheet can be filled by hand. A day that has not started yet gives a blank sheet.
+- Every day has **In**, **Out**, **Lunch (min)**, **Our supervisor** and **Vendor driver** signatures, and **Remarks**.
+- A day already recorded comes out filled; a day with nothing recorded stays empty to fill by hand. The signature boxes are always empty.
+- A day the machine is not on site is grey, with the reason. Friday appears only when the machine worked.
+- At the end of each vendor: **Accountant** and **Administration** (final approval) signatures.
 - A supervisor only gets the sites and shifts he supervises.
-Tip: You can download a blank sheet up to 31 days ahead, to print it before the day.
+Tip: You can download next week's blank sheet before it starts, to print it in advance.
 
 ## Daily equipment report for the client
 id: client-daily-report
