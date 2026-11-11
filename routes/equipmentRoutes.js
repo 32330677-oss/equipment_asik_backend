@@ -209,7 +209,8 @@ router.get('/live', ACS, liveC.live);
 router.get('/live/sites/:siteId', ACS, liveC.liveSite);
 router.get('/reports/daily.pdf', ACS, liveC.dailyPdf);
 router.get('/reports/client-daily.pdf', ACS, clientRep.clientDailyPdf);
-router.get('/reports/daily-timesheet.xlsx', ACS, dailyTs.dailyTimesheetXlsx); // one Excel sheet: every machine of the day, Site > Shift > Vendor
+router.get('/reports/weekly-timesheet.xlsx', ACS, dailyTs.weeklyTimesheetXlsx); // weekly timesheet: one sheet per vendor, a block per machine
+router.get('/reports/weekly-timesheet/week', ACS, dailyTs.week); // the week (from / to) of a date, for the app
 router.get('/reports/utilization', AC, liveC.utilization);
 router.get('/reports/hours', AC, require('../controllers/equipment/hoursReportController').hours);
 
