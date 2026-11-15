@@ -540,6 +540,40 @@ function drawVendor(doc, ctx, b, items) {
     const regular = Math.round((n(it.net_amount) - a.overtime - a.fuel - a.fuelDiff - add - ded) * 100) / 100;
     return { regular, overtime: a.overtime, fuel: a.fuel, fuelDiff: a.fuelDiff, add, ded };
   };
+  // 15 Nov 2026 (display only): a monthly machine shows in "Regular hours" the NET hours paid (hours of the base -
+  // absence / shortfall / breakdown + offset) x the hourly price, so qty x rate = the regular amount. The base is
+  // stored as a fraction of a month: its hours = fraction x divisor x hours per day. When the lines can not be put in
+  // hours at ONE hourly price matching the amount (typed hourly price, several months at different prices, lines in
+  // days...), the cell stays as before.
+  const monthlyHours = (it, regAmt) => {
+    if (it.billing_mode !== 'Monthly') return null;
+    const calc = F.monthlyCalcOf(it);
+    const ls = it.lines.filter((l) => !['Overtime', ...F.SPECIAL_LINES].includes(l.line_type));
+    let hours = 0; const prices = [];
+    for (const l of ls) {
+      const qty = n(l.quantity);
+      if (l.line_type === 'MonthlyBase') {
+        const m = /^(\d{4}-\d{2})/.exec(String(l.note || ''));
+        const c = calc.find((x) => m && x.month === m[1]);
+        const D = c ? n(c.divisor ?? c.working_days) : 0;
+        const hpd = n((c && c.hours_per_day) ?? (it.rate && it.rate.standard_hours_per_day));
+        if (!D || !hpd) return null;
+        hours += (Math.round(qty * D * 100) / 100) * hpd; // the fraction is stored with 4 decimals: back to whole base days
+        if (qty) prices.push(n(l.unit_price) / D / hpd);
+      } else if (l.unit === 'h') {
+        const sign = n(l.unit_price) < 0 || (!n(l.unit_price) && n(l.amount) < 0) ? -1 : 1;
+        hours += sign * qty;
+        if (n(l.unit_price)) prices.push(Math.abs(n(l.unit_price)));
+      } else if (qty || n(l.amount)) return null;
+    }
+    if (!prices.length) return null;
+    const H = prices[0];
+    if (prices.some((p) => Math.abs(p - H) > 0.006)) return null;
+    hours = Math.round(hours * 100) / 100;
+    if (Math.abs(hours * H - regAmt) > 0.05) return null;
+    return { qty: qtyText(hours, 'h'), rate: fmt.num(H, 2), amt: money(regAmt, cur), amount: regAmt, mixed: false, units: ['h'], q: hours };
+  };
+  g.forEach((x, i) => { const h = monthlyHours(items[i], cols(items[i]).regular); if (h) x.reg = h; });
   const rows = items.map((it, i) => {
     const a = cols(it); const { reg, ot } = g[i];
     const dnr = it.billing_mode === 'DNR';
