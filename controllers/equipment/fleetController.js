@@ -64,7 +64,8 @@ function machineSummarySql(where) {
       (SELECT GROUP_CONCAT(CONCAT(s3.site_code, IF(a3.shift_type = 'Night', ' (Night)', '')) ORDER BY a3.shift_type, s3.site_code SEPARATOR ', ')
          FROM eq_site_assignments a3 JOIN sites s3 ON s3.site_id = a3.site_id WHERE a3.equipment_id = e.equipment_id AND ${active('a3')}) AS deployments_today,
       a.eq_assignment_id, a.site_id, a.shift_type, a.assigned_date, a.unassigned_date, s.site_code, s.site_name,
-      rc.rate_card_id, rc.billing_mode, rc.hourly_rate, rc.daily_rate, rc.monthly_rate, vc.currency,
+      rc.rate_card_id, rc.billing_mode, rc.hourly_rate, rc.daily_rate, rc.monthly_rate, rc.shift_type AS rate_shift_type, vc.currency,
+      (SELECT rc3.monthly_rate FROM eq_rate_cards rc3 WHERE rc3.equipment_id = e.equipment_id AND rc3.shift_type = 'Night' AND ${activeOnSql('rc3', 'effective_from', 'effective_to')} LIMIT 1) AS night_monthly_rate,
       (SELECT COUNT(*) FROM eq_dnr_rates dr WHERE dr.status = 'Active' AND dr.vendor_id = e.vendor_id
          AND (dr.equipment_id IS NULL OR dr.equipment_id = e.equipment_id) AND (dr.effective_to IS NULL OR dr.effective_to >= CURDATE())) AS dnr_rates
     FROM eq_equipment e
@@ -74,11 +75,14 @@ function machineSummarySql(where) {
       SELECT a2.eq_assignment_id FROM eq_site_assignments a2 WHERE a2.equipment_id = e.equipment_id AND ${active('a2')}
       ORDER BY a2.shift_type, a2.assigned_date, a2.eq_assignment_id LIMIT 1)
     LEFT JOIN sites s ON s.site_id = a.site_id
-    LEFT JOIN eq_rate_cards rc ON rc.equipment_id = e.equipment_id AND ${activeOnSql('rc', 'effective_from', 'effective_to')}
+    LEFT JOIN eq_rate_cards rc ON rc.rate_card_id = (
+      SELECT rc2.rate_card_id FROM eq_rate_cards rc2 WHERE rc2.equipment_id = e.equipment_id AND ${activeOnSql('rc2', 'effective_from', 'effective_to')}
+      ORDER BY rc2.shift_type IS NOT NULL, rc2.shift_type, rc2.effective_from DESC LIMIT 1)
     LEFT JOIN eq_vendor_contracts vc ON vc.vendor_contract_id = rc.vendor_contract_id
     ${where}`;
 }
-const todayParams = (today) => [today, today, today, today, today, today];
+// one per date placeholder of machineSummarySql (deployments today, the Night card, the deployment shown, the card shown)
+const todayParams = (today) => [today, today, today, today, today, today, today, today];
 
 exports.listMachines = async (req, res) => {
   const { page, pageSize, offset } = pageParams(req.query);

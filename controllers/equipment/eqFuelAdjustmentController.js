@@ -183,7 +183,7 @@ exports.createAdjustment = async (req, res) => {
   const d = validate(req.body, {
     equipment_id: v.id({ required: true }), site_id: v.id(), adjustment_date: v.date({ required: true }),
     adjustment_type: v.enumOf(TYPES, { required: true }), amount: v.number({ required: true, min: -99999999, max: 99999999, decimals: 2 }),
-    reason: v.string({ required: true, max: 500 }),
+    reason: v.string({ required: true, max: 500 }), shift_type: v.enumOf(['Day', 'Night']),
   });
   if (d.amount === 0) throw AppError.validation({ amount: 'cannot be 0' });
   const row = await withTransaction(async (conn) => {
@@ -191,15 +191,20 @@ exports.createAdjustment = async (req, res) => {
     if (d.site_id) await C.loadSite(conn, d.site_id);
     // 14 Oct 2026: refused inside an invoice handed over to finance (an issued invoice is brought up to date by itself)
     await lock.assertOpen(conn, { equipmentId: d.equipment_id, siteId: d.site_id || null, from: d.adjustment_date, what: 'An adjustment on this date' });
-    const card = await C.rateCardOn(conn, d.equipment_id, d.adjustment_date);
+    // 16 Nov 2026: a machine with a Day and a Night card: the adjustment says which shift card it goes to
+    const shifted = await C.hasShiftCards(conn, d.equipment_id, d.adjustment_date);
+    if (shifted && !d.shift_type) throw AppError.validation({ shift_type: 'this machine has a Day and a Night card on that date: say which shift the adjustment is for' });
+    if (!shifted) d.shift_type = null;
+    const card = await C.rateCardOn(conn, d.equipment_id, d.adjustment_date, d.shift_type || undefined);
+    if (shifted && !card) throw AppError.validation({ shift_type: `the machine has no ${d.shift_type} card on that date` });
     // a machine paid only per delivery note (DNR) has no rate card: the currency is the one of its DNR price
     const dnrPrice = card ? null : (await DNR.ratesForMachines(conn, [d.equipment_id], d.adjustment_date, d.adjustment_date))[0];
     if (!card && !dnrPrice) throw AppError.conflict('NO_RATE_CARD', 'The machine has no rate card or DNR price on that date; the currency is unknown.');
     if (!card && !d.site_id) throw AppError.validation({ site_id: 'is required for a machine paid per delivery note (DNR)' });
     const [r] = await conn.execute(
-      `INSERT INTO eq_adjustments (equipment_id, site_id, adjustment_date, adjustment_type, amount, currency, reason, created_by_user_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [d.equipment_id, d.site_id || null, d.adjustment_date, d.adjustment_type, d.amount, card ? card.currency : dnrPrice.currency, d.reason, req.user.user_id]);
+      `INSERT INTO eq_adjustments (equipment_id, site_id, shift_type, adjustment_date, adjustment_type, amount, currency, reason, created_by_user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [d.equipment_id, d.site_id || null, d.shift_type || null, d.adjustment_date, d.adjustment_type, d.amount, card ? card.currency : dnrPrice.currency, d.reason, req.user.user_id]);
     const [[out]] = await conn.execute('SELECT * FROM eq_adjustments WHERE adjustment_id = ?', [r.insertId]);
     await audit.log(conn, { table: 'eq_adjustments', id: r.insertId, action: 'create', newValues: out, ...audit.ctx(req) });
     return out;

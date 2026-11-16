@@ -51,7 +51,8 @@ async function live(opts = {}) {
 
   const downBy = {};
   for (const d of downs) (downBy[d.eq_attendance_id] = downBy[d.eq_attendance_id] || []).push(d);
-  const cardBy = Object.fromEntries(cards.map((c) => [c.equipment_id, c]));
+  // 16 Nov 2026: a machine with a Day and a Night card: the card of the deployment's shift
+  const cardBy = Object.fromEntries(cards.map((c) => [`${c.equipment_id}|${c.shift_type || 'All'}`, c]));
 
   const kpis = { deployed: 0, on_site_now: 0, working: 0, on_break: 0, breakdown: 0, standby: 0, not_arrived: 0, finished: 0, absent: 0, holiday: 0, forgotten_checkout: 0, late: 0, hours_today: 0 };
   const cost = {};
@@ -84,7 +85,7 @@ async function live(opts = {}) {
     if (late) kpis.late += 1;
     kpis.hours_today += workMin / 60;
     let estimate = null;
-    const c = cardBy[d.equipment_id];
+    const c = cardBy[`${d.equipment_id}|All`] || cardBy[`${d.equipment_id}|${d.shift_type}`];
     if (opts.withMoney && c && row && row.day_status !== 'Absent' && row.day_status !== 'Holiday') {
       const std = Number(c.standard_hours_per_day) || 8;
       if (c.billing_mode === 'Hourly') estimate = (workMin / 60) * Number(c.hourly_rate);

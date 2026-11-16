@@ -101,7 +101,7 @@ function itemView(it, names) {
   return {
     equipment_id: it.equipment_id, equipment_code: names.eq[it.equipment_id]?.equipment_code, machine_label: names.eq[it.equipment_id]?.machine_label || null, type_name: names.eq[it.equipment_id]?.type_name,
     vendor_id: it.vendor_id, vendor_name: names.vendor[it.vendor_id]?.vendor_name, site_id: it.site_id, site_code: names.site[it.site_id]?.site_code,
-    currency: it.currency, billing_mode: it.billing_mode, rate_card_id: it.rate_card_id,
+    currency: it.currency, billing_mode: it.billing_mode, rate_card_id: it.rate_card_id, shift_type: it.shift_type || null,
     days_recorded: it.days_recorded, worked_days: it.worked_days, work_hours: hoursOf(it.work_minutes), overtime_hours: hoursOf(it.overtime_minutes),
     standby_hours: hoursOf(it.standby_minutes), breakdown_hours: hoursOf(it.breakdown_minutes), topup_hours: hoursOf(it.topup_minutes),
     gross: toDecimalString(it.gross_cents), deductions: toDecimalString(it.deductions_cents), net: toDecimalString(it.net_cents),
@@ -290,7 +290,7 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
   if (extra.accept_reason) await conn.execute('UPDATE eq_payroll_batches SET accept_blockers_reason = ? WHERE eq_batch_id = ?', [extra.accept_reason, b.insertId]);
   const batchId = b.insertId;
   // the Admin's offset decisions that apply to this batch (a month of a monthly machine it bills)
-  const billed = new Set(items.filter((i) => i.billing_mode === 'Monthly').flatMap((i) => (i.months || []).map((m) => `${i.equipment_id}|${m.month}`)));
+  const billed = new Set(items.filter((i) => i.billing_mode === 'Monthly').flatMap((i) => (i.months || []).map((m) => P.offsetKey(i.equipment_id, m.month, i.shift_type || null))));
   const offsets = P.normalizeOffsets(scope.offsets).filter((k) => billed.has(k));
   if (offsets.length) await conn.execute('UPDATE eq_payroll_batches SET offset_months = ? WHERE eq_batch_id = ?', [JSON.stringify(offsets), batchId]);
   // machines chosen by hand (11 Oct 2026); empty = the whole scope
@@ -320,8 +320,8 @@ async function persistBatch(conn, req, scope, items, extra = {}) {
     }
     // each deployed day of a monthly machine is billed by one batch only (11 Oct 2026)
     for (const md of it.monthly_days || []) {
-      await conn.execute('INSERT INTO eq_payroll_monthly_days (eq_batch_id, eq_item_id, equipment_id, day, site_id) VALUES (?, ?, ?, ?, ?)',
-        [batchId, ir.insertId, it.equipment_id, md.day, md.site_id]);
+      await conn.execute('INSERT INTO eq_payroll_monthly_days (eq_batch_id, eq_item_id, equipment_id, day, shift_key, site_id) VALUES (?, ?, ?, ?, ?, ?)',
+        [batchId, ir.insertId, it.equipment_id, md.day, md.shift_key || 'All', md.site_id]);
     }
     for (const pr of it.per_row) {
       const r = pr.row;
@@ -671,7 +671,7 @@ async function batchDetail(conn, id, { withDrift = true } = {}) {
       const snap = P.parseJson(i.rate_snapshot) || {};
       const inv = (kind) => (invoices.find((x) => live(x) && x.kind === kind && x.eq_item_id === i.eq_item_id) || {}).invoice_no || null;
       return {
-        ...i, ...(snap.labels || {}), rate_snapshot: snap, lines: byItem[i.eq_item_id] || [],
+        ...i, ...(snap.labels || {}), shift_type: snap.shift_type || null, rate_snapshot: snap, lines: byItem[i.eq_item_id] || [],
         fuel_difference: (byItem[i.eq_item_id] || []).filter((l) => l.line_type === 'FuelPriceDifference').reduce((a, l) => a + Number(l.amount), 0).toFixed(2),
         site_allocation: snap.site_allocation ? snap.site_allocation.map((a) => ({ site_id: a.site_id, site_code: siteCode[a.site_id], hours: a.hours, share_pct: a.share_pct, amount: (a.amount_cents / 100).toFixed(2) })) : null,
         invoice_no: inv('Machine'), fuel_invoice_no: inv('FuelDiff'),
@@ -864,6 +864,7 @@ async function reviewSummaryOf(conn, batch) {
      WHERE i.eq_batch_id = ? AND i.billing_mode = 'Monthly' ORDER BY e.equipment_code`, [id]);
   for (const m of monthly) {
     const snap = P.parseJson(m.rate_snapshot) || {};
+    if (snap.shift_type) m.equipment_code = `${m.equipment_code} (${snap.shift_type})`;
     for (const t of snap.monthly_terms || []) {
       const parts = [];
       if (t.amount_source === 'manual') parts.push(`amount ${Number(t.amount).toFixed(2)}`);

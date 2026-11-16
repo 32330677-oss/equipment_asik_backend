@@ -27,13 +27,24 @@ async function nextCode(conn, table, column, prefix, width) {
 }
 
 /** Rate card in force for a machine on a date (with contract currency + vendor). */
-async function rateCardOn(conn, equipmentId, date) {
+async function rateCardOn(conn, equipmentId, date, shift = undefined) {
   const [rows] = await conn.execute(
     `SELECT rc.*, vc.currency, vc.vendor_id, vc.contract_number FROM eq_rate_cards rc
      JOIN eq_vendor_contracts vc ON vc.vendor_contract_id = rc.vendor_contract_id
      WHERE rc.equipment_id = ? AND ${activeOnSql('rc', 'effective_from', 'effective_to')}
-     ORDER BY rc.effective_from DESC LIMIT 1`, [equipmentId, date, date]);
-  return rows[0] || null;
+     ORDER BY rc.effective_from DESC`, [equipmentId, date, date]);
+  // 16 Nov 2026: a card for both shifts first; a machine with a Day and a Night card: the card of that shift (no shift
+  // given: the Day card). A shift without its card: null.
+  const both = rows.find((r) => !r.shift_type);
+  if (both || !rows.length) return both || null;
+  if (shift) return rows.find((r) => r.shift_type === shift) || null;
+  return rows.find((r) => r.shift_type === 'Day') || rows[0];
+}
+/** The machine has a Day / Night card on that date (16 Nov 2026). */
+async function hasShiftCards(conn, equipmentId, date) {
+  const [[r]] = await conn.execute(
+    `SELECT COUNT(*) AS n FROM eq_rate_cards WHERE equipment_id = ? AND shift_type IS NOT NULL AND ${activeOnSql('', 'effective_from', 'effective_to')}`, [equipmentId, date, date]);
+  return Number(r.n) > 0;
 }
 
 /**
@@ -129,5 +140,5 @@ function parseJson(v) {
 module.exports = {
   assignTypeSeq, refreshTypeLabels,
   loadVendor, loadContract, loadMachine, loadOperator, loadRateCard, loadSite, loadDeployment,
-  nextCode, rateCardOn, rateCardLocked, rateCardLastBilledDate, rateCardBilledUpTo, deploymentOn, assertMachineDeployed, parseJson,
+  nextCode, rateCardOn, hasShiftCards, rateCardLocked, rateCardLastBilledDate, rateCardBilledUpTo, deploymentOn, assertMachineDeployed, parseJson,
 };

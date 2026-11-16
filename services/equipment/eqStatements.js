@@ -325,9 +325,11 @@ async function modelFromCalc(conn, { kind, scope, items }) {
 }
 
 // 016: the machine's fixed number inside its vendor + type ("Excavator #3"), shown next to its code everywhere
-const mlabel = (it) => it.machine_label || it.type_name || '';
+// 16 Nov 2026: an item of a Day / Night card says its shift next to the machine (a machine with two shift cards = two items)
+const shiftTag = (it) => { const s = (it.rate && it.rate.shift_type) || it.shift_type; return s ? ` (${s})` : ''; };
+const mlabel = (it) => `${it.machine_label || it.type_name || ''}${shiftTag(it)}`;
 /** Short form for narrow detail columns: "EQ-0012 #3" (the full label is in the machine summary / header). */
-const mshort = (it) => { const k = /#\d+$/.exec(it.machine_label || ''); return k ? `${it.equipment_code} ${k[0]}` : it.equipment_code; };
+const mshort = (it) => { const k = /#\d+$/.exec(it.machine_label || ''); return `${k ? `${it.equipment_code} ${k[0]}` : it.equipment_code}${shiftTag(it)}`; };
 
 // --------------------------------------------------------------- D2 machine invoice / statement
 const fuelDiffOf = (it) => it.lines.filter((l) => l.line_type === 'FuelPriceDifference').reduce((a, l) => a + n(l.amount), 0);

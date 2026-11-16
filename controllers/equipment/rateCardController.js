@@ -18,6 +18,8 @@ const FIELDS = {
   effective_from: v.date(),
   effective_to: v.date(),
   billing_mode: v.enumOf(['Hourly', 'Daily', 'Monthly']),
+  // 16 Nov 2026: Monthly only — the shift this card prices (Day / Night); empty = both shifts (every card before)
+  shift_type: v.enumOf(['Day', 'Night']),
   hourly_rate: MONEY(), daily_rate: MONEY(), monthly_rate: MONEY(),
   standard_hours_per_day: HOURS({ min: 1 }),
   min_billable_hours_per_day: HOURS(),
@@ -65,6 +67,8 @@ function checkCard(card) {
     f.half_day_threshold_hours = 'is required with HalfDayThreshold';
   }
   if (mode !== 'Daily' && Number(card.second_shift_pct || 0) > 0) f.second_shift_pct = 'only for Daily billing';
+  if (!card.shift_type) card.shift_type = null;
+  if (card.shift_type && mode !== 'Monthly') f.shift_type = 'only for Monthly billing (a Day card and a Night card, each shift at its own monthly price)';
   if (mode === 'Monthly') card.monthly_divisor = 'MonthDays';
   if (card.second_shift_pct === null || card.second_shift_pct === undefined) card.second_shift_pct = 0;
   if (card.operator_included && card.operator_daily_rate != null) f.operator_daily_rate = 'only allowed when operator_included is false';
@@ -87,12 +91,54 @@ async function assertContractAndOverlap(conn, machine, card, exceptId = 0) {
   if (card.effective_from < contract.start_date || (contract.end_date && (!card.effective_to || card.effective_to > contract.end_date))) {
     throw AppError.conflict('RATE_CARD_OUTSIDE_CONTRACT', `Rate card dates must be inside the contract (${contract.start_date} to ${contract.end_date || 'open'}).`);
   }
-  const [clash] = await conn.execute(
-    `SELECT rate_card_id, effective_from, effective_to FROM eq_rate_cards
+  const [around] = await conn.execute(
+    `SELECT rate_card_id, effective_from, effective_to, billing_mode, shift_type, vendor_contract_id FROM eq_rate_cards
      WHERE equipment_id = ? AND rate_card_id <> ? AND ${overlapsSql('', 'effective_from', 'effective_to')}`,
     [machine.equipment_id, exceptId, card.effective_to || null, card.effective_from]);
-  if (clash.length) throw AppError.conflict('RATE_CARD_OVERLAP', 'Another rate card of this machine covers some of these dates.', { conflicts: clash });
+  // BR-05 (16 Nov 2026): one card per machine and day, except a Day card and a Night card of a monthly machine. A card
+  // for both shifts never shares a day with a shift card.
+  const shift = card.shift_type || null;
+  const clash = around.filter((c) => !shift || !c.shift_type || c.shift_type === shift);
+  if (clash.length) {
+    const mixed = clash.some((c) => Boolean(c.shift_type) !== Boolean(shift));
+    throw AppError.conflict('RATE_CARD_OVERLAP', mixed
+      ? 'A card for both shifts and a shift card (Day / Night) cannot cover the same dates: close the card for both shifts first.'
+      : `Another rate card of this machine${shift ? ` for the ${shift} shift` : ''} covers some of these dates.`, { conflicts: clash });
+  }
+  // the Day and the Night card of the same days: same contract (one currency, one vendor invoice)
+  const other = around.filter((c) => shift && c.shift_type && c.shift_type !== shift && c.vendor_contract_id !== card.vendor_contract_id);
+  if (other.length) throw AppError.conflict('SHIFT_CARDS_OTHER_CONTRACT', 'The Day and the Night card of the same dates must be under the same contract.', { conflicts: other });
+  await assertShiftMonthStart(conn, machine.equipment_id, card, exceptId);
   return contract;
+}
+
+const firstOfMonth = (d) => `${String(d).slice(0, 7)}-01`;
+/**
+ * 16 Nov 2026: a machine passes from a card for both shifts to shift cards (or back) on the 1st of a month only, so a
+ * month is billed either as one contract or as one contract per shift, never half and half.
+ */
+async function assertShiftMonthStart(conn, equipmentId, card, exceptId) {
+  if (card.billing_mode !== 'Monthly') return;
+  const from = String(card.effective_from).slice(0, 10);
+  if (from === firstOfMonth(from)) return;
+  const [before] = await conn.execute(
+    `SELECT rate_card_id, effective_from, effective_to, shift_type FROM eq_rate_cards
+     WHERE equipment_id = ? AND rate_card_id <> ? AND billing_mode = 'Monthly' AND effective_from < ? AND (effective_to IS NULL OR effective_to >= ?)`,
+    [equipmentId, exceptId, from, firstOfMonth(from)]);
+  const kind = (x) => (x ? 'shift' : 'both');
+  const switching = before.filter((c) => kind(c.shift_type) !== kind(card.shift_type));
+  if (switching.length) {
+    throw AppError.conflict('SHIFT_CARDS_MONTH_START', 'A monthly machine passes between one card for both shifts and shift cards (Day / Night) on the 1st of a month only. '
+      + `Start this card on ${firstOfMonth(from)} or on the 1st of the next month.`, { conflicts: switching });
+  }
+}
+
+/** Shift cards are created only once the setting eq_shift_rate_cards_enabled is on (16 Nov 2026). */
+async function assertShiftAllowed(card, before = null) {
+  if (!card.shift_type || (before && before.shift_type === card.shift_type)) return;
+  if (!(await settings.getBool('eq_shift_rate_cards_enabled'))) {
+    throw AppError.conflict('SHIFT_CARDS_DISABLED', 'Shift cards (a Day card and a Night card) are not switched on: Settings > eq_shift_rate_cards_enabled.');
+  }
 }
 
 exports.list = async (req, res) => {
@@ -111,6 +157,7 @@ exports.create = async (req, res) => {
   const equipmentId = parseId(req.params.id);
   const d = validate(req.body, { ...FIELDS, vendor_contract_id: v.id({ required: true }), effective_from: v.date({ required: true }), billing_mode: v.enumOf(['Hourly', 'Daily', 'Monthly'], { required: true }) });
   const card = checkCard({ ...DEFAULTS, ...monthlyDefaults(d) });
+  await assertShiftAllowed(card);
   const created = await withTransaction(async (conn) => {
     const machine = await C.loadMachine(conn, equipmentId, true);
     await assertContractAndOverlap(conn, machine, card);
@@ -157,6 +204,7 @@ exports.update = async (req, res) => {
     // 14 Oct 2026: a draft or issued invoice using the card follows the change (it is recalculated / brought up to date)
     const generated = await rateCardInOpenBatch(conn, id);
     const card = checkCard({ ...before, overtime_enabled: Boolean(before.overtime_enabled), operator_included: Boolean(before.operator_included), ...d });
+    await assertShiftAllowed(card, before);
     const machine = await C.loadMachine(conn, before.equipment_id, true);
     await assertContractAndOverlap(conn, machine, card, id);
     await conn.execute(`UPDATE eq_rate_cards SET ${COLUMNS.map((k) => `${k} = ?`).join(', ')} WHERE rate_card_id = ?`, [...toDb(card), id]);
@@ -243,6 +291,7 @@ exports.revise = async (req, res) => {
     if (billed && closeOn < billed.date) throw billedConflict(billed, `Choose a start date after ${billed.date}`);
     const { rate_card_id: _a, created_at: _b, updated_at: _c, created_by_user_id: _d, equipment_id: equipmentId, ...old } = before;
     const card = checkCard({ ...old, overtime_enabled: Boolean(before.overtime_enabled), operator_included: Boolean(before.operator_included), ...d, effective_to: before.effective_to });
+    await assertShiftAllowed(card, before);
     await conn.execute('UPDATE eq_rate_cards SET effective_to = ? WHERE rate_card_id = ?', [closeOn, id]);
     await audit.log(conn, { table: 'eq_rate_cards', id, action: 'close', oldValues: { effective_to: before.effective_to }, newValues: { effective_to: closeOn }, ...audit.ctx(req) });
     const machine = await C.loadMachine(conn, equipmentId, true);

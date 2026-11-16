@@ -105,7 +105,8 @@ async function utilizationData(q) {
   const [rows] = await pool.query(
     `SELECT equipment_id, day_status, working_minutes, breakdown_minutes, standby_minutes, gross_minutes FROM eq_attendance
      WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ? AND status <> 'Cancelled'${q.site_id ? ' AND site_id = ?' : ''}`, [ids, q.from, q.to, ...(q.site_id ? [q.site_id] : [])]);
-  const [cards] = await pool.query('SELECT equipment_id, standard_hours_per_day FROM eq_rate_cards WHERE equipment_id IN (?) AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)', [ids, q.to, q.from]);
+  // a machine with a Day and a Night card: the hours per day of the Day card (sorted last, so it is the one kept)
+  const [cards] = await pool.query("SELECT equipment_id, standard_hours_per_day FROM eq_rate_cards WHERE equipment_id IN (?) AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?) ORDER BY shift_type = 'Day', rate_card_id", [ids, q.to, q.from]);
   const std = Object.fromEntries(cards.map((c) => [c.equipment_id, Number(c.standard_hours_per_day)]));
   const out = [];
   for (const id of ids) {
