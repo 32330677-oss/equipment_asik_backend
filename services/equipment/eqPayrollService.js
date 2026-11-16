@@ -64,9 +64,24 @@ async function loadRateCards(conn, equipmentIds, start, end) {
     [equipmentIds, end, start]);
   return rows;
 }
-function cardFor(cards, equipmentId, date) {
-  return cards.find((c) => c.equipment_id === equipmentId && covers(c.effective_from, c.effective_to, date)) || null;
+/**
+ * The card of a machine on a date (16 Nov 2026: and a shift). A card for both shifts (shift_type NULL, every card before
+ * 16 Nov 2026) prices every shift. A monthly machine with a Day card and a Night card: the card of that shift, or null
+ * when that shift has no card (NO_RATE_CARD). Without a shift (callers that only need the billing mode or the currency
+ * of the machine), the Day card first.
+ */
+function cardFor(cards, equipmentId, date, shift = undefined) {
+  const on = cards.filter((c) => c.equipment_id === equipmentId && covers(c.effective_from, c.effective_to, date));
+  if (!on.length) return null;
+  const both = on.find((c) => !c.shift_type);
+  if (both) return both;
+  if (shift) return on.find((c) => c.shift_type === shift) || null;
+  return on.find((c) => c.shift_type === 'Day') || on[0];
 }
+/** Key of a monthly card: 'All' for a card of both shifts, else its shift (monthly days, terms of the month, offsets). */
+const shiftKey = (card) => (card && card.shift_type) || 'All';
+/** Admin offset decision of a machine and month ("<id>|YYYY-MM"), per shift for a shift card ("<id>|YYYY-MM|Night"). */
+const offsetKey = (equipmentId, month, shift = null) => `${equipmentId}|${month}${shift ? `|${shift}` : ''}`;
 
 const weekday = (d) => new Date(`${d}T00:00:00Z`).getUTCDay();
 
@@ -104,7 +119,7 @@ function monthTerms(month, card, offDay, termsOf = null) {
 /** Months where the Admin decided that extra hours cover missing hours: ["<equipment_id>|YYYY-MM", ...]. */
 function normalizeOffsets(v) {
   const list = Array.isArray(v) ? v : typeof v === 'string' && v.trim() ? v.split(',') : [];
-  return [...new Set(list.map((x) => String(x).trim()).filter((x) => /^\d+\|\d{4}-(0[1-9]|1[0-2])$/.test(x)))].sort();
+  return [...new Set(list.map((x) => String(x).trim()).filter((x) => /^\d+\|\d{4}-(0[1-9]|1[0-2])(\|(Day|Night))?$/.test(x)))].sort();
 }
 
 /** Months context of a set of days (Monthly billing): deployed days, deployed WORKING days, official holidays, terms. */
@@ -148,8 +163,9 @@ function monthsContext(start, end, deployRanges, card, ownsDay = null, offDay = 
 async function loadMonthlyTerms(conn, equipmentIds, fromMonth, toMonth) {
   if (!equipmentIds.length) return () => null;
   const [rows] = await conn.query('SELECT * FROM eq_monthly_terms WHERE equipment_id IN (?) AND month BETWEEN ? AND ?', [equipmentIds, fromMonth, toMonth]);
-  const map = new Map(rows.map((r) => [`${r.equipment_id}|${r.month}`, r]));
-  return (equipmentId, month) => map.get(`${equipmentId}|${month}`) || null;
+  const map = new Map(rows.map((r) => [`${r.equipment_id}|${r.month}|${r.shift_key || 'All'}`, r]));
+  // 16 Nov 2026: a shift card reads the terms typed for its shift ('All' = the card of both shifts)
+  return (equipmentId, month, shift = null) => map.get(`${equipmentId}|${month}|${shift || 'All'}`) || null;
 }
 
 /** A row has standby time (full Standby day, or standby periods inside a Working day). */
@@ -340,6 +356,7 @@ async function monthlyMultiSite(conn, scope) {
      FROM eq_site_assignments a JOIN eq_equipment e ON e.equipment_id = a.equipment_id
      JOIN eq_rate_cards rc ON rc.equipment_id = a.equipment_id AND rc.billing_mode = 'Monthly' AND rc.effective_from <= ? AND (rc.effective_to IS NULL OR rc.effective_to >= ?)
      JOIN eq_site_assignments b ON b.equipment_id = a.equipment_id AND b.site_id <> a.site_id
+       AND (rc.shift_type IS NULL OR (rc.shift_type = a.shift_type AND rc.shift_type = b.shift_type))
        AND b.assigned_date <= ? AND (b.unassigned_date IS NULL OR b.unassigned_date >= ?) AND (b.unassigned_date IS NULL OR b.unassigned_date >= b.assigned_date)
      JOIN sites s2 ON s2.site_id = b.site_id
      WHERE a.site_id = ? AND a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)`,
@@ -357,7 +374,7 @@ async function monthlyMultiSite(conn, scope) {
 async function monthlyDaysWithoutRows(conn, scope) {
   const ds = scopeSql(scope, 'a');
   const [deps] = await conn.query(
-    `SELECT a.equipment_id, a.site_id, a.assigned_date, a.unassigned_date, e.equipment_code, e.vendor_id, st.site_code FROM eq_site_assignments a
+    `SELECT a.equipment_id, a.site_id, a.shift_type, a.assigned_date, a.unassigned_date, e.equipment_code, e.vendor_id, st.site_code FROM eq_site_assignments a
      JOIN eq_equipment e ON e.equipment_id = a.equipment_id JOIN sites st ON st.site_id = a.site_id
      WHERE a.assigned_date <= ? AND (a.unassigned_date IS NULL OR a.unassigned_date >= ?) AND (a.unassigned_date IS NULL OR a.unassigned_date >= a.assigned_date)${ds.sql}
      ORDER BY a.equipment_id, a.assigned_date`,
@@ -368,15 +385,16 @@ async function monthlyDaysWithoutRows(conn, scope) {
   if (!monthlyCards.length) return [];
   const monthlyIds = [...new Set(monthlyCards.map((c) => c.equipment_id))];
   const [rows] = await conn.query(
-    `SELECT DISTINCT equipment_id, record_date FROM eq_attendance
+    `SELECT DISTINCT equipment_id, record_date, shift_type FROM eq_attendance
      WHERE equipment_id IN (?) AND record_date BETWEEN ? AND ? AND status <> 'Cancelled'`, [monthlyIds, scope.start_date, scope.end_date]);
-  const recorded = new Set(rows.map((r) => `${r.equipment_id}|${String(r.record_date).slice(0, 10)}`));
+  // a card of both shifts: any row of the day counts; a shift card (16 Nov 2026): a row of that shift
+  const recorded = new Set(rows.flatMap((r) => [`${r.equipment_id}|${String(r.record_date).slice(0, 10)}|All`, `${r.equipment_id}|${String(r.record_date).slice(0, 10)}|${r.shift_type}`]));
   // a day another active batch already billed is not this scope's business any more (each monthly day billed once)
   const [held] = await conn.query(
-    `SELECT md.equipment_id, md.day FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id
+    `SELECT md.equipment_id, md.day, md.shift_key FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id
      WHERE md.equipment_id IN (?) AND md.day BETWEEN ? AND ? AND ${ACTIVE_BATCH} AND b.eq_batch_id <> ?`,
     [monthlyIds, scope.start_date, scope.end_date, scope.exclude_batch_id || 0]);
-  for (const x of held) recorded.add(`${x.equipment_id}|${String(x.day).slice(0, 10)}`);
+  for (const x of held) recorded.add(`${x.equipment_id}|${String(x.day).slice(0, 10)}|${x.shift_key || 'All'}`);
   const offDay = await settings.getInt('eq_weekly_off_day');
   const out = []; const seen = new Set();
   for (const d of deps) {
@@ -384,11 +402,13 @@ async function monthlyDaysWithoutRows(conn, scope) {
     const from = String(d.assigned_date).slice(0, 10) > scope.start_date ? String(d.assigned_date).slice(0, 10) : scope.start_date;
     const to = d.unassigned_date && String(d.unassigned_date).slice(0, 10) < scope.end_date ? String(d.unassigned_date).slice(0, 10) : scope.end_date;
     for (let day = from; day <= to; day = addDays(day, 1)) {
-      const key = `${d.equipment_id}|${day}`;
-      if (seen.has(key) || recorded.has(key) || weekday(day) === offDay) continue;
-      if (!monthlyCards.some((c) => c.equipment_id === d.equipment_id && covers(c.effective_from, c.effective_to, day))) continue;
+      if (weekday(day) === offDay) continue;
+      const card = cardFor(monthlyCards, d.equipment_id, day, d.shift_type);
+      if (!card) continue;
+      const key = `${d.equipment_id}|${day}|${shiftKey(card)}`;
+      if (seen.has(key) || recorded.has(key)) continue;
       seen.add(key);
-      out.push({ equipment_code: d.equipment_code, site_code: d.site_code, record_date: day, _v: d.vendor_id, _e: d.equipment_id, _s: d.site_id, _d: day });
+      out.push({ equipment_code: d.equipment_code, site_code: d.site_code, ...(card.shift_type ? { shift_type: card.shift_type } : {}), record_date: day, _v: d.vendor_id, _e: d.equipment_id, _s: d.site_id, _d: day });
     }
   }
   return out.sort((a, b) => a.equipment_code.localeCompare(b.equipment_code) || a.record_date.localeCompare(b.record_date));
@@ -429,19 +449,19 @@ async function blockers(conn, scope) {
     [...exParams, ...params]);
   add('IN_OTHER_BATCH', 'Rows already paid in another active batch (they are skipped).', inOther);
   // rate cards: for eligible rows and for Monthly deployments
-  const [approved] = await conn.query(`SELECT ea.eq_attendance_id, ea.equipment_id, e.equipment_code, st.site_code, ea.record_date, ea.day_status, ea.standby_minutes, ea.standby_credit_minutes,
+  const [approved] = await conn.query(`SELECT ea.eq_attendance_id, ea.equipment_id, e.equipment_code, st.site_code, ea.record_date, ea.shift_type, ea.day_status, ea.standby_minutes, ea.standby_credit_minutes,
     e.vendor_id AS _v, ea.equipment_id AS _e, ea.site_id AS _s, ea.record_date AS _d ${base} AND ea.status = 'Approved' AND ${notInActive}`, [...params, ...exParams]);
   const ids = [...new Set(approved.map((r) => r.equipment_id))];
   const cards = await loadRateCards(conn, ids, scope.start_date, scope.end_date);
-  add('NO_RATE_CARD', 'Rows on dates without a rate card.', approved.filter((r) => !cardFor(cards, r.equipment_id, r.record_date)));
+  add('NO_RATE_CARD', 'Rows on dates without a rate card (or a shift without its card).', approved.filter((r) => !cardFor(cards, r.equipment_id, r.record_date, r.shift_type)));
   // monthly machines: the standby hours paid are decided per row by the Admin/Accountant (no %)
   add('STANDBY_HOURS_NOT_SET', 'Monthly machines with standby: set the standby hours to pay (Attendance review).',
     approved.filter((r) => {
-      const c = cardFor(cards, r.equipment_id, r.record_date);
+      const c = cardFor(cards, r.equipment_id, r.record_date, r.shift_type);
       return c && c.billing_mode === 'Monthly' && hasStandby(r) && (r.standby_credit_minutes === null || r.standby_credit_minutes === undefined);
     }).map(({ standby_credit_minutes: _x, ...r }) => r));
   // monthly machines are billed from their deployments: a row on a day without deployment would be billed in no month
-  const monthlyRows = approved.filter((r) => { const c = cardFor(cards, r.equipment_id, r.record_date); return c && c.billing_mode === 'Monthly'; });
+  const monthlyRows = approved.filter((r) => { const c = cardFor(cards, r.equipment_id, r.record_date, r.shift_type); return c && c.billing_mode === 'Monthly'; });
   if (monthlyRows.length) {
     const [dps] = await conn.query(
       'SELECT equipment_id, assigned_date, unassigned_date FROM eq_site_assignments WHERE equipment_id IN (?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)',
@@ -459,13 +479,13 @@ async function blockers(conn, scope) {
      WHERE f.issue_date BETWEEN ? AND ? AND f.is_cancelled = 0 AND f.price_per_liter IS NULL${fs.sql}`, [scope.start_date, scope.end_date, ...fs.params]);
   add('FUEL_UNPRICED', 'Fuel issues without a price per litre.', fuel);
   // fuel price difference: a machine with fuel terms needs a national price on every working day
-  const payable = approved.filter((r) => cardFor(cards, r.equipment_id, r.record_date));
+  const payable = approved.filter((r) => cardFor(cards, r.equipment_id, r.record_date, r.shift_type));
   if (payable.length) {
     const terms = await loadFuelTerms(conn, ids, scope.start_date, scope.end_date);
     if (terms.length) {
       const prices = await loadFuelPrices(conn);
       const noPrice = payable.filter((r) => termsFor(terms, r.equipment_id, r.record_date)
-        && !priceOn(prices, cardFor(cards, r.equipment_id, r.record_date).currency, r.record_date));
+        && !priceOn(prices, cardFor(cards, r.equipment_id, r.record_date, r.shift_type).currency, r.record_date));
       add('FUEL_PRICE_MISSING', 'Machines with a fuel difference agreement have days without a national fuel price.', noPrice);
     }
   }
@@ -558,8 +578,9 @@ async function calculate(conn, scope) {
     `SELECT eq_assignment_id, equipment_id, site_id, shift_type, assigned_date, unassigned_date FROM eq_site_assignments
      WHERE equipment_id IN (?) AND assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)`,
     [depIds, scope.end_date, scope.start_date]) : [[]];
-  const ownerSite = (equipmentId, day) => {
-    const c = allDeps.filter((d) => d.equipment_id === equipmentId && covers(d.assigned_date, d.unassigned_date, day))
+  // 16 Nov 2026: a shift card's base goes to the site of that shift's deployment
+  const ownerSite = (equipmentId, day, shift = null) => {
+    const c = allDeps.filter((d) => d.equipment_id === equipmentId && (!shift || d.shift_type === shift) && covers(d.assigned_date, d.unassigned_date, day))
       .sort((a, b) => (a.shift_type === b.shift_type ? 0 : a.shift_type === 'Day' ? -1 : 1) || String(a.assigned_date).localeCompare(String(b.assigned_date)) || a.eq_assignment_id - b.eq_assignment_id);
     return c.length ? c[0].site_id : null;
   };
@@ -590,10 +611,10 @@ async function calculate(conn, scope) {
   const groups = new Map();
   // A MONTHLY card is one contract per machine: one group whatever the site (hours due settled once per month);
   // it is billed on the site where the machine spent most deployed days, with the cost split by site.
-  const mainSite = (equipmentId) => {
+  const mainSite = (equipmentId, shift = null) => {
     const count = new Map();
     for (let d = scope.start_date; d <= scope.end_date; d = addDays(d, 1)) {
-      const s = ownerSite(equipmentId, d);
+      const s = ownerSite(equipmentId, d, shift);
       if (s) count.set(s, (count.get(s) || 0) + 1);
     }
     let best = null; let n = -1;
@@ -601,14 +622,14 @@ async function calculate(conn, scope) {
     return best;
   };
   const groupFor = (equipmentId, siteId, card, vendorId) => {
-    if (card && card.billing_mode === 'Monthly') siteId = mainSite(equipmentId) || siteId;
+    if (card && card.billing_mode === 'Monthly') siteId = mainSite(equipmentId, card.shift_type || null) || siteId;
     const key = `${equipmentId}|${card && card.billing_mode === 'Monthly' ? 'M' : siteId}|${card ? card.rate_card_id : 'none'}`;
     if (!groups.has(key)) groups.set(key, { equipment_id: equipmentId, site_id: siteId, vendor_id: vendorId, card, rows: [], fuel: [], adjustments: [] });
     return groups.get(key);
   };
   for (const r of rows) {
-    const card = cardFor(cards, r.equipment_id, r.record_date);
-    if (!card) throw AppError.conflict('NO_RATE_CARD', `${r.equipment_code} has no rate card on ${r.record_date}.`);
+    const card = cardFor(cards, r.equipment_id, r.record_date, r.shift_type);
+    if (!card) throw AppError.conflict('NO_RATE_CARD', `${r.equipment_code} has no rate card on ${r.record_date}${cards.some((c) => c.equipment_id === r.equipment_id && c.shift_type) ? ` for the ${r.shift_type} shift` : ''}.`);
     groupFor(r.equipment_id, r.site_id, card, r.vendor_id).rows.push(r);
   }
   // DNR: one group per machine x site x currency, separate from any rate card of the same machine (both are paid)
@@ -633,13 +654,14 @@ async function calculate(conn, scope) {
   for (const d of deps) {
     const monthlyCards = cards.filter((c) => c.equipment_id === d.equipment_id && c.billing_mode === 'Monthly');
     for (const c of monthlyCards) {
+      if (c.shift_type && c.shift_type !== d.shift_type) continue; // 16 Nov 2026: a shift card is billed from that shift's deployments only
       const g = groupFor(d.equipment_id, d.site_id, c, d.vendor_id);
       g.deployRanges = g.deployRanges || [];
       g.deployRanges.push({ from: d.assigned_date, to: d.unassigned_date });
     }
   }
   for (const f of fuel) {
-    const card = cardFor(cards, f.equipment_id, f.issue_date);
+    const card = cardFor(cards, f.equipment_id, f.issue_date, f.shift_type);
     if (!card) {
       const dg = dnrFallback(f.equipment_id, f.site_id, f.vendor_id, f.issue_date);
       if (dg) { dg.fuel.push(f); continue; }
@@ -648,10 +670,10 @@ async function calculate(conn, scope) {
     groupFor(f.equipment_id, f.site_id, card, f.vendor_id).fuel.push(f);
   }
   for (const a of adjs) {
-    const card = cardFor(cards, a.equipment_id, a.adjustment_date);
+    const card = cardFor(cards, a.equipment_id, a.adjustment_date, a.shift_type || undefined);
     let siteId = a.site_id;
     if (!siteId) {
-      const candidates = [...groups.values()].filter((g) => g.equipment_id === a.equipment_id);
+      const candidates = [...groups.values()].filter((g) => g.equipment_id === a.equipment_id && (!card || !g.card || g.card.rate_card_id === card.rate_card_id));
       candidates.sort((x, y) => y.rows.length - x.rows.length);
       siteId = candidates[0] ? candidates[0].site_id : (deps.find((d) => d.equipment_id === a.equipment_id) || {}).site_id;
     }
@@ -674,7 +696,7 @@ async function calculate(conn, scope) {
     let ctx = {};
     let monthly = null;
     if (rate.billing_mode === 'Monthly') {
-      monthly = monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf: (m) => termsOf(g.equipment_id, m), ownerSite, prevCalc, earlierCardDays });
+      monthly = monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf: (m) => termsOf(g.equipment_id, m, g.card.shift_type || null), ownerSite, prevCalc, earlierCardDays });
       // 31 Oct 2026: rows of a month without any deployed day are not held at 0: they wait for a later invoice
       const billedMonths = new Set((monthly.ctx.months || []).map((m) => m.month));
       const waiting = g.rows.filter((r) => !billedMonths.has(monthOf(String(r.record_date).slice(0, 10))));
@@ -683,7 +705,7 @@ async function calculate(conn, scope) {
         warnings.push({ code: 'MONTHLY_ROWS_WAITING', equipment_id: g.equipment_id, rows: waiting.length, days: waiting.map((r) => String(r.record_date).slice(0, 10)),
           message: 'Rows of a month without any deployed day are not invoiced: they wait until the deployment is fixed.' });
       }
-      ctx = { ...monthly.ctx, offset: (monthly.ctx.months || []).filter((m) => offsets.has(`${g.equipment_id}|${m.month}`)).map((m) => m.month) };
+      ctx = { ...monthly.ctx, offset: (monthly.ctx.months || []).filter((m) => offsets.has(offsetKey(g.equipment_id, m.month, g.card.shift_type || null))).map((m) => m.month) };
     }
     if (rate.billing_mode !== 'Monthly' && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;
     if (rate.billing_mode === 'Monthly' && !ctx.months.length && !g.rows.length && !g.fuel.length && !g.adjustments.length) continue;
@@ -712,7 +734,7 @@ async function calculate(conn, scope) {
     if (rate.billing_mode === 'Monthly' && !g.rows.length && monthly.days.length) warnings.push({ code: 'NO_ATTENDANCE_ROWS', equipment_id: g.equipment_id, site_id: g.site_id, message: 'Monthly base billed without any attendance row in the period.' });
     items.push({
       equipment_id: g.equipment_id, vendor_id: g.vendor_id, site_id: g.site_id, currency: g.card.currency,
-      rate_card_id: g.card.rate_card_id, rate_snapshot: g.card, fuel_diff: fuelDiffSnapshot, monthly_calc: res.monthly_details || null, billing_mode: rate.billing_mode,
+      rate_card_id: g.card.rate_card_id, shift_type: g.card.shift_type || null, rate_snapshot: g.card, fuel_diff: fuelDiffSnapshot, monthly_calc: res.monthly_details || null, billing_mode: rate.billing_mode,
       days_recorded: g.rows.length, worked_days: t.workedDays || 0,
       work_minutes: t.work || 0, overtime_minutes: t.ot || 0, standby_minutes: t.standby || 0, breakdown_minutes: t.breakdown || 0, topup_minutes: t.topup || 0,
       gross_cents: res.gross_cents, deductions_cents: res.deductions_cents, net_cents: res.net_cents,
@@ -737,20 +759,22 @@ async function calculate(conn, scope) {
 async function earlierMonthlyCardDays(conn, monthlyIds, monthFrom, monthTo, offDay) {
   if (!monthlyIds.length) return () => 0;
   const [mc] = await conn.query(
-    `SELECT rate_card_id, equipment_id, effective_from, effective_to FROM eq_rate_cards
+    `SELECT rate_card_id, equipment_id, effective_from, effective_to, shift_type FROM eq_rate_cards
      WHERE equipment_id IN (?) AND billing_mode = 'Monthly' AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)`,
     [monthlyIds, monthTo, monthFrom]);
   const multi = [...new Set(mc.map((c) => c.equipment_id))].filter((id) => mc.filter((c) => c.equipment_id === id).length > 1);
   if (!multi.length) return () => 0;
   const [dp] = await conn.query(
-    `SELECT equipment_id, assigned_date, unassigned_date FROM eq_site_assignments
+    `SELECT equipment_id, shift_type, assigned_date, unassigned_date FROM eq_site_assignments
      WHERE equipment_id IN (?) AND assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)`,
     [multi, monthTo, monthFrom]);
   return (equipmentId, card, month, D) => {
     if (!multi.includes(equipmentId)) return 0;
-    const others = mc.filter((c) => c.equipment_id === equipmentId && c.rate_card_id !== card.rate_card_id && String(c.effective_from).slice(0, 10) < String(card.effective_from).slice(0, 10));
+    // 16 Nov 2026: a shift card is its own contract: only the earlier cards of the same shift (or of both shifts) count
+    const sameContract = (c) => !c.shift_type || !card.shift_type || c.shift_type === card.shift_type;
+    const others = mc.filter((c) => c.equipment_id === equipmentId && c.rate_card_id !== card.rate_card_id && sameContract(c) && String(c.effective_from).slice(0, 10) < String(card.effective_from).slice(0, 10));
     if (!others.length) return 0;
-    const deps = dp.filter((d) => d.equipment_id === equipmentId);
+    const deps = dp.filter((d) => d.equipment_id === equipmentId && (!card.shift_type || d.shift_type === card.shift_type));
     let n = 0;
     for (let i = 1; i <= daysInMonth(month); i += 1) {
       const d = `${month}-${String(i).padStart(2, '0')}`;
@@ -802,7 +826,7 @@ function monthlyContext(g, { scope, offDay, heldDays, prevRowsAll, termsOf, owne
     return list;
   };
   const months = decorate(monthsFromDays(allDays, g.card, offDay, holidayOf([...g.rows, ...prevRows]), termsOf));
-  const days = mine.map((d) => ({ day: d, site_id: ownerSite(g.equipment_id, d) || g.site_id }));
+  const days = mine.map((d) => ({ day: d, shift_key: shiftKey(g.card), site_id: ownerSite(g.equipment_id, d, g.card.shift_type || null) || g.site_id }));
   if (!heldIn.length && !prevRows.length) return { ctx: { months }, days, prevRowIds: [] };
   const prevMonthsList = [...new Set(prevRows.map((r) => monthOf(String(r.record_date).slice(0, 10))))].filter((m) => withDays.has(m));
   const prevMonths = decorate(monthsFromDays(heldIn, g.card, offDay, holidayOf(prevRows), termsOf, prevMonthsList));
@@ -910,4 +934,4 @@ async function batchDrift(conn, batch) {
   return reasons;
 }
 
-module.exports = { scopeMachines, batchScope, monthTerms, normalizeOffsets, monthsFromDays, deployedDays, monthlyContext, loadMonthlyTerms, ACTIVE_BATCH, calcDetail, applyShiftRules, allocateBySite, monthlyMultiSite, batchDrift, billingSettings, BILLING_SETTINGS, calculate, blockers, blockingCodes, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };
+module.exports = { cardFor, shiftKey, offsetKey, scopeMachines, batchScope, monthTerms, normalizeOffsets, monthsFromDays, deployedDays, monthlyContext, loadMonthlyTerms, ACTIVE_BATCH, calcDetail, applyShiftRules, allocateBySite, monthlyMultiSite, batchDrift, billingSettings, BILLING_SETTINGS, calculate, blockers, blockingCodes, changedRows, hasStandby, engineRow, rowFigures, BLOCKING, INFO_ONLY, engineRate, monthsContext, workingDaysOfMonth, scopeSql, parseJson, sheetsMissingScan, fuelDifference, priceOn };

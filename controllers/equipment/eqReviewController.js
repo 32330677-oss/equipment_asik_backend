@@ -59,7 +59,7 @@ exports.get = async (req, res) => {
     `SELECT a.action_type, a.created_at, a.reason, a.changed_fields, a.payroll_effect, u.full_name AS user_name FROM audit_logs a
      LEFT JOIN users u ON u.user_id = a.user_id
      WHERE (a.table_name = 'eq_attendance' AND a.record_id = ?) OR (a.related_type = 'eq_attendance' AND a.related_id = ?) ORDER BY a.log_id`, [id, id]);
-  const card = await C.rateCardOn(pool, view.equipment_id, view.record_date);
+  const card = await C.rateCardOn(pool, view.equipment_id, view.record_date, view.shift_type);
   const standby = {
     billing_mode: card ? card.billing_mode : null,
     applies: Boolean(card && card.billing_mode === 'Monthly' && (view.day_status === 'Standby' || Number(view.standby_minutes) > 0)),
@@ -356,8 +356,8 @@ exports.standbyCredit = async (req, res) => {
   await withTransaction(async (conn) => {
     const row = await S.loadRow(conn, id, true);
     await lock.assertEqEditable(conn, row);
-    const card = await C.rateCardOn(conn, row.equipment_id, row.record_date);
-    if (!card) throw AppError.conflict('NO_RATE_CARD', `The machine has no rate card on ${row.record_date}.`);
+    const card = await C.rateCardOn(conn, row.equipment_id, row.record_date, row.shift_type);
+    if (!card) throw AppError.conflict('NO_RATE_CARD', `The machine has no rate card on ${row.record_date} for this shift.`);
     if (card.billing_mode !== 'Monthly') throw AppError.conflict('NOT_MONTHLY', 'Standby hours are given only for monthly machines; hourly and daily cards use the standby % of the card.');
     if (!(row.day_status === 'Standby' || Number(row.standby_minutes) > 0)) throw AppError.conflict('NO_STANDBY', 'This row has no standby time.');
     const max = maxStandbyHours(row, card);

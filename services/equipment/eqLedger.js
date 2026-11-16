@@ -180,17 +180,17 @@ async function machineHistory(conn, equipmentId, { from = BEGIN, to = businessTo
   const approved = ranges(free.filter((r) => r.status === 'Approved').map((r) => r.record_date));
   const pending = ranges(free.filter((r) => r.status !== 'Approved').map((r) => r.record_date));
   let monthly = [];
-  const [cards] = await conn.query("SELECT effective_from, effective_to FROM eq_rate_cards WHERE equipment_id = ? AND billing_mode = 'Monthly' AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)",
+  const [cards] = await conn.query("SELECT effective_from, effective_to, shift_type FROM eq_rate_cards WHERE equipment_id = ? AND billing_mode = 'Monthly' AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)",
     [equipmentId, until, from]);
   if (cards.length && from <= until) {
     const offDay = await settings.getInt('eq_weekly_off_day');
     const [deps] = await conn.query(
-      'SELECT assigned_date, unassigned_date FROM eq_site_assignments WHERE equipment_id = ? AND assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)',
+      'SELECT assigned_date, unassigned_date, shift_type FROM eq_site_assignments WHERE equipment_id = ? AND assigned_date <= ? AND (unassigned_date IS NULL OR unassigned_date >= ?) AND (unassigned_date IS NULL OR unassigned_date >= assigned_date)',
       [equipmentId, until, from]);
     const [held] = await conn.query(
-      `SELECT md.day FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id WHERE md.equipment_id = ? AND md.day BETWEEN ? AND ? AND ${ACTIVE}`,
+      `SELECT md.day, md.shift_key FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id WHERE md.equipment_id = ? AND md.day BETWEEN ? AND ? AND ${ACTIVE}`,
       [equipmentId, from, until]);
-    const heldSet = new Set(held.map((h) => day(h.day)));
+    const heldSet = new Set(held.map((h) => `${day(h.day)}|${h.shift_key || 'All'}`));
     const inRange = (d, a, b) => d >= day(a) && (!b || d <= day(b));
     const days = [];
     const start = from < BEGIN ? BEGIN : from;
@@ -198,9 +198,12 @@ async function machineHistory(conn, equipmentId, { from = BEGIN, to = businessTo
     const first = cards.map((c) => day(c.effective_from)).sort()[0];
     for (let d = start > first ? start : first; d <= until; d = addDays(d, 1)) {
       if (new Date(`${d}T00:00:00Z`).getUTCDay() === offDay) continue;
-      if (!cards.some((c) => inRange(d, c.effective_from, c.effective_to))) continue;
-      if (!deps.some((x) => inRange(d, x.assigned_date, x.unassigned_date))) continue;
-      if (!heldSet.has(d)) days.push(d);
+      // 16 Nov 2026: a day is not billed while one of its monthly cards (both shifts, or a Day / Night card with its
+      // deployment) has not billed it
+      const open = cards.filter((c) => inRange(d, c.effective_from, c.effective_to))
+        .filter((c) => deps.some((x) => (!c.shift_type || x.shift_type === c.shift_type) && inRange(d, x.assigned_date, x.unassigned_date)))
+        .some((c) => !heldSet.has(`${d}|${c.shift_type || 'All'}`));
+      if (open) days.push(d);
     }
     monthly = ranges(days, offDay);
   }
@@ -399,4 +402,4 @@ async function machineHistoryPdf(conn, h, user) {
   return { buffer: await P.toBuffer(doc), fileName: `billing-history-${m.equipment_code}-${h.to}.pdf`.replace(/[^A-Za-z0-9._-]/g, '_') };
 }
 
-module.exports = { vendorStatement, vendorStatementPdf, machineHistory, machineHistoryPdf, ranges };
+module.exports = { vendorStatement, vendorStatementPdf, machineHistory, machineHistoryPdf, ranges };

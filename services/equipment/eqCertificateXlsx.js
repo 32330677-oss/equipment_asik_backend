@@ -185,7 +185,8 @@ function supportingDocs(it, allOk) {
 
 // ======================================================================= machine certificate
 function machineSheet(wb, logoId, ctx, it) {
-  const name = `${it.equipment_code}${it.site_code ? ` ${it.site_code}` : ''}`.replace(/[[\]:*?/\\]/g, '-').slice(0, 31);
+  const shift = (it.rate_snapshot || {}).shift_type; // 16 Nov 2026: a Day / Night card item
+  const name = `${it.equipment_code}${shift ? ` ${shift}` : ''}${it.site_code ? ` ${it.site_code}` : ''}`.replace(/[[\]:*?/\\]/g, '-').slice(0, 31);
   let sheetName = name; let k = 2;
   while (wb.getWorksheet(sheetName)) { sheetName = `${name.slice(0, 28)} ${k}`; k += 1; }
   const ws = wb.addWorksheet(sheetName);
@@ -242,7 +243,7 @@ function machineSheet(wb, logoId, ctx, it) {
   const regPrices = [...new Set((it.lines || []).filter((l) => F.REGULAR_LINES.includes(l.line_type)).map((l) => n(l.unit_price)))];
   const billedRate = regPrices.length === 1 ? regPrices[0] : regPrices.length > 1 ? `${regPrices.length} prices - see section C` : (unitRate === null || unitRate === undefined ? null : n(unitRate));
   put(ws, 'A18', it.equipment_code, { bold: true, align: 'center' });
-  put(ws, 'B18', [it.machine_label || it.type_name, it.plate_number ? `plate ${it.plate_number}` : null, [it.make, it.model].filter(Boolean).join(' ') || null].filter(Boolean).join(' | '));
+  put(ws, 'B18', [`${it.machine_label || it.type_name || ''}${rate.shift_type ? ` (${rate.shift_type} shift)` : ''}`, it.plate_number ? `plate ${it.plate_number}` : null, [it.make, it.model].filter(Boolean).join(' ') || null].filter(Boolean).join(' | '));
   put(ws, 'C18', it.type_name || '', { align: 'center' });
   put(ws, 'D18', `${BASIS[it.billing_mode] || it.billing_mode}${it.billing_mode === 'Monthly' ? ' (per month)' : ''}`, { align: 'center' });
   put(ws, 'E18', rate.operator_included === undefined || rate.operator_included === null ? '' : (n(rate.operator_included) ? 'Included' : 'Charged apart'), { align: 'center' });
@@ -471,7 +472,7 @@ function vendorSheet(wb, logoId, ctx, items) {
     tot.reg += h.regular; tot.ot += h.overtime; tot.regA += a.regular; tot.otA += a.overtime; tot.add += a.add; tot.ded += a.ded;
     put(ws, `A${r}`, i + 1, { align: 'center', fill });
     put(ws, `B${r}`, it.invoice_no || 'draft', { bold: true, fill });
-    put(ws, `C${r}`, `${it.equipment_code} | ${it.machine_label || it.type_name || ''}`, { fill });
+    put(ws, `C${r}`, `${it.equipment_code} | ${it.machine_label || it.type_name || ''}${(it.rate_snapshot || {}).shift_type ? ` (${it.rate_snapshot.shift_type})` : ''}`, { fill });
     put(ws, `D${r}`, it.site_code || '', { align: 'center', fill });
     put(ws, `E${r}`, BASIS[it.billing_mode] || it.billing_mode, { align: 'center', fill });
     put(ws, `F${r}`, n(it.worked_days), { align: 'center', fill });

@@ -21,6 +21,7 @@ const DEFINITIONS = {
   eq_fuel_diff_allow_negative: { type: 'bool', description: 'Fuel price difference: deduct from the vendor when the official price falls below the base price' },
   eq_shift_continuity_minutes: { type: 'int', min: 0, max: 180, description: 'Shifts of one machine closer than this (minutes) are continuous: overtime starts after threshold x shifts' },
   eq_block_monthly_days_without_rows: { type: 'bool', description: 'Monthly machines: a deployed working day with no attendance row blocks generating (it is deducted in full as an absence); the batch can still be generated with a reason' },
+  eq_shift_rate_cards_enabled: { type: 'bool', description: 'Monthly machines: allow a Day card and a Night card (each shift at its own monthly price)' },
   eq_late_entry_days: { type: 'int', min: 1, max: 60, description: 'A row created more than this many days after its date is flagged as a late entry (warning only; a reason is asked)' },
   // titles under the signature lines of every invoice, statement and certificate (14 Oct 2026: one place, not in the code)
   doc_prepared_by_en: { type: 'string', max: 80, description: 'Documents: who prepares the invoices (English)' },
@@ -31,7 +32,8 @@ const DEFINITIONS = {
 
 /** Settings that change amounts or switch a control: changing them needs a reason. */
 const CONTROL_KEYS = new Set(['eq_payroll_requires_paper_match', 'eq_weekly_off_day', 'eq_fuel_diff_allow_negative', 'eq_shift_continuity_minutes',
-  'payroll_finalize_admin_only', 'eq_finalize_requires_scan', 'eq_block_monthly_days_without_rows']);
+  'payroll_finalize_admin_only', 'eq_finalize_requires_scan', 'eq_block_monthly_days_without_rows',
+  'eq_shift_rate_cards_enabled']);
 
 const DEFAULTS = {
   eq_payroll_requires_paper_match: 'false', eq_paper_tolerance_minutes: '10', eq_meter_tolerance_pct: '15',
@@ -41,6 +43,7 @@ const DEFAULTS = {
   eq_finalize_requires_scan: 'true', eq_fuel_diff_allow_negative: 'true', eq_weekly_off_day: '5',
   eq_shift_continuity_minutes: '30', eq_late_entry_days: '3',
   eq_block_monthly_days_without_rows: 'true',
+  eq_shift_rate_cards_enabled: 'false',
   doc_prepared_by_en: 'Plant & Equipment Department', doc_prepared_by_ar: 'إدارة الآليات والمعدات',
   doc_approved_by_en: 'Project Director', doc_approved_by_ar: 'مدير المشروع',
 };

@@ -32,11 +32,11 @@ const lastDay = (m) => `${m}-${String(daysInMonth(m)).padStart(2, '0')}`;
  * The invoice that bills a day of this month for this machine and stops the current user (handed over; withdrawn for a
  * non-Admin): { id, finalized, state } or null. Draft and issued invoices do not stop the change.
  */
-async function lockOf(conn, equipmentId, month) {
+async function lockOf(conn, equipmentId, month, shiftKey = 'All') {
   const [rows] = await conn.execute(
     `SELECT DISTINCT b.eq_batch_id, b.status, b.is_finalized FROM eq_payroll_monthly_days md JOIN eq_payroll_batches b ON b.eq_batch_id = md.eq_batch_id
-     WHERE md.equipment_id = ? AND md.day BETWEEN ? AND ? AND b.status IN ('Generated','HandedOver','Returned')
-     ORDER BY b.eq_batch_id DESC`, [equipmentId, firstDay(month), lastDay(month)]);
+     WHERE md.equipment_id = ? AND md.shift_key = ? AND md.day BETWEEN ? AND ? AND b.status IN ('Generated','HandedOver','Returned')
+     ORDER BY b.eq_batch_id DESC`, [equipmentId, shiftKey, firstDay(month), lastDay(month)]);
   const b = rows.find((x) => lock.denies(x));
   return b ? { id: b.eq_batch_id, finalized: true, state: lock.stateOf(b) } : null;
 }
@@ -73,19 +73,21 @@ async function termsRows(conn, { start, end, vendorId = null, equipmentIds = nul
     try { items = (await P.calculate(conn, { start_date: start, end_date: end, vendor_id: m.vendor_id, equipment_ids: [m.equipment_id] })).items; } catch (e) { if (!e.isAppError) throw e; }
     for (const month of monthsBetween(start, end)) {
       const from = firstDay(month) > start ? firstDay(month) : start;
-      const card = cards.find((c) => c.equipment_id === m.equipment_id && c.effective_from <= lastDay(month) && (!c.effective_to || c.effective_to >= from));
-      if (!card) continue;
-      const t = terms(m.equipment_id, month);
+      // 16 Nov 2026: one row per card of the month (a machine with a Day and a Night card: one row per shift)
+      const inMonth = cards.filter((c) => c.equipment_id === m.equipment_id && c.effective_from <= lastDay(month) && (!c.effective_to || c.effective_to >= from));
+      const perShift = [...new Map(inMonth.map((c) => [P.shiftKey(c), c])).keys()].map((k) => inMonth.find((c) => P.shiftKey(c) === k));
+      for (const card of perShift) {
+      const t = terms(m.equipment_id, month, card.shift_type || null);
       const mt = P.monthTerms(month, P.engineRate(card), offDay, () => t);
       const amount = mt.amountCents !== null ? mt.amountCents / 100 : Number(card.monthly_rate);
       const item = items.find((i) => i.billing_mode === 'Monthly' && i.rate_card_id === card.rate_card_id);
       const det = item && (item.monthly_calc || []).find((x) => x.month === month);
       const estimate = item ? item.lines.filter((l) => l.month === month).reduce((a, l) => a + l.amount_cents, 0) : null;
-      const locked = await lockOf(conn, m.equipment_id, month);
+      const locked = await lockOf(conn, m.equipment_id, month, P.shiftKey(card));
       const hpd = Number(card.standard_hours_per_day);
       out.push({
-        equipment_id: m.equipment_id, label: m.machine_label || `${m.equipment_code} ${m.type_name}`, equipment_code: m.equipment_code, plate: m.plate_number,
-        month, rate_card_id: card.rate_card_id, monthly_rate: Number(card.monthly_rate), currency: card.currency, hours_per_day: hpd,
+        equipment_id: m.equipment_id, label: `${m.machine_label || `${m.equipment_code} ${m.type_name}`}${card.shift_type ? ` (${card.shift_type})` : ''}`, equipment_code: m.equipment_code, plate: m.plate_number,
+        month, shift_type: card.shift_type || null, rate_card_id: card.rate_card_id, monthly_rate: Number(card.monthly_rate), currency: card.currency, hours_per_day: hpd,
         calendar_days: mt.workingDays,
         amount, amount_source: mt.amountSource,
         divisor: mt.divisor, divisor_source: mt.divisorSource,
@@ -102,6 +104,7 @@ async function termsRows(conn, { start, end, vendorId = null, equipmentIds = nul
         typed_working_days: t ? t.working_days : null, typed_hourly_rate: t && t.hourly_rate !== null ? Number(t.hourly_rate) : null,
         typed_amount: t && t.monthly_amount !== null && t.monthly_amount !== undefined ? Number(t.monthly_amount) : null,
       });
+      }
     }
   }
   return out;
@@ -126,7 +129,7 @@ exports.list = async (req, res) => {
 exports.put = async (req, res) => {
   const body = req.body || {};
   const d = validate(body, {
-    equipment_id: v.id({ required: true }), month: v.string({ required: true, max: 7 }),
+    equipment_id: v.id({ required: true }), month: v.string({ required: true, max: 7 }), shift_type: v.enumOf(['Day', 'Night']),
     working_days: v.int({ min: 1, max: 31 }), hourly_rate: v.number({ min: 0.0001, max: 99999999, decimals: 4 }),
     monthly_amount: v.number({ min: 0.01, max: 999999999999, decimals: 2 }), note: v.string({ max: 500 }),
   });
@@ -139,12 +142,17 @@ exports.put = async (req, res) => {
     if (!m) throw AppError.notFound('Machine');
     const cards = await monthlyCards(conn, [d.equipment_id], firstDay(d.month), lastDay(d.month));
     if (!cards.length) throw new AppError(422, 'NOT_MONTHLY', 'This machine has no monthly rate card in that month.');
-    const locked = await lockOf(conn, d.equipment_id, d.month);
+    // 16 Nov 2026: a machine with a Day and a Night card has an exception per shift
+    const shift = d.shift_type || null;
+    if (cards.some((c) => c.shift_type) && !shift) throw AppError.validation({ shift_type: 'this machine has a Day and a Night card in that month: say which shift' });
+    if (shift && !cards.some((c) => c.shift_type === shift)) throw AppError.validation({ shift_type: `this machine has no ${shift} card in that month` });
+    const key = shift || 'All';
+    const locked = await lockOf(conn, d.equipment_id, d.month, key);
     if (locked) {
       throw AppError.conflict('MONTHLY_TERMS_LOCKED', `Invoice batch #${locked.id} bills this month for this machine and is ${locked.state === 'returned' ? 'withdrawn from finance (the Admin changes it)' : 'handed over to finance'}. `
         + 'Withdraw it from finance first, or make a debit / credit note.', { eq_batch_id: locked.id, finalized: true, state: locked.state });
     }
-    const [[before]] = await conn.execute('SELECT * FROM eq_monthly_terms WHERE equipment_id = ? AND month = ? FOR UPDATE', [d.equipment_id, d.month]);
+    const [[before]] = await conn.execute('SELECT * FROM eq_monthly_terms WHERE equipment_id = ? AND month = ? AND shift_key = ? FOR UPDATE', [d.equipment_id, d.month, key]);
     if (days === null && hourly === null && amount === null) {
       if (before) {
         await conn.execute('DELETE FROM eq_monthly_terms WHERE monthly_terms_id = ?', [before.monthly_terms_id]);
@@ -159,14 +167,14 @@ exports.put = async (req, res) => {
       await audit.log(conn, { table: 'eq_monthly_terms', id: before.monthly_terms_id, action: 'update', oldValues: before, newValues: after, reason: d.note || null, ...audit.ctx(req) });
     } else {
       const [r] = await conn.execute(
-        'INSERT INTO eq_monthly_terms (equipment_id, month, monthly_amount, working_days, hourly_rate, note, set_by_user_id, set_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [d.equipment_id, d.month, amount, days, hourly, d.note || null, req.user.user_id, businessNow()]);
+        'INSERT INTO eq_monthly_terms (equipment_id, month, shift_key, monthly_amount, working_days, hourly_rate, note, set_by_user_id, set_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [d.equipment_id, d.month, key, amount, days, hourly, d.note || null, req.user.user_id, businessNow()]);
       const [[after]] = await conn.execute('SELECT * FROM eq_monthly_terms WHERE monthly_terms_id = ?', [r.insertId]);
       await audit.log(conn, { table: 'eq_monthly_terms', id: r.insertId, action: 'create', newValues: after, reason: d.note || null, ...audit.ctx(req) });
     }
   });
   const rows = await termsRows(pool, { start: firstDay(d.month), end: lastDay(d.month), equipmentIds: [d.equipment_id] });
-  res.json({ status: 'success', data: rows.find((r) => r.month === d.month) || null });
+  res.json({ status: 'success', data: rows.find((r) => r.month === d.month && (r.shift_type || null) === (d.shift_type || null)) || null });
 };
 
 exports.termsRows = termsRows;
